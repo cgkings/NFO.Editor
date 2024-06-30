@@ -1,5 +1,5 @@
 
-## NFO.editor GUI版
+## 大锤 NFO.editor GUI版
 轻量化NFO编辑器GUI版Lightweight NFO editor GUI version
 
 
