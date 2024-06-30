@@ -36,7 +36,7 @@ jobs:
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: build-artifacts-windows  # 确保与后续任务中的名称匹配
+          name: build-artifacts-windows
           path: dist/
 
   release:
@@ -47,35 +47,32 @@ jobs:
       - name: Download Build Artifacts (Windows)
         uses: actions/download-artifact@v4
         with:
-          name: build-artifacts-windows  # 与上传工件时的名称匹配
+          name: build-artifacts-windows
           path: dist/windows
 
       - name: Create Release
         id: create_release
-        uses: actions/create-release@v1  # 根据最新版本调整
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: actions/create-release@v1
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           tag_name: ${{ github.ref }}
           release_name: Release ${{ github.ref }}
           draft: false
           prerelease: false
 
       - name: Upload Windows Executable
-        uses: actions/upload-release-asset@v1  # 根据最新版本调整
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: actions/upload-release-asset@v1
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: dist/windows/NFO.Editor.exe
           asset_name: NFO.Editor_windows.exe
           asset_content_type: application/octet-stream
 
       - name: Upload Python Script for Windows
-        uses: actions/upload-release-asset@v1  # 根据最新版本调整
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: actions/upload-release-asset@v1
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: dist/windows/NFO.Editor.py
           asset_name: NFO.Editor_windows.py
