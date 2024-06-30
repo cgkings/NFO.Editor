@@ -5,6 +5,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 import xml.dom.minidom as minidom
 from PIL import Image, ImageTk
+import subprocess
 
 class NFOEditorApp:
     def __init__(self, root):
@@ -29,6 +30,9 @@ class NFOEditorApp:
 
         open_folder_button = tk.Button(top_frame, text="📁", command=self.open_selected_folder)
         open_folder_button.pack(side=tk.LEFT, padx=5)
+
+        open_video_button = tk.Button(top_frame, text="▶", command=self.open_selected_video)
+        open_video_button.pack(side=tk.LEFT, padx=5)
 
         self.folder_path_label = tk.Label(top_frame, text="")
         self.folder_path_label.pack(side=tk.RIGHT, padx=5)
@@ -232,6 +236,26 @@ class NFOEditorApp:
             if os.path.exists(nfo_file_path):
                 folder_path = os.path.dirname(nfo_file_path)
                 os.startfile(folder_path)
+            else:
+                messagebox.showerror("Error", f"NFO file does not exist: {nfo_file_path}")
+
+    def open_selected_video(self):
+        video_extensions = ['.mp4', '.mkv', '.avi', '.mov']  # Add other video formats if needed
+        player_path = r'D:\cprogram\Green\1.Media\mpvnet\mpvnet.exe'
+        player_options = '--fs=yes'
+        
+        selected_indices = self.file_listbox.curselection()
+        if selected_indices:
+            selected_index = selected_indices[0]
+            nfo_file_path = os.path.join(self.folder_path, self.file_listbox.get(selected_index))
+            if os.path.exists(nfo_file_path):
+                video_file_base = os.path.splitext(nfo_file_path)[0]
+                for ext in video_extensions:
+                    video_file = video_file_base + ext
+                    if os.path.exists(video_file):
+                        subprocess.run([player_path, player_options, video_file])
+                        return
+                messagebox.showerror("Error", "No video file found with supported formats: .mp4, .mkv, .avi, .mov")
             else:
                 messagebox.showerror("Error", f"NFO file does not exist: {nfo_file_path}")
 
