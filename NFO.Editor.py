@@ -4,32 +4,46 @@ import os
 import xml.etree.ElementTree as ET
 from datetime import datetime
 import xml.dom.minidom as minidom
+from PIL import Image, ImageTk
 
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO.Editor v 1.0 20240628")
-        
-        self.folder_path = ""  # 存储选中的文件夹路径
-        self.current_file_path = ""  # 存储当前选中的 NFO 文件路径
-        self.fields_entries = {}  # 存储各字段的输入框对象
-        self.nfo_files = []  # 存储当前文件夹中的所有 NFO 文件路径列表
+        self.root.title("大锤 v2.0.0 NFO Editor 20240629")
+
+        self.current_file_path = None
+        self.fields_entries = {}
+
+        # 图片显示开关,默认打开图片显示
+        self.show_images_var = tk.BooleanVar(value=True)
 
         # 创建顶部按钮和路径显示
         top_frame = tk.Frame(self.root)
         top_frame.pack(side=tk.TOP, fill=tk.X)
-        
+
         select_directory_button = tk.Button(top_frame, text="选择目录 (Select Directory)", command=self.open_folder)
         select_directory_button.pack(side=tk.LEFT, padx=5)
-        
+
         open_nfo_button = tk.Button(top_frame, text="🖊", command=self.open_selected_nfo)
         open_nfo_button.pack(side=tk.LEFT, padx=5)
-        
+
         open_folder_button = tk.Button(top_frame, text="📁", command=self.open_selected_folder)
         open_folder_button.pack(side=tk.LEFT, padx=5)
-        
+
         self.folder_path_label = tk.Label(top_frame, text="")
         self.folder_path_label.pack(side=tk.RIGHT, padx=5)
+
+        # 图片显示开关
+        image_toggle = tk.Checkbutton(top_frame, text="显示图片", variable=self.show_images_var, command=self.toggle_image_display)
+        image_toggle.pack(side=tk.RIGHT, padx=5)
+
+        # 图片显示区域框架
+        image_frame = tk.Frame(self.root, width=400, height=300, bg="gray")
+        image_frame.pack(side=tk.RIGHT, padx=10, pady=10)
+        image_frame.pack_propagate(0)
+
+        self.image_label = tk.Label(image_frame, text="图片显示已关闭", bg="gray")
+        self.image_label.pack(expand=True)
 
         # 创建排序选项
         sorting_frame = tk.Frame(self.root)
@@ -66,8 +80,35 @@ class NFOEditorApp:
         # 创建操作按钮
         self.create_operations_panel()
 
+        # 默认打开图片显示
+        self.toggle_image_display()
+
         # 运行主循环
         self.root.mainloop()
+
+    def toggle_image_display(self):
+        if self.show_images_var.get():
+            self.image_label.config(text="")
+            self.display_image()
+        else:
+            self.image_label.config(image="", text="图片显示已关闭")
+
+    def display_image(self):
+        if self.current_file_path:
+            folder = os.path.dirname(self.current_file_path)
+            image_files = [f for f in os.listdir(folder) if f.lower().endswith('.jpg') and 'thumb' in f.lower()]
+            if image_files:
+                image_path = os.path.join(folder, image_files[0])
+                try:
+                    img = Image.open(image_path)
+                    img.thumbnail((400, 300), Image.LANCZOS)  # 调整图片大小，保持比例
+                    img = ImageTk.PhotoImage(img)
+                    self.image_label.config(image=img)
+                    self.image_label.image = img  # 保持引用防止图片被垃圾回收
+                except Exception as e:
+                    self.image_label.config(text="加载图片失败: " + str(e))
+            else:
+                self.image_label.config(text="文件夹内无thumb图片")
 
     def create_field_labels(self):
         # 定义各字段的标签文本和高度
@@ -112,7 +153,6 @@ class NFOEditorApp:
             self.load_files_in_folder()
 
     def load_files_in_folder(self):
-        # 加载选中文件夹中的 NFO 文件列表到文件列表框中
         self.file_listbox.delete(0, tk.END)
         self.nfo_files = []
         try:
@@ -121,7 +161,10 @@ class NFOEditorApp:
                     if file.endswith('.nfo'):
                         nfo_file = os.path.join(root, file)
                         self.nfo_files.append(nfo_file)
-                        self.file_listbox.insert(tk.END, os.path.relpath(nfo_file, self.folder_path))  # 插入相对路径以供显示
+                        self.file_listbox.insert(tk.END, os.path.relpath(nfo_file, self.folder_path))
+            if self.nfo_files:  # 如果存在nfo文件，选择第一个
+                self.file_listbox.select_set(0)
+                self.file_listbox.event_generate('<<ListboxSelect>>')
         except OSError as e:
             messagebox.showerror("Error", f"Error loading files from folder: {str(e)}")
 
@@ -149,11 +192,12 @@ class NFOEditorApp:
                 messagebox.showerror("Error", f"NFO file does not exist: {nfo_file_path}")
 
     def on_file_select(self, event):
-        # 当文件列表框中选中文件发生变化时，更新当前选中的 NFO 文件路径并加载其字段内容
         selected_index = self.file_listbox.curselection()
         if selected_index:
             self.current_file_path = os.path.join(self.folder_path, self.file_listbox.get(selected_index[0]))
             self.load_nfo_fields()
+            if self.show_images_var.get():
+                self.display_image()
 
     def load_nfo_fields(self):
         # 加载当前选中 NFO 文件的字段内容到对应的输入框中
