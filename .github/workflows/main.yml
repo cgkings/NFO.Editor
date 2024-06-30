@@ -19,10 +19,13 @@ jobs:
         with:
           python-version: '3.9'
 
+      - name: Use Node.js 20
+        uses: actions/setup-node@v2
+        with:
+          node-version: '20'
+
       - name: Install dependencies
-        run: |
-          npm install -g node@20
-          pip install pyinstaller
+        run: pip install pyinstaller
 
       - name: Build executable
         run: pyinstaller --onefile --noconsole --icon="pic/chuizi.ico" "NFO.Editor.py"
@@ -48,10 +51,13 @@ jobs:
         with:
           python-version: '3.9'
 
+      - name: Use Node.js 20
+        uses: actions/setup-node@v2
+        with:
+          node-version: '20'
+
       - name: Install dependencies
-        run: |
-          npm install -g node@20
-          pip install pyinstaller
+        run: pip install pyinstaller
 
       - name: Build executable
         run: pyinstaller --onefile --noconsole --icon="pic/chuizi.ico" "NFO.Editor.py"
@@ -61,7 +67,6 @@ jobs:
         with:
           name: build-artifacts-macos
           path: dist/
-
 
   release:
     runs-on: ubuntu-latest
