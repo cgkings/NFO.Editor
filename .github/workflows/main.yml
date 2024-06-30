@@ -36,7 +36,7 @@ jobs:
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: build-artifacts-windows
+          name: build-artifacts-windows  # 确保与后续任务中的名称匹配
           path: dist/
 
   release:
@@ -47,9 +47,10 @@ jobs:
       - name: Download Build Artifacts (Windows)
         uses: actions/download-artifact@v3
         with:
-          name: build-artifacts-windows
+          name: build-artifacts-windows  # 与上传工件时的名称匹配
           path: dist/windows
 
+    # 下面是您的其余步骤，确保正确使用工件上传相关的 GitHub 动作
       - name: Create Release
         id: create_release
         uses: actions/create-release@v1
