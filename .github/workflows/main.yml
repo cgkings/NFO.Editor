@@ -12,7 +12,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -26,10 +26,10 @@ jobs:
         run: pyinstaller --onefile --noconsole --icon="pic/chuizi.ico" "NFO.Editor.py"
 
       - name: Copy Python script
-        run: copy NFO.Editor.py dist\
+        run: cp NFO.Editor.py dist/
 
       - name: Upload Build Artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: build-artifacts-windows
           path: dist/
@@ -39,7 +39,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -53,7 +53,7 @@ jobs:
         run: pyinstaller --onefile --noconsole --icon="pic/chuizi.ico" "NFO.Editor.py"
 
       - name: Upload Build Artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: build-artifacts-macos
           path: dist/
@@ -114,4 +114,4 @@ jobs:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: dist/macos/NFO.Editor
           asset_name: NFO.Editor_macos
-          asset_content_type: application/octet-stream
+          asset_content_type: application/x-mach-binary  
