@@ -52,7 +52,7 @@ jobs:
 
       - name: Create Release
         id: create_release
-        uses: github-actions/create-release@v1.1.0
+        uses: actions/create-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -62,7 +62,7 @@ jobs:
           prerelease: false
 
       - name: Upload Windows Executable
-        uses: github-actions/upload-release-asset@v1.1.0
+        uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -72,7 +72,7 @@ jobs:
           asset_content_type: application/octet-stream
 
       - name: Upload Python Script for Windows
-        uses: github-actions/upload-release-asset@v1.1.0
+        uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
