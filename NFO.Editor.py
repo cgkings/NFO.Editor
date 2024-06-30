@@ -8,7 +8,7 @@ import xml.dom.minidom as minidom
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor 20240628")
+        self.root.title("大锤 NFO.Editor v 1.0 20240628")
         
         self.folder_path = ""  # 存储选中的文件夹路径
         self.current_file_path = ""  # 存储当前选中的 NFO 文件路径
