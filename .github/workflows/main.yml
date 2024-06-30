@@ -50,10 +50,9 @@ jobs:
           name: build-artifacts-windows  # 与上传工件时的名称匹配
           path: dist/windows
 
-    # 下面是您的其余步骤，确保正确使用工件上传相关的 GitHub 动作
       - name: Create Release
         id: create_release
-        uses: actions/create-release@v4
+        uses: actions/create-release@v1  # 根据最新版本调整
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -63,7 +62,7 @@ jobs:
           prerelease: false
 
       - name: Upload Windows Executable
-        uses: actions/upload-release-asset@v4
+        uses: actions/upload-release-asset@v1  # 根据最新版本调整
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -73,7 +72,7 @@ jobs:
           asset_content_type: application/octet-stream
 
       - name: Upload Python Script for Windows
-        uses: actions/upload-release-asset@v4
+        uses: actions/upload-release-asset@v1  # 根据最新版本调整
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
