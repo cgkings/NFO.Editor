@@ -10,7 +10,7 @@ import subprocess
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v4.0.0")
+        self.root.title("大锤 NFO Editor v5.0.0")
 
         self.current_file_path = None
         self.fields_entries = {}
@@ -347,9 +347,11 @@ class NFOEditorApp:
             }
 
             # 更新 XML 树中的字段值
-            for child in root:
-                if child.tag in updates:
-                    child.text = updates[child.tag]
+            for field, value in updates.items():
+                element = root.find(field)
+                if element is None:  # 如果字段不存在，创建新元素
+                    element = ET.SubElement(root, field)
+                element.text = value  # 更新或设置文本
 
             # 更新演员信息
             unique_actors = set(actors_text.split(','))
