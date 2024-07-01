@@ -9,7 +9,6 @@
 <center><img src="https://github.com/cgkings/NFO.Editor/blob/main/pic/v2.0.0.jpg" alt="主菜单" /></center>
 
 待修复bug
-批量操作不是选择批量，是加载文件夹内全部修改
 修改评分没有联动修改99
 整合mdcx的图片修改工具
 文件选择区丢失焦点

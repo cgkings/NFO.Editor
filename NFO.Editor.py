@@ -10,13 +10,13 @@ import subprocess
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor 20240630")
+        self.root.title("大锤 NFO Editor v3.0.0")
 
         self.current_file_path = None
         self.fields_entries = {}
 
         # 图片显示开关,默认打开图片显示
-        self.show_images_var = tk.BooleanVar(value=True)
+        self.show_images_var = tk.BooleanVar(value=False)
 
         # 创建顶部按钮和路径显示
         top_frame = tk.Frame(self.root)
@@ -108,19 +108,22 @@ class NFOEditorApp:
         self.create_operations_panel()
 
         # 默认打开图片显示
-        self.toggle_image_display()
+        #self.toggle_image_display()
 
         # 运行主循环
         self.root.mainloop()
 
     def toggle_image_display(self):
         if self.show_images_var.get():
-            self.poster_label.config(text="封面图 (poster)", fg="black")
-            self.thumb_label.config(text="缩略图 (thumb)", fg="black")
-            self.display_image()
+            self.display_image() # 如果开关打开，则尝试显示图片
         else:
-            self.poster_label.config(image="", text="封面图 (poster)", fg="black")
-            self.thumb_label.config(image="", text="缩略图 (thumb)", fg="black")
+            # 确保在尝试清空图像前，图像实际存在
+            if hasattr(self.poster_label, 'image') and self.poster_label.image:
+                self.poster_label.config(image=None)
+                self.poster_label.image = None  # 清除引用
+            if hasattr(self.thumb_label, 'image') and self.thumb_label.image:
+                self.thumb_label.config(image=None)
+                self.thumb_label.image = None  # 清除引用
 
     def display_image(self):
         if self.current_file_path:
@@ -240,9 +243,10 @@ class NFOEditorApp:
                 messagebox.showerror("Error", f"NFO file does not exist: {nfo_file_path}")
 
     def open_selected_video(self):
-        video_extensions = ['.mp4', '.mkv', '.avi', '.mov']  # Add other video formats if needed
+        video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.strm']  # Add other video formats if needed
         player_path = r'D:\cprogram\Green\1.Media\mpvnet\mpvnet.exe'
-        player_options = '--fs=yes'
+        player_options = ''
+        #player_options = '--fs=yes'
         
         selected_indices = self.file_listbox.curselection()
         if selected_indices:
@@ -255,7 +259,7 @@ class NFOEditorApp:
                     if os.path.exists(video_file):
                         subprocess.run([player_path, player_options, video_file])
                         return
-                messagebox.showerror("Error", "No video file found with supported formats: .mp4, .mkv, .avi, .mov")
+                messagebox.showerror("Error", "No video file found with supported formats: .mp4, .mkv, .avi, .mov, .strm")
             else:
                 messagebox.showerror("Error", f"NFO file does not exist: {nfo_file_path}")
 
@@ -423,10 +427,16 @@ class NFOEditorApp:
             fill_value = fill_entry.get()
             operation_log = ""
 
+            selected_files = self.file_listbox.curselection()  # 获取选择的文件
+            if not selected_files:
+                messagebox.showwarning("警告", "请先选择要填充的文件")
+                return
+
             if field and fill_value:
-                for nfo_file in self.nfo_files:
+                for i in selected_files:
+                    nfo_file = self.file_listbox.get(i)  # 获取选择的文件路径
                     try:
-                        tree = ET.parse(nfo_file)
+                        tree = ET.parse(os.path.join(self.folder_path, nfo_file))  # 修改为完整路径
                         root = tree.getroot()
 
                         # 如果字段不存在，则创建新的元素
@@ -445,13 +455,10 @@ class NFOEditorApp:
 
                         # 去除多余的空行
                         pretty_lines = pretty_str.decode('utf-8').splitlines()
-                        formatted_lines = []
-                        for line in pretty_lines:
-                            if line.strip():
-                                formatted_lines.append(line)
+                        formatted_lines = [line for line in pretty_lines if line.strip()]
                         formatted_str = "\n".join(formatted_lines)
 
-                        with open(nfo_file, 'w', encoding='utf-8') as file:
+                        with open(os.path.join(self.folder_path, nfo_file), 'w', encoding='utf-8') as file:  # 保存到原文件
                             file.write(formatted_str)
 
                         operation_log += f"{nfo_file}: {field}字段填充成功\n"
@@ -481,7 +488,6 @@ class NFOEditorApp:
         log_text = tk.Text(dialog, width=50, height=10)
         log_text.pack(pady=5)
 
-    # 添加批量新增功能的方法 batch_add
     def batch_add(self):
         # 批量新增对话框逻辑
         def apply_add():
@@ -489,16 +495,26 @@ class NFOEditorApp:
             add_value = add_entry.get()
             operation_log = ""
 
+            selected_files = self.file_listbox.curselection()  # 获取选择的文件
+            if not selected_files:
+                messagebox.showwarning("警告", "请先选择要新增的文件")
+                return
+
             if field and add_value:
-                for nfo_file in self.nfo_files:
+                for i in selected_files:
+                    nfo_file = self.file_listbox.get(i)  # 获取选择的文件路径
                     try:
-                        tree = ET.parse(nfo_file)
+                        tree = ET.parse(os.path.join(self.folder_path, nfo_file))  # 修改为完整路径
                         root = tree.getroot()
 
-                        # 创建新的元素并添加新增值
-                        new_elem = ET.Element(field)
-                        new_elem.text = add_value.strip()
-                        root.append(new_elem)
+                        # 如果字段不存在，则创建新的元素
+                        field_elem = root.find(field)
+                        if field_elem is None:
+                            field_elem = ET.Element(field)
+                            root.append(field_elem)
+
+                        # 新增字段值
+                        field_elem.text = add_value.strip()
 
                         # 保存修改后的 XML 文件
                         xml_str = ET.tostring(root, encoding='utf-8')
@@ -507,23 +523,20 @@ class NFOEditorApp:
 
                         # 去除多余的空行
                         pretty_lines = pretty_str.decode('utf-8').splitlines()
-                        formatted_lines = []
-                        for line in pretty_lines:
-                            if line.strip():
-                                formatted_lines.append(line)
+                        formatted_lines = [line for line in pretty_lines if line.strip()]
                         formatted_str = "\n".join(formatted_lines)
 
-                        with open(nfo_file, 'w', encoding='utf-8') as file:
+                        with open(os.path.join(self.folder_path, nfo_file), 'w', encoding='utf-8') as file:  # 保存到原文件
                             file.write(formatted_str)
 
-                        operation_log += f"{nfo_file}: {field}字段批量新增成功\n"
+                        operation_log += f"{nfo_file}: {field}字段新增成功\n"
                     except Exception as e:
-                        operation_log += f"{nfo_file}: {field}字段批量新增失败 - {str(e)}\n"
+                        operation_log += f"{nfo_file}: {field}字段新增失败 - {str(e)}\n"
 
             log_text.delete(1.0, tk.END)
             log_text.insert(1.0, operation_log)
 
-        # 创建批量新增对话框
+       # 创建批量新增对话框
         dialog = Toplevel(self.root)
         dialog.title("批量新增 (Batch Add)")
         dialog.geometry("400x300")
