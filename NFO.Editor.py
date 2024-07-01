@@ -10,7 +10,7 @@ import subprocess
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v3.0.0")
+        self.root.title("大锤 NFO Editor v4.0.0")
 
         self.current_file_path = None
         self.fields_entries = {}
@@ -110,6 +110,9 @@ class NFOEditorApp:
         # 默认打开图片显示
         #self.toggle_image_display()
 
+        self.root = root
+        self.selected_index_cache = None  # 添加此行来保存选中索引
+
         # 运行主循环
         self.root.mainloop()
 
@@ -177,6 +180,8 @@ class NFOEditorApp:
             entry.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=True)
             
             self.fields_entries[field] = entry
+            entry.bind('<FocusOut>', self.on_entry_focus_out)
+            #print(f"Created field {field}, added FocusOut binding.")
 
     def create_operations_panel(self):
         # 创建操作面板，包括保存更改按钮、批量替换按钮和保存时间标签
@@ -265,11 +270,15 @@ class NFOEditorApp:
 
     def on_file_select(self, event):
         selected_index = self.file_listbox.curselection()
-        if selected_index:
+        #print(f"File selected: {selected_index}")
+        if selected_index:  # 确保选中的索引非空
             self.current_file_path = os.path.join(self.folder_path, self.file_listbox.get(selected_index[0]))
             self.load_nfo_fields()
             if self.show_images_var.get():
                 self.display_image()
+            self.selected_index_cache = selected_index  # 只有在非空时才更新缓存
+        #else:
+            #print("No file selected, cache not updated.")
 
     def load_nfo_fields(self):
         # 加载当前选中 NFO 文件的字段内容到对应的输入框中
@@ -302,6 +311,15 @@ class NFOEditorApp:
             self.fields_entries['genres'].insert(1.0, ', '.join(genres))
         except Exception as e:
             messagebox.showerror("Error", f"Error loading NFO file: {str(e)}")
+
+    def on_entry_focus_out(self, event):
+        #print(f"Entry focus out: Current selection before re-select: {self.file_listbox.curselection()}")
+        if self.selected_index_cache:  # 确保缓存非空
+            self.file_listbox.selection_set(self.selected_index_cache[0])  # 使用保存的索引恢复选中状态
+            self.file_listbox.see(self.selected_index_cache[0])  # 确保选中的条目可见
+            #print(f"Re-set selection to {self.selected_index_cache}.")
+        #else:
+            #print("No cached index to restore.")
 
     def save_changes(self):
         if not self.current_file_path:
@@ -373,6 +391,13 @@ class NFOEditorApp:
                 file.write(pretty_str)
 
             self.update_save_time()
+
+            # 操作完成后重新选中之前选中的文件
+            if self.selected_index_cache:
+                self.file_listbox.selection_set(self.selected_index_cache[0])
+                self.file_listbox.see(self.selected_index_cache[0])  # 确保选中的条目可见
+                #print(f"Re-set selection to {self.selected_index_cache} after saving changes.")
+            
         except Exception as e:
             messagebox.showerror("Error", f"Error saving changes to NFO file: {str(e)}")
 
