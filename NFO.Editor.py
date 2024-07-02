@@ -10,7 +10,7 @@ import subprocess
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v5.0.0")
+        self.root.title("大锤 NFO Editor v6.0.0")
 
         self.current_file_path = None
         self.fields_entries = {}
@@ -159,6 +159,7 @@ class NFOEditorApp:
     def create_field_labels(self):
         # 定义各字段的标签文本和高度
         fields = {
+            'num': ('番号', 1),
             'title': ('标题', 2),
             'plot': ('简介', 5),
             'tags': ('标签', 3),
@@ -171,17 +172,22 @@ class NFOEditorApp:
         # 创建标签和输入框，并存储到 fields_entries 中
         for field, (label_text, height) in fields.items():
             frame = tk.Frame(self.fields_frame)
-            frame.pack(fill=tk.X) # 确保每个输入框在水平方向上填充父容器
-            
+            frame.pack(fill=tk.X)  # Ensure each input field fills the parent container horizontally
+
             label = tk.Label(frame, text=label_text + ":", font=("Arial", 12, "bold"))
-            label.pack(side=tk.LEFT, padx=5, pady=5, anchor=tk.W) # 左对齐标签
-            
-            entry = tk.Text(frame, width=60, height=height)
-            entry.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=True)
-            
+            label.pack(side=tk.LEFT, padx=5, pady=5, anchor=tk.W)  # Align the label to the left
+
+            if field == 'num':
+                entry = tk.Label(frame, text="", width=60, height=height, fg="blue", cursor="hand2", anchor='w', font=("Arial", 12, "bold"))
+                entry.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=True)
+                entry.bind("<Button-1>", self.open_num_url)
+            else:
+                entry = tk.Text(frame, width=60, height=height)
+                entry.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=True)
+
             self.fields_entries[field] = entry
-            entry.bind('<FocusOut>', self.on_entry_focus_out)
-            #print(f"Created field {field}, added FocusOut binding.")
+            if field != 'num':
+                entry.bind('<FocusOut>', self.on_entry_focus_out)
 
     def create_operations_panel(self):
         # 创建操作面板，包括保存更改按钮、批量替换按钮和保存时间标签
@@ -248,11 +254,8 @@ class NFOEditorApp:
                 messagebox.showerror("Error", f"NFO file does not exist: {nfo_file_path}")
 
     def open_selected_video(self):
-        video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.strm']  # Add other video formats if needed
-        player_path = r'D:\cprogram\Green\1.Media\mpvnet\mpvnet.exe'
-        player_options = ''
-        #player_options = '--fs=yes'
-        
+        video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.strm']  # 添加其他视频格式（如有需要）
+
         selected_indices = self.file_listbox.curselection()
         if selected_indices:
             selected_index = selected_indices[0]
@@ -262,11 +265,11 @@ class NFOEditorApp:
                 for ext in video_extensions:
                     video_file = video_file_base + ext
                     if os.path.exists(video_file):
-                        subprocess.run([player_path, player_options, video_file])
+                        os.startfile(video_file)
                         return
-                messagebox.showerror("Error", "No video file found with supported formats: .mp4, .mkv, .avi, .mov, .strm")
+                messagebox.showerror("错误", "没有找到支持的格式的视频文件：.mp4, .mkv, .avi, .mov, .strm")
             else:
-                messagebox.showerror("Error", f"NFO file does not exist: {nfo_file_path}")
+                messagebox.showerror("错误", f"NFO文件不存在：{nfo_file_path}")
 
     def on_file_select(self, event):
         selected_index = self.file_listbox.curselection()
@@ -281,15 +284,17 @@ class NFOEditorApp:
             #print("No file selected, cache not updated.")
 
     def load_nfo_fields(self):
-        # 加载当前选中 NFO 文件的字段内容到对应的输入框中
         for entry in self.fields_entries.values():
-            entry.delete(1.0, tk.END)
+            if isinstance(entry, tk.Text):
+                entry.delete(1.0, tk.END)
+            elif isinstance(entry, tk.Label):
+                entry.config(text="")
 
         try:
             tree = ET.parse(self.current_file_path)
             root = tree.getroot()
 
-            fields_to_load = ['title', 'plot', 'series', 'rating']
+            fields_to_load = ['title', 'plot', 'series', 'rating', 'num']
             unique_actors = set()
             tags = []
             genres = []
@@ -298,7 +303,10 @@ class NFOEditorApp:
                 if child.tag in fields_to_load:
                     entry = self.fields_entries.get(child.tag)
                     if entry:
-                        entry.insert(1.0, child.text if child.text else "")
+                        if child.tag == 'num':
+                            entry.config(text=child.text if child.text else "")
+                        else:
+                            entry.insert(1.0, child.text if child.text else "")
                 if child.tag == 'actor':
                     unique_actors.add(child.find('name').text)
                 if child.tag == 'tag':
@@ -311,6 +319,13 @@ class NFOEditorApp:
             self.fields_entries['genres'].insert(1.0, ', '.join(genres))
         except Exception as e:
             messagebox.showerror("Error", f"Error loading NFO file: {str(e)}")
+
+    def open_num_url(self, event):
+        num_value = self.fields_entries['num'].cget("text")
+        if num_value:
+            url = f"https://javdb.com/search?q={num_value}"
+            import webbrowser
+            webbrowser.open(url)
 
     def on_entry_focus_out(self, event):
         #print(f"Entry focus out: Current selection before re-select: {self.file_listbox.curselection()}")
