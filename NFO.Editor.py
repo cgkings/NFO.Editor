@@ -6,11 +6,12 @@ from datetime import datetime
 import xml.dom.minidom as minidom
 from PIL import Image, ImageTk
 import subprocess
+from tkinter import ttk
 
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v6.0.0")
+        self.root.title("大锤 NFO Editor v7.0.0")
 
         self.current_file_path = None
         self.fields_entries = {}
@@ -61,16 +62,23 @@ class NFOEditorApp:
         listbox_frame = tk.Frame(self.root)
         listbox_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self.file_listbox = tk.Listbox(listbox_frame, width=50, selectmode=tk.EXTENDED)
-        self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        columns = ("一级目录", "二级目录", "NFO文件")
+        self.file_treeview = ttk.Treeview(listbox_frame, columns=columns, show="headings")
+        self.file_treeview.heading("一级目录", text="一级目录")
+        self.file_treeview.heading("二级目录", text="二级目录")
+        self.file_treeview.heading("NFO文件", text="NFO文件")
+        self.file_treeview.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # 隐藏NFO文件列
+        self.file_treeview.column("NFO文件", width=0, minwidth=0)
+        # 调整列宽
+        self.file_treeview.column("一级目录", width=260)
+        self.file_treeview.column("二级目录", width=260)
         
-        scrollbar = tk.Scrollbar(listbox_frame, orient=tk.VERTICAL)
+        scrollbar = tk.Scrollbar(listbox_frame, orient=tk.VERTICAL, command=self.file_treeview.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        self.file_listbox.config(yscrollcommand=scrollbar.set)
-        scrollbar.config(command=self.file_listbox.yview)
-        
-        self.file_listbox.bind('<<ListboxSelect>>', self.on_file_select)
+        self.file_treeview.config(yscrollcommand=scrollbar.set)
+
+        self.file_treeview.bind('<<TreeviewSelect>>', self.on_file_select)
 
         # 创建字段编辑框架
         self.fields_frame = tk.Frame(self.root, padx=10, pady=10)
@@ -95,10 +103,10 @@ class NFOEditorApp:
         thumb_frame.pack(side=tk.LEFT, padx=5)
         thumb_frame.pack_propagate(0)
 
-        self.poster_label = tk.Label(poster_frame, text="封面图 (poster)", fg="black")  # 设置文本颜色为黑色
+        self.poster_label = tk.Label(poster_frame, text="封面图 (poster)", fg="black")
         self.poster_label.pack(expand=True)
 
-        self.thumb_label = tk.Label(thumb_frame, text="缩略图 (thumb)", fg="black")  # 设置文本颜色为黑色
+        self.thumb_label = tk.Label(thumb_frame, text="缩略图 (thumb)", fg="black")
         self.thumb_label.pack(expand=True)
 
         # 创建字段标签和输入框
@@ -215,73 +223,98 @@ class NFOEditorApp:
             self.load_files_in_folder()
 
     def load_files_in_folder(self):
-        self.file_listbox.delete(0, tk.END)
+        self.file_treeview.delete(*self.file_treeview.get_children())
         self.nfo_files = []
         try:
             for root, dirs, files in os.walk(self.folder_path):
+                rel_dir = os.path.relpath(root, self.folder_path)
+                if rel_dir == '.':
+                    continue  # 跳过根目录
+                parts = rel_dir.split(os.sep)
                 for file in files:
                     if file.endswith('.nfo'):
-                        nfo_file = os.path.join(root, file)
-                        self.nfo_files.append(nfo_file)
-                        self.file_listbox.insert(tk.END, os.path.relpath(nfo_file, self.folder_path))
-            if self.nfo_files:  # 如果存在nfo文件，选择第一个
-                self.file_listbox.select_set(0)
-                self.file_listbox.event_generate('<<ListboxSelect>>')
+                        self.nfo_files.append(os.path.join(root, file))
+                        if len(parts) == 1:
+                            self.file_treeview.insert("", "end", values=(parts[0], "", file))
+                        elif len(parts) == 2:
+                            self.file_treeview.insert("", "end", values=(parts[0], parts[1], file))
         except OSError as e:
             messagebox.showerror("Error", f"Error loading files from folder: {str(e)}")
 
+        if self.nfo_files:  # 如果存在nfo文件，选择第一个
+            first_item = self.file_treeview.get_children()[0]
+            self.file_treeview.selection_set(first_item)
+            self.file_treeview.see(first_item)
+            self.on_file_select(None)
+
     def open_selected_nfo(self):
-        # 打开选中的 NFO 文件
-        selected_indices = self.file_listbox.curselection()
-        if selected_indices:
-            selected_index = selected_indices[0]
-            nfo_file_path = os.path.join(self.folder_path, self.file_listbox.get(selected_index))
-            if os.path.exists(nfo_file_path):
-                os.startfile(nfo_file_path)
-            else:
-                messagebox.showerror("Error", f"NFO file does not exist: {nfo_file_path}")
+        selected_items = self.file_treeview.selection()
+        for selected_item in selected_items:
+            item = self.file_treeview.item(selected_item)
+            values = item["values"]
+            if values[2]:  # 如果有NFO文件
+                if values[1]:
+                    nfo_file_path = os.path.join(self.folder_path, values[0], values[1], values[2])
+                else:
+                    nfo_file_path = os.path.join(self.folder_path, values[0], values[2])
+                if os.path.exists(nfo_file_path):
+                    os.startfile(nfo_file_path)
+                else:
+                    messagebox.showerror("Error", f"NFO file does not exist: {nfo_file_path}")
 
     def open_selected_folder(self):
-        # 打开包含选中 NFO 文件的文件夹
-        selected_indices = self.file_listbox.curselection()
-        if selected_indices:
-            selected_index = selected_indices[0]
-            nfo_file_path = os.path.join(self.folder_path, self.file_listbox.get(selected_index))
-            if os.path.exists(nfo_file_path):
-                folder_path = os.path.dirname(nfo_file_path)
-                os.startfile(folder_path)
-            else:
-                messagebox.showerror("Error", f"NFO file does not exist: {nfo_file_path}")
+        selected_items = self.file_treeview.selection()
+        for selected_item in selected_items:
+            item = self.file_treeview.item(selected_item)
+            values = item["values"]
+            if values[2]:  # 如果有NFO文件
+                if values[1]:
+                    nfo_file_path = os.path.join(self.folder_path, values[0], values[1], values[2])
+                else:
+                    nfo_file_path = os.path.join(self.folder_path, values[0], values[2])
+                if os.path.exists(nfo_file_path):
+                    folder_path = os.path.dirname(nfo_file_path)
+                    os.startfile(folder_path)
+                else:
+                    messagebox.showerror("Error", f"NFO file does not exist: {nfo_file_path}")
 
     def open_selected_video(self):
         video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.strm']  # 添加其他视频格式（如有需要）
-
-        selected_indices = self.file_listbox.curselection()
-        if selected_indices:
-            selected_index = selected_indices[0]
-            nfo_file_path = os.path.join(self.folder_path, self.file_listbox.get(selected_index))
-            if os.path.exists(nfo_file_path):
-                video_file_base = os.path.splitext(nfo_file_path)[0]
-                for ext in video_extensions:
-                    video_file = video_file_base + ext
-                    if os.path.exists(video_file):
-                        os.startfile(video_file)
-                        return
-                messagebox.showerror("错误", "没有找到支持的格式的视频文件：.mp4, .mkv, .avi, .mov, .strm")
-            else:
-                messagebox.showerror("错误", f"NFO文件不存在：{nfo_file_path}")
+        selected_items = self.file_treeview.selection()
+        for selected_item in selected_items:
+            item = self.file_treeview.item(selected_item)
+            values = item["values"]
+            if values[2]:  # 如果有NFO文件
+                if values[1]:
+                    nfo_file_path = os.path.join(self.folder_path, values[0], values[1], values[2])
+                else:
+                    nfo_file_path = os.path.join(self.folder_path, values[0], values[2])
+                if os.path.exists(nfo_file_path):
+                    video_file_base = os.path.splitext(nfo_file_path)[0]
+                    for ext in video_extensions:
+                        video_file = video_file_base + ext
+                        if os.path.exists(video_file):
+                            os.startfile(video_file)
+                            return
+                    messagebox.showerror("错误", "没有找到支持的格式的视频文件：.mp4, .mkv, .avi, .mov, .strm")
+                else:
+                    messagebox.showerror("错误", f"NFO文件不存在：{nfo_file_path}")
 
     def on_file_select(self, event):
-        selected_index = self.file_listbox.curselection()
-        #print(f"File selected: {selected_index}")
-        if selected_index:  # 确保选中的索引非空
-            self.current_file_path = os.path.join(self.folder_path, self.file_listbox.get(selected_index[0]))
-            self.load_nfo_fields()
-            if self.show_images_var.get():
-                self.display_image()
-            self.selected_index_cache = selected_index  # 只有在非空时才更新缓存
-        #else:
-            #print("No file selected, cache not updated.")
+        selected_items = self.file_treeview.selection()
+        if selected_items:  # 确保选中的项非空
+            for selected_item in selected_items:
+                item = self.file_treeview.item(selected_item)
+                values = item["values"]
+                if values[2]:  # 如果有NFO文件
+                    if values[1]:
+                        self.current_file_path = os.path.join(self.folder_path, values[0], values[1], values[2])
+                    else:
+                        self.current_file_path = os.path.join(self.folder_path, values[0], values[2])
+                    self.load_nfo_fields()
+                    if self.show_images_var.get():
+                        self.display_image()
+            self.selected_index_cache = selected_items  # 只有在非空时才更新缓存
 
     def load_nfo_fields(self):
         for entry in self.fields_entries.values():
@@ -328,13 +361,10 @@ class NFOEditorApp:
             webbrowser.open(url)
 
     def on_entry_focus_out(self, event):
-        #print(f"Entry focus out: Current selection before re-select: {self.file_listbox.curselection()}")
         if self.selected_index_cache:  # 确保缓存非空
-            self.file_listbox.selection_set(self.selected_index_cache[0])  # 使用保存的索引恢复选中状态
-            self.file_listbox.see(self.selected_index_cache[0])  # 确保选中的条目可见
-            #print(f"Re-set selection to {self.selected_index_cache}.")
-        #else:
-            #print("No cached index to restore.")
+            for selected_index in self.selected_index_cache:
+                self.file_treeview.selection_set(selected_index)  # 使用保存的索引恢复选中状态
+                self.file_treeview.see(selected_index)  # 确保选中的条目可见
 
     def save_changes(self):
         if not self.current_file_path:
@@ -411,9 +441,9 @@ class NFOEditorApp:
 
             # 操作完成后重新选中之前选中的文件
             if self.selected_index_cache:
-                self.file_listbox.selection_set(self.selected_index_cache[0])
-                self.file_listbox.see(self.selected_index_cache[0])  # 确保选中的条目可见
-                #print(f"Re-set selection to {self.selected_index_cache} after saving changes.")
+                self.file_treeview.selection_set(self.selected_index_cache)
+                for selected_index in self.selected_index_cache:
+                    self.file_treeview.see(selected_index)  # 确保选中的条目可见
             
         except Exception as e:
             messagebox.showerror("Error", f"Error saving changes to NFO file: {str(e)}")
@@ -423,15 +453,21 @@ class NFOEditorApp:
         self.save_time_label.config(text=f"保存时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     def sort_files(self):
-        # 根据选中的排序方式对文件列表进行排序
         sort_by = self.sorting_var.get()
+        
+        # 获取 Treeview 中的所有项
+        items = [(self.file_treeview.set(k, "一级目录"), 
+                  self.file_treeview.set(k, "二级目录"), 
+                  self.file_treeview.set(k, "NFO文件"), 
+                  k) for k in self.file_treeview.get_children("")]
+
         if sort_by == "filename":
-            self.nfo_files.sort()
+            items.sort(key=lambda t: t[2])  # 按 NFO 文件名排序
         else:
-            # 加载并解析每个 NFO 文件以获取排序依据字段的值
-            def get_sort_key(nfo_file):
+            def get_sort_key(item):
                 try:
-                    tree = ET.parse(nfo_file)
+                    nfo_file_path = os.path.join(self.folder_path, item[0], item[1], item[2])
+                    tree = ET.parse(nfo_file_path)
                     root = tree.getroot()
                     
                     if sort_by == "actors":
@@ -452,15 +488,13 @@ class NFOEditorApp:
                                 return child.text.strip()
                 except ET.ParseError:
                     pass
-                
                 return ""
+            
+            items.sort(key=get_sort_key)
 
-            self.nfo_files.sort(key=get_sort_key)
-
-        # 更新文件列表框
-        self.file_listbox.delete(0, tk.END)
-        for nfo_file in self.nfo_files:
-            self.file_listbox.insert(tk.END, os.path.relpath(nfo_file, self.folder_path))
+        # 清空 Treeview 并重新插入排序后的项
+        for i, (一级目录, 二级目录, NFO文件, k) in enumerate(items):
+            self.file_treeview.move(k, '', i)
 
     def batch_filling(self):
         # 批量填充对话框逻辑
@@ -469,16 +503,17 @@ class NFOEditorApp:
             fill_value = fill_entry.get()
             operation_log = ""
 
-            selected_files = self.file_listbox.curselection()  # 获取选择的文件
+            selected_files = self.file_treeview.selection()  # 获取选择的文件
             if not selected_files:
                 messagebox.showwarning("警告", "请先选择要填充的文件")
                 return
 
             if field and fill_value:
-                for i in selected_files:
-                    nfo_file = self.file_listbox.get(i)  # 获取选择的文件路径
+                for item in selected_files:
+                    item_values = self.file_treeview.item(item, "values")
+                    nfo_file = os.path.join(self.folder_path, item_values[0], item_values[1], item_values[2])  # 获取选择的文件路径
                     try:
-                        tree = ET.parse(os.path.join(self.folder_path, nfo_file))  # 修改为完整路径
+                        tree = ET.parse(nfo_file)
                         root = tree.getroot()
 
                         # 如果字段不存在，则创建新的元素
@@ -500,7 +535,7 @@ class NFOEditorApp:
                         formatted_lines = [line for line in pretty_lines if line.strip()]
                         formatted_str = "\n".join(formatted_lines)
 
-                        with open(os.path.join(self.folder_path, nfo_file), 'w', encoding='utf-8') as file:  # 保存到原文件
+                        with open(nfo_file, 'w', encoding='utf-8') as file:  # 保存到原文件
                             file.write(formatted_str)
 
                         operation_log += f"{nfo_file}: {field}字段填充成功\n"
@@ -513,21 +548,22 @@ class NFOEditorApp:
         # 创建批量填充对话框
         dialog = Toplevel(self.root)
         dialog.title("批量填充 (Batch Fill)")
-        dialog.geometry("400x300")
+        # 设置对话框大小和位置
+        dialog.geometry("400x600+325+100")  # 可以根据需要设置位置和大小
 
-        tk.Label(dialog, text="选择填充替换字段 (Select Field):").pack(pady=5)
+        tk.Label(dialog, text="选择填充替换字段 (Select Field):").pack(pady=5, anchor=tk.W)
         field_var = tk.StringVar(value="series")
         tk.Radiobutton(dialog, text="系列 (Series)", variable=field_var, value="series").pack(anchor=tk.W)
         tk.Radiobutton(dialog, text="评分 (Rating)", variable=field_var, value="rating").pack(anchor=tk.W)
 
-        tk.Label(dialog, text="填充替换值 (Fill Field Value):").pack(pady=5)
+        tk.Label(dialog, text="填充替换值 (Fill Field Value):").pack(pady=5, anchor=tk.W)
         fill_entry = tk.Entry(dialog, width=40)
         fill_entry.pack(pady=5)
 
-        tk.Button(dialog, text="应用填充替换 (Apply Fill)", command=apply_fill).pack(pady=10)
+        tk.Button(dialog, text="应用填充 (Apply Fill)", command=apply_fill).pack(pady=10)
 
-        tk.Label(dialog, text="操作日志 (Operation Log):").pack(pady=5)
-        log_text = tk.Text(dialog, width=50, height=10)
+        tk.Label(dialog, text="操作日志 (Operation Log):").pack(pady=5, anchor=tk.W)
+        log_text = tk.Text(dialog, width=50, height=20)
         log_text.pack(pady=5)
 
     def batch_add(self):
@@ -537,16 +573,17 @@ class NFOEditorApp:
             add_value = add_entry.get()
             operation_log = ""
 
-            selected_files = self.file_listbox.curselection()  # 获取选择的文件
+            selected_files = self.file_treeview.selection()  # 获取选择的文件
             if not selected_files:
                 messagebox.showwarning("警告", "请先选择要新增的文件")
                 return
 
             if field and add_value:
-                for i in selected_files:
-                    nfo_file = self.file_listbox.get(i)  # 获取选择的文件路径
+                for item in selected_files:
+                    item_values = self.file_treeview.item(item, "values")
+                    nfo_file = os.path.join(self.folder_path, item_values[0], item_values[1], item_values[2])  # 获取选择的文件路径
                     try:
-                        tree = ET.parse(os.path.join(self.folder_path, nfo_file))  # 修改为完整路径
+                        tree = ET.parse(nfo_file)
                         root = tree.getroot()
 
                         # 如果字段不存在，则创建新的元素
@@ -568,7 +605,7 @@ class NFOEditorApp:
                         formatted_lines = [line for line in pretty_lines if line.strip()]
                         formatted_str = "\n".join(formatted_lines)
 
-                        with open(os.path.join(self.folder_path, nfo_file), 'w', encoding='utf-8') as file:  # 保存到原文件
+                        with open(nfo_file, 'w', encoding='utf-8') as file:  # 保存到原文件
                             file.write(formatted_str)
 
                         operation_log += f"{nfo_file}: {field}字段新增成功\n"
@@ -581,21 +618,23 @@ class NFOEditorApp:
        # 创建批量新增对话框
         dialog = Toplevel(self.root)
         dialog.title("批量新增 (Batch Add)")
-        dialog.geometry("400x300")
 
-        tk.Label(dialog, text="选择字段新增一个值 (Select Field):").pack(pady=5)
+        # 设置对话框大小和位置
+        dialog.geometry("400x600+325+100")  # 可以根据需要设置位置和大小
+
+        tk.Label(dialog, text="选择字段新增一个值 (Select Field):").pack(pady=5, anchor=tk.W)
         field_var = tk.StringVar(value="tag")
         tk.Radiobutton(dialog, text="标签 (Tag)", variable=field_var, value="tag").pack(anchor=tk.W)
         tk.Radiobutton(dialog, text="类型 (Genre)", variable=field_var, value="genre").pack(anchor=tk.W)
 
-        tk.Label(dialog, text="输入新增值 (Enter Value to Add):").pack(pady=5)
+        tk.Label(dialog, text="输入新增值 (Enter Value to Add):").pack(pady=5, anchor=tk.W)
         add_entry = tk.Entry(dialog, width=40)
         add_entry.pack(pady=5)
 
         tk.Button(dialog, text="应用新增 (Apply Add)", command=apply_add).pack(pady=10)
 
-        tk.Label(dialog, text="操作日志 (Operation Log):").pack(pady=5)
-        log_text = tk.Text(dialog, width=50, height=10)
+        tk.Label(dialog, text="操作日志 (Operation Log):").pack(pady=5, anchor=tk.W)
+        log_text = tk.Text(dialog, width=50, height=20)
         log_text.pack(pady=5)
 
 if __name__ == "__main__":
