@@ -7,11 +7,15 @@ import xml.dom.minidom as minidom
 from PIL import Image, ImageTk
 import subprocess
 from tkinter import ttk
+# 鼠标悬停模块
+from idlelib.tooltip import Hovertip
+# 引入 cg_strm.py 中的 BatchCopyTool 类
+from cg_strm import BatchCopyTool
 
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v7.0.0")
+        self.root.title("大锤 NFO Editor v7.0.1")
 
         self.current_file_path = None
         self.fields_entries = {}
@@ -23,17 +27,31 @@ class NFOEditorApp:
         top_frame = tk.Frame(self.root)
         top_frame.pack(side=tk.TOP, fill=tk.X)
 
-        select_directory_button = tk.Button(top_frame, text="选择目录 (Select Directory)", command=self.open_folder)
+        select_directory_button = tk.Button(top_frame, text="选择目录 (Select Directory)", command=self.open_folder, font=("Arial", 12))
         select_directory_button.pack(side=tk.LEFT, padx=5)
+        # 鼠标悬停提示
+        Hovertip(select_directory_button, '选择目录以加载NFO文件')
 
-        open_nfo_button = tk.Button(top_frame, text="🖊", command=self.open_selected_nfo)
+        open_nfo_button = tk.Button(top_frame, text="🖊", command=self.open_selected_nfo, font=("Arial", 12))
         open_nfo_button.pack(side=tk.LEFT, padx=5)
+        Hovertip(open_nfo_button, '打开选中的NFO文件')
 
-        open_folder_button = tk.Button(top_frame, text="📁", command=self.open_selected_folder)
+        open_folder_button = tk.Button(top_frame, text="📁", command=self.open_selected_folder, font=("Arial", 12))
         open_folder_button.pack(side=tk.LEFT, padx=5)
+        Hovertip(open_folder_button, '打开选中的文件夹')
 
-        open_video_button = tk.Button(top_frame, text="▶", command=self.open_selected_video)
+        open_video_button = tk.Button(top_frame, text="⏯", command=self.open_selected_video, font=("Arial", 12))
         open_video_button.pack(side=tk.LEFT, padx=5)
+        Hovertip(open_video_button, '播放选中的视频文件')
+
+        open_strm_button = tk.Button(top_frame, text="🔗", command=self.open_batch_copy_tool, font=("Arial", 12))
+        open_strm_button.pack(side=tk.LEFT, padx=5)
+        Hovertip(open_strm_button, '打开strm同步工具')
+
+        # 新增刷新按钮
+        refresh_button = tk.Button(top_frame, text="🔁", command=self.load_files_in_folder, font=("Arial", 12))
+        refresh_button.pack(side=tk.LEFT, padx=5)
+        Hovertip(refresh_button, '刷新文件列表')
 
         self.folder_path_label = tk.Label(top_frame, text="")
         self.folder_path_label.pack(side=tk.RIGHT, padx=5)
@@ -41,6 +59,7 @@ class NFOEditorApp:
         # 图片显示开关
         image_toggle = tk.Checkbutton(top_frame, text="显示图片", variable=self.show_images_var, command=self.toggle_image_display)
         image_toggle.pack(side=tk.RIGHT, padx=5)
+        Hovertip(image_toggle, '显示或隐藏图片')
 
         # 创建排序选项
         sorting_frame = tk.Frame(self.root)
@@ -123,6 +142,11 @@ class NFOEditorApp:
 
         # 运行主循环
         self.root.mainloop()
+
+    def open_batch_copy_tool(self):
+        new_window = tk.Toplevel(self.root)
+        batch_copy_tool_app = BatchCopyTool(new_window, self.folder_path)
+        new_window.grab_set()  # 确保批量复制工具窗口比NFO.Editor主界面高一层
 
     def toggle_image_display(self):
         if self.show_images_var.get():
@@ -294,8 +318,17 @@ class NFOEditorApp:
                     for ext in video_extensions:
                         video_file = video_file_base + ext
                         if os.path.exists(video_file):
-                            os.startfile(video_file)
-                            return
+                            if ext == '.strm':
+                                with open(video_file, 'r') as strm_file:
+                                    video_file_path = strm_file.readline().strip()
+                                    if os.path.exists(video_file_path):
+                                        os.startfile(video_file_path)
+                                        return
+                                    else:
+                                        messagebox.showerror("错误", f"视频文件路径不存在：{video_file_path}")
+                            else:
+                                os.startfile(video_file)
+                                return
                     messagebox.showerror("错误", "没有找到支持的格式的视频文件：.mp4, .mkv, .avi, .mov, .strm")
                 else:
                     messagebox.showerror("错误", f"NFO文件不存在：{nfo_file_path}")
