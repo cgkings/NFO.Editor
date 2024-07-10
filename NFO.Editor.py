@@ -12,7 +12,7 @@ import xml.dom.minidom as minidom
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v8.0.1")
+        self.root.title("大锤 NFO Editor v9.0.0")
 
         self.current_file_path = None
         self.fields_entries = {}
@@ -199,17 +199,23 @@ class NFOEditorApp:
         self.nfo_files = []
         try:
             for root, dirs, files in os.walk(self.folder_path):
-                rel_dir = os.path.relpath(root, self.folder_path)
-                if rel_dir == '.':
-                    continue
-                parts = rel_dir.split(os.sep)
                 for file in files:
                     if file.endswith('.nfo'):
                         self.nfo_files.append(os.path.join(root, file))
-                        if len(parts) == 1:
-                            self.file_treeview.insert("", "end", values=(parts[0], "", file))
-                        elif len(parts) == 2:
-                            self.file_treeview.insert("", "end", values=(parts[0], parts[1], file))
+                        nfo_file_path = os.path.join(root, file)
+                        relative_path = os.path.relpath(nfo_file_path, self.folder_path)
+                        parts = relative_path.split(os.sep)
+
+                        if len(parts) > 1:
+                            nfo_file = parts[-1]
+                            second_level_dir = parts[-2]
+                            first_level_dirs = os.sep.join(parts[:-2])
+                        else:
+                            nfo_file = parts[-1]
+                            second_level_dir = ""
+                            first_level_dirs = ""
+
+                        self.file_treeview.insert("", "end", values=(first_level_dirs, second_level_dir, nfo_file))
         except OSError as e:
             messagebox.showerror("Error", f"Error loading files from folder: {str(e)}")
 
