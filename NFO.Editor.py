@@ -12,7 +12,7 @@ import xml.dom.minidom as minidom
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v8.0.0")
+        self.root.title("大锤 NFO Editor v8.0.1")
 
         self.current_file_path = None
         self.fields_entries = {}
@@ -132,11 +132,11 @@ class NFOEditorApp:
 
         self.poster_label = tk.Label(poster_frame, text="封面图 (poster)", fg="black")
         self.poster_label.pack(expand=True)
-        self.poster_label.bind("<Button-1>", lambda event: self.open_image_and_crop('poster'))
+        self.poster_label.bind("<Button-1>", lambda event: self.open_image_and_crop('fanart'))
 
         self.thumb_label = tk.Label(thumb_frame, text="缩略图 (thumb)", fg="black")
         self.thumb_label.pack(expand=True)
-        self.thumb_label.bind("<Button-1>", lambda event: self.open_image_and_crop('thumb'))
+        self.thumb_label.bind("<Button-1>", lambda event: self.open_image_and_crop('fanart'))
 
         self.create_field_labels()
 
@@ -690,11 +690,11 @@ class NFOEditorApp:
         import sys
 
         app = QtWidgets.QApplication(sys.argv)
-        Dialog = QtWidgets.QMainWindow()
-        ui = Ui_Dialog_cut_poster()
-        ui.setupUi(Dialog)
+        main_window = QtWidgets.QMainWindow()
+        ui = Ui_Dialog_cut_poster(main_window)
+        ui.setupUi(main_window)
         ui.load_image(image_path)  # 使用新的 load_image 方法
-        Dialog.show()
+        main_window.show()
         app.exec_()
 
     def open_image_and_crop(self, image_type):
