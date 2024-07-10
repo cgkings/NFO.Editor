@@ -580,6 +580,15 @@ class NFOEditorApp:
         log_text = tk.Text(dialog, width=50, height=20)
         log_text.pack(pady=5)
 
+    def load_target_files(self, path):
+        self.sorted_treeview.delete(*self.sorted_treeview.get_children())
+        if path != os.path.abspath(os.path.join(path, "..")):
+            self.sorted_treeview.insert("", "end", values=("..",))
+        for item in os.listdir(path):
+            full_path = os.path.join(path, item)
+            if os.path.isdir(full_path):
+                self.sorted_treeview.insert("", "end", values=(item,))
+
     def start_move_thread(self):
         move_thread = threading.Thread(target=self.move_selected_folder)
         move_thread.start()
@@ -614,7 +623,7 @@ class NFOEditorApp:
         target_folder = filedialog.askdirectory(title="选择目标目录")
         if target_folder:
             self.current_target_path = target_folder
-            self.load_target_folder(target_folder)
+            self.load_target_files(target_folder)
 
     def load_target_folder(self, path):
         self.sorted_treeview.delete(*self.sorted_treeview.get_children())
@@ -636,8 +645,10 @@ class NFOEditorApp:
             selected_path = self.sorted_treeview.item(item)["values"][0]
             if selected_path == "..":
                 selected_path = os.path.abspath(os.path.join(self.current_target_path, ".."))
+            else:
+                selected_path = os.path.join(self.current_target_path, selected_path)
             self.current_target_path = selected_path
-            self.load_target_folder(selected_path)
+            self.load_target_files(selected_path)
 
     def open_batch_copy_tool(self):
         from cg_strm import BatchCopyTool
