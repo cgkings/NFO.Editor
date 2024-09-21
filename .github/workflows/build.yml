@@ -41,7 +41,7 @@ jobs:
 
     - name: 运行 PyInstaller
       run: |
-        pyinstaller --name "${{ env.BUILD_NAME }}" --noconsole --icon="chuizi.ico" --add-data "Img:Img" "NFO.Editor.py"
+        pyinstaller --name "${{ env.BUILD_NAME }}" --onefile --noconsole --icon="chuizi.ico" --add-data "Img:Img" "NFO.Editor.py"
 
     - name: 列出 dist 目录
       run: |
