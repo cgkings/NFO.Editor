@@ -66,9 +66,21 @@ jobs:
           exit 1
         }
 
-    - name: 打包构建产物
-      uses: actions/upload-artifact@v3
+    - name: 创建 Release
+      id: create_release
+      uses: softprops/action-gh-release@v1
       with:
-        name: NFO.Editor-build-windows
-        path: |
-          dist/${{ env.BUILD_NAME }}.*
+        tag_name: ${{ env.BUILD_NAME }}  # 使用构建名称作为标签
+        release_name: Release ${{ env.BUILD_NAME }}
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: 上传构建产物到 Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ env.BUILD_NAME }}  # 与创建 Release 时相同
+        files: dist/${{ env.BUILD_NAME }}.exe  # 上传的文件
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
