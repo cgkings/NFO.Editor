@@ -82,6 +82,6 @@ jobs:
       with:
         tag_name: ${{ env.BUILD_NAME }}  # 与创建 Release 时相同
         files: dist/NFO.Editor.exe  # 上传的文件
-        name: NFO.Editor.${{ github.ref.Substring(10) }}.exe  # 使用标签名作为文件名
+        name: NFO.Editor.${{ env.BUILD_NAME }}.exe  # 使用标签名作为文件名
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
