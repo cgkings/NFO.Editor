@@ -3,7 +3,7 @@ name: Build NFO.Editor
 on:
   push:
     tags:
-      - 'v*.*.*'  # 仅在创建符合格式 v9.0.0 的标签时触发
+      - 'v*.*.*'  # 仅在创建符合格式 v*.*.* 的标签时触发
   workflow_dispatch:  # 允许手动触发构建
 
 jobs:
@@ -40,7 +40,14 @@ jobs:
         if ($env:GITHUB_EVENT_NAME -eq "push" -and $env:GITHUB_REF -match '^refs/tags/v.*') {
           $BUILD_NAME = $env:GITHUB_REF.Substring(10)  # 去掉 "refs/tags/"
         } else {
-          $BUILD_NAME = "NFO.Editor" + (Get-Date -Format "yyyy-MM-dd-HH-mm-ss")
+          # 获取最新的标签
+          git fetch --tags
+          $latestTag = git describe --tags $(git rev-list --tags --max-count=1)
+          if ($null -eq $latestTag) {
+            Write-Error "未找到任何标签，无法继续。"
+            exit 1
+          }
+          $BUILD_NAME = $latestTag
         }
         echo "BUILD_NAME=$BUILD_NAME" >> $env:GITHUB_ENV
 
@@ -70,7 +77,7 @@ jobs:
       id: create_release
       uses: softprops/action-gh-release@v1
       with:
-        tag_name: ${{ env.BUILD_NAME }}  # 使用构建名称作为标签
+        tag_name: ${{ env.BUILD_NAME }}  # 使用现有的标签
         release_name: Release ${{ env.BUILD_NAME }}
         draft: false
         prerelease: false
