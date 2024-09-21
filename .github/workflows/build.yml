@@ -34,7 +34,7 @@ jobs:
         pip install -r requirements.txt
         pip install pyinstaller
 
-      - name: 设置构建名称
+    - name: 设置构建名称
       id: set_build_name
       run: |
         if ($env:GITHUB_EVENT_NAME -eq "push" -and $env:GITHUB_REF -match '^refs/tags/v.*') {
@@ -59,12 +59,12 @@ jobs:
         echo "原始名称: $ORIGINAL_NAME"
         echo "新名称: $NEW_NAME"
 
-        if [ -f "${ORIGINAL_NAME}" ]; then
-          mv "${ORIGINAL_NAME}" "${NEW_NAME}"
-        else
+        if (Test-Path $ORIGINAL_NAME) {
+          Rename-Item $ORIGINAL_NAME $NEW_NAME
+        } else {
           echo "错误: 构建产物 ${ORIGINAL_NAME} 不存在。"
           exit 1
-        fi
+        }
 
     - name: 打包构建产物
       uses: actions/upload-artifact@v3
