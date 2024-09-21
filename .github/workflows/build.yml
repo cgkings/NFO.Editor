@@ -62,7 +62,7 @@ jobs:
     - name: 重命名构建产物
       run: |
         $ORIGINAL_NAME = "dist/NFO.Editor.exe"  # 使用实际生成的文件名
-        $NEW_NAME = "dist/${{ env.BUILD_NAME }}.exe"
+        $NEW_NAME = "dist/NFO.Editor.${{ env.BUILD_NAME }}.exe"
         echo "原始名称: $ORIGINAL_NAME"
         echo "新名称: $NEW_NAME"
 
