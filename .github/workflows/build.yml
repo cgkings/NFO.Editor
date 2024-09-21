@@ -40,7 +40,7 @@ jobs:
         if ($env:GITHUB_EVENT_NAME -eq "push" -and $env:GITHUB_REF -match '^refs/tags/v.*') {
           $BUILD_NAME = $env:GITHUB_REF.Substring(10)  # 去掉 "refs/tags/"
         } else {
-          $BUILD_NAME = "build-" + (Get-Date -Format "yyyy-MM-dd-HH-mm-ss")
+          $BUILD_NAME = "NFO.Editor" + (Get-Date -Format "yyyy-MM-dd-HH-mm-ss")
         }
         echo "BUILD_NAME=$BUILD_NAME" >> $env:GITHUB_ENV
 
@@ -71,7 +71,7 @@ jobs:
       uses: softprops/action-gh-release@v1
       with:
         tag_name: ${{ env.BUILD_NAME }}  # 使用构建名称作为标签
-        release_name: ${{ env.BUILD_NAME }}  # 使用构建名称作为 Release 名称
+        release_name: Release ${{ env.BUILD_NAME }}
         draft: false
         prerelease: false
       env:
@@ -81,7 +81,6 @@ jobs:
       uses: softprops/action-gh-release@v1
       with:
         tag_name: ${{ env.BUILD_NAME }}  # 与创建 Release 时相同
-        files: dist/NFO.Editor.exe  # 上传的文件
-        name: NFO.Editor.${{ env.BUILD_NAME }}.exe  # 使用标签名作为文件名
+        files: dist/${{ env.BUILD_NAME }}.exe  # 上传的文件
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
