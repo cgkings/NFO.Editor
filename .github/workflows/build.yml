@@ -1,6 +1,14 @@
+name: Build NFO.Editor
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # 仅在创建符合格式 v9.0.0 的标签时触发
+  workflow_dispatch:  # 允许手动触发构建
+
 jobs:
   build:
-    runs-on: windows-latest  # 使用 Windows 环境
+    runs-on: windows-latest  # 只在 Windows 上构建
 
     steps:
     - name: 检出代码
@@ -11,23 +19,60 @@ jobs:
       with:
         python-version: '3.12.2'
 
+    - name: 缓存 pip 依赖
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/pip
+        key: windows-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          windows-pip-
+
     - name: 安装依赖
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install pyinstaller
+      shell: bash
+
+    - name: 设置构建名称
+      id: set_build_name
+      run: |
+        if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" =~ ^refs/tags/v.* ]]; then
+          BUILD_NAME=${GITHUB_REF#refs/tags/}
+        else
+          BUILD_NAME=build-$(date +"%Y-%m-%d-%H-%M-%S")
+        fi
+        echo "BUILD_NAME=${BUILD_NAME}" >> $GITHUB_ENV
+      shell: bash
 
     - name: 运行 PyInstaller
       run: |
         pyinstaller --name "NFO.Editor" --onefile --noconsole --icon="chuizi.ico" --add-data "Img;Img" "NFO.Editor.py"
+      shell: bash
 
-    - name: 列出 dist 目录
+      - name: 列出 dist 目录
       run: |
         dir dist  # 列出 dist 目录下的文件，帮助确认可执行文件
+
+    - name: 重命名构建产物
+      run: |
+        ORIGINAL_NAME="dist/${BUILD_NAME}.exe"
+        NEW_NAME="${BUILD_NAME}.exe"
+        echo "原始名称: $ORIGINAL_NAME"
+        echo "新名称: $NEW_NAME"
+
+        if [ -f "${ORIGINAL_NAME}" ]; then
+          mv "${ORIGINAL_NAME}" "${NEW_NAME}"
+        else
+          echo "错误: 构建产物 ${ORIGINAL_NAME} 不存在。"
+          exit 1
+        fi
+      shell: bash
 
     - name: 打包构建产物
       uses: actions/upload-artifact@v3
       with:
         name: NFO.Editor-build-windows
         path: |
-          dist/NFO.Editor.exe  # 直接使用生成的 Windows 可执行文件名
+          dist/${{ env.BUILD_NAME }}.*
