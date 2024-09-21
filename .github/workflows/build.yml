@@ -46,7 +46,7 @@ jobs:
         echo "BUILD_NAME=${BUILD_NAME}" >> $GITHUB_ENV
       shell: bash
 
-    - name: 运行 PyInstaller
+      - name: 运行 PyInstaller
       run: |
         pyinstaller --name "NFO.Editor" --onefile --noconsole --icon="chuizi.ico" --add-data "Img;Img" "NFO.Editor.py"
       shell: bash
