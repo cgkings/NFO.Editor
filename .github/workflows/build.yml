@@ -37,7 +37,7 @@ jobs:
 
     - name: 运行 PyInstaller
       run: |
-        pyinstaller --name "${{ env.BUILD_NAME }}" --noconsole --icon="chuizi.ico" --add-data "img;img" "NFO.Editor.py"
+        pyinstaller --name "${{ env.BUILD_NAME }}" --noconsole --icon="chuizi.ico" --add-data "img:img" "NFO.Editor.py"
 
     - name: 重命名构建产物
       run: |
