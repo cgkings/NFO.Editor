@@ -25,6 +25,10 @@ jobs:
         pip install -r requirements.txt
         pip install pyinstaller
 
+    - name: 列出当前目录
+      run: |
+        ls -R  # 列出当前目录结构，帮助调试
+
     - name: 设置构建名称
       id: set_build_name
       run: |
@@ -37,7 +41,7 @@ jobs:
 
     - name: 运行 PyInstaller
       run: |
-        pyinstaller --name "${{ env.BUILD_NAME }}" --noconsole --icon="chuizi.ico" --add-data "img:img" "NFO.Editor.py"
+        pyinstaller --name "${{ env.BUILD_NAME }}" --noconsole --icon="chuizi.ico" --add-data "Img:Img" "NFO.Editor.py"
 
     - name: 重命名构建产物
       run: |
