@@ -1,0 +1,84 @@
+name: Build NFO.Editor
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # 仅在创建符合格式 v9.0.0 的标签时触发
+  workflow_dispatch:  # 允许手动触发构建
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+        python-version: [3.12.2]
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v3
+
+    - name: 设置 Python 版本
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: 缓存 pip 依赖
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: 安装依赖
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install pyinstaller
+
+    - name: 设置构建名称
+      id: set_build_name
+      run: |
+        if [[ "${{ github.event_name }}" == "push" && "${{ startsWith(github.ref, 'refs/tags/v') }}" == "true" ]]; then
+          BUILD_NAME=${GITHUB_REF#refs/tags/}
+        else
+          BUILD_NAME=build-$(date +"%Y-%m-%d-%H-%M-%S")
+        fi
+        echo "BUILD_NAME=${BUILD_NAME}" >> $GITHUB_ENV
+      shell: bash
+
+    - name: 运行 PyInstaller
+      run: |
+        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          ADD_DATA="img;img"
+          ICON_FILE="chuizi.ico"
+          EXTENSION=".exe"
+        elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+          ADD_DATA="img:img"
+          ICON_FILE="chuizi.icns"  # macOS 使用 .icns 格式的图标
+          EXTENSION=".app"
+        fi
+        pyinstaller --name "${{ env.BUILD_NAME }}" --noconsole --icon="${ICON_FILE}" --add-data "${ADD_DATA}" "NFO.Editor.py"
+      shell: bash
+
+    - name: 重命名构建产物
+      run: |
+        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          ORIGINAL_NAME="dist/${{ env.BUILD_NAME }}.exe"
+          NEW_NAME="${{ env.BUILD_NAME }}.exe"
+        elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+          ORIGINAL_NAME="dist/${{ env.BUILD_NAME }}.app"
+          NEW_NAME="${{ env.BUILD_NAME }}.app"
+        fi
+        mv "${ORIGINAL_NAME}" "${NEW_NAME}"
+      shell: bash
+
+    - name: 打包构建产物
+      uses: actions/upload-artifact@v3
+      with:
+        name: NFO.Editor-build-${{ matrix.os }}
+        path: |
+          dist/${{ env.BUILD_NAME }}.*
