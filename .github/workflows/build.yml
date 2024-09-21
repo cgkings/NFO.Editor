@@ -88,6 +88,6 @@ jobs:
       uses: softprops/action-gh-release@v1
       with:
         tag_name: ${{ env.BUILD_NAME }}  # 与创建 Release 时相同
-        files: dist/${{ env.BUILD_NAME }}.exe  # 上传的文件
+        files: dist/NFO.Editor.${{ env.BUILD_NAME }}.exe  # 上传的文件
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
