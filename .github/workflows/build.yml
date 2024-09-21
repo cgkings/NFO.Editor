@@ -60,7 +60,7 @@ jobs:
         echo "新名称: $NEW_NAME"
 
         if (Test-Path $ORIGINAL_NAME) {
-          Rename-Item $ORIGINAL_NAME $NEW_NAME
+          Move-Item -Path $ORIGINAL_NAME -Destination $NEW_NAME  # 使用 Move-Item 进行重命名
         } else {
           echo "错误: 构建产物 ${ORIGINAL_NAME} 不存在。"
           exit 1
