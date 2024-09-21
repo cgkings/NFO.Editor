@@ -43,10 +43,14 @@ jobs:
       run: |
         pyinstaller --name "${{ env.BUILD_NAME }}" --noconsole --icon="chuizi.ico" --add-data "Img:Img" "NFO.Editor.py"
 
+    - name: 列出 dist 目录
+      run: |
+        ls -R dist/  # 列出 dist 目录下的文件，帮助确认可执行文件
+
     - name: 重命名构建产物
       run: |
-        ORIGINAL_NAME="dist/${{ env.BUILD_NAME }}.exe"
-        NEW_NAME="${{ env.BUILD_NAME }}.exe"
+        ORIGINAL_NAME="dist/${{ env.BUILD_NAME }}"
+        NEW_NAME="${{ env.BUILD_NAME }}"
         if [ -f "${ORIGINAL_NAME}" ]; then
           mv "${ORIGINAL_NAME}" "${NEW_NAME}"
         else
