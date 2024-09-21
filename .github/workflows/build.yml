@@ -1,14 +1,6 @@
-name: Build NFO.Editor
-
-on:
-  push:
-    tags:
-      - 'v*.*.*'  # 仅在创建符合格式 v9.0.0 的标签时触发
-  workflow_dispatch:  # 允许手动触发构建
-
 jobs:
   build:
-    runs-on: ubuntu-latest  # 使用 Ubuntu 作为基础环境
+    runs-on: windows-latest  # 使用 Windows 环境
 
     steps:
     - name: 检出代码
@@ -25,41 +17,17 @@ jobs:
         pip install -r requirements.txt
         pip install pyinstaller
 
-    - name: 列出当前目录
-      run: |
-        ls -R  # 列出当前目录结构，帮助调试
-
-    - name: 设置构建名称
-      id: set_build_name
-      run: |
-        if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" =~ ^refs/tags/v.* ]]; then
-          BUILD_NAME=${GITHUB_REF#refs/tags/}
-        else
-          BUILD_NAME=build-$(date +"%Y-%m-%d-%H-%M-%S")
-        fi
-        echo "BUILD_NAME=${BUILD_NAME}" >> $GITHUB_ENV
-
     - name: 运行 PyInstaller
       run: |
-        pyinstaller --name "${{ env.BUILD_NAME }}" --onefile --noconsole --icon="chuizi.ico" --add-data "Img:Img" "NFO.Editor.py"
+        pyinstaller --name "NFO.Editor" --onefile --noconsole --icon="chuizi.ico" --add-data "Img;Img" "NFO.Editor.py"
 
     - name: 列出 dist 目录
       run: |
-        ls -R dist/  # 列出 dist 目录下的文件，帮助确认可执行文件
-
-    - name: 重命名构建产物
-      run: |
-        ORIGINAL_NAME="dist/${{ env.BUILD_NAME }}"
-        if [ -f "${ORIGINAL_NAME}" ]; then
-          echo "构建产物 ${ORIGINAL_NAME} 存在。"
-        else
-          echo "错误: 构建产物 ${ORIGINAL_NAME} 不存在。"
-          exit 1
-        fi
+        dir dist  # 列出 dist 目录下的文件，帮助确认可执行文件
 
     - name: 打包构建产物
       uses: actions/upload-artifact@v3
       with:
-        name: NFO.Editor-build-linux
+        name: NFO.Editor-build-windows
         path: |
-          dist/${{ env.BUILD_NAME }}  # 直接使用生成的文件名
+          dist/NFO.Editor.exe  # 直接使用生成的 Windows 可执行文件名
