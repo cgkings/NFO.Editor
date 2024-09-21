@@ -50,10 +50,8 @@ jobs:
     - name: 重命名构建产物
       run: |
         ORIGINAL_NAME="dist/${{ env.BUILD_NAME }}"
-        NEW_NAME="${{ env.BUILD_NAME }}"
         if [ -f "${ORIGINAL_NAME}" ]; then
           echo "构建产物 ${ORIGINAL_NAME} 存在。"
-          mv "${ORIGINAL_NAME}" "${NEW_NAME}"
         else
           echo "错误: 构建产物 ${ORIGINAL_NAME} 不存在。"
           exit 1
@@ -64,4 +62,4 @@ jobs:
       with:
         name: NFO.Editor-build-linux
         path: |
-          dist/${{ env.BUILD_NAME }}.*
+          dist/${{ env.BUILD_NAME }}  # 直接使用生成的文件名
