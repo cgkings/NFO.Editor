@@ -52,6 +52,7 @@ jobs:
         ORIGINAL_NAME="dist/${{ env.BUILD_NAME }}"
         NEW_NAME="${{ env.BUILD_NAME }}"
         if [ -f "${ORIGINAL_NAME}" ]; then
+          echo "构建产物 ${ORIGINAL_NAME} 存在。"
           mv "${ORIGINAL_NAME}" "${NEW_NAME}"
         else
           echo "错误: 构建产物 ${ORIGINAL_NAME} 不存在。"
@@ -61,6 +62,6 @@ jobs:
     - name: 打包构建产物
       uses: actions/upload-artifact@v3
       with:
-        name: NFO.Editor-build-windows
+        name: NFO.Editor-build-linux
         path: |
           dist/${{ env.BUILD_NAME }}.*
