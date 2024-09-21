@@ -71,7 +71,7 @@ jobs:
       uses: softprops/action-gh-release@v1
       with:
         tag_name: ${{ env.BUILD_NAME }}  # 使用构建名称作为标签
-        release_name: Release ${{ env.BUILD_NAME }}
+        release_name: ${{ env.BUILD_NAME }}  # 使用构建名称作为 Release 名称
         draft: false
         prerelease: false
       env:
@@ -81,6 +81,7 @@ jobs:
       uses: softprops/action-gh-release@v1
       with:
         tag_name: ${{ env.BUILD_NAME }}  # 与创建 Release 时相同
-        files: dist/${{ env.BUILD_NAME }}.exe  # 上传的文件
+        files: dist/NFO.Editor.exe  # 上传的文件
+        name: NFO.Editor.${{ github.ref.Substring(10) }}.exe  # 使用标签名作为文件名
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
