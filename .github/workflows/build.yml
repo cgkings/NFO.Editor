@@ -34,15 +34,15 @@ jobs:
         pip install -r requirements.txt
         pip install pyinstaller
 
-    - name: 设置构建名称
+      - name: 设置构建名称
       id: set_build_name
       run: |
-        if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" =~ ^refs/tags/v.* ]]; then
-          BUILD_NAME=${GITHUB_REF#refs/tags/}
-        else
-          BUILD_NAME=build-$(date +"%Y-%m-%d-%H-%M-%S")
-        fi
-        echo "BUILD_NAME=${BUILD_NAME}" >> $GITHUB_ENV
+        if ($env:GITHUB_EVENT_NAME -eq "push" -and $env:GITHUB_REF -match '^refs/tags/v.*') {
+          $BUILD_NAME = $env:GITHUB_REF.Substring(10)  # 去掉 "refs/tags/"
+        } else {
+          $BUILD_NAME = "build-" + (Get-Date -Format "yyyy-MM-dd-HH-mm-ss")
+        }
+        echo "BUILD_NAME=$BUILD_NAME" >> $env:GITHUB_ENV
 
     - name: 运行 PyInstaller
       run: |
