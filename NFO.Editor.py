@@ -1,35 +1,14 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, Toplevel, ttk
 import os
-import subprocess
+# import subprocess
+import shutil
 import threading
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from PIL import Image, ImageTk
 from idlelib.tooltip import Hovertip
 import xml.dom.minidom as minidom
-import io
-import shutil
-import tempfile
-import queue
-
-class ImageLoader:
-    def __init__(self):
-        self.cache = {}
-        self.queue = queue.Queue()
-
-    def load_image(self, image_path, size):
-        if image_path in self.cache:
-            return self.cache[image_path]
-        try:
-            with open(image_path, 'rb') as f:
-                img_data = f.read()
-            img = Image.open(io.BytesIO(img_data))
-            img.thumbnail(size, Image.LANCZOS)
-            self.cache[image_path] = img
-            return img
-        except Exception as e:
-            raise e
 
 class NFOEditorApp:
     def __init__(self, root):
@@ -39,14 +18,9 @@ class NFOEditorApp:
         self.current_file_path = None
         self.fields_entries = {}
         self.show_images_var = tk.BooleanVar(value=False)
-        self.image_loader = ImageLoader()
-        self.directory_queue = queue.Queue()
-        self.image_queue = queue.Queue()
 
         self.setup_ui()
         self.center_window()
-        self.process_directory_queue()
-        self.process_image_queue()
         self.root.mainloop()
 
     def center_window(self):
@@ -115,8 +89,8 @@ class NFOEditorApp:
         self.file_treeview.heading("NFO文件", text="NFO文件")
         self.file_treeview.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.file_treeview.column("NFO文件", width=0, minwidth=0)
-        self.file_treeview.column("一级目录", width=150)
-        self.file_treeview.column("二级目录", width=150)
+        self.file_treeview.column("一级目录")
+        self.file_treeview.column("二级目录")
 
         scrollbar = tk.Scrollbar(listbox_frame, orient=tk.VERTICAL, command=self.file_treeview.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -224,16 +198,13 @@ class NFOEditorApp:
     def load_files_in_folder(self):
         self.file_treeview.delete(*self.file_treeview.get_children())
         self.nfo_files = []
-        self.file_loading_thread = threading.Thread(target=self.scan_nfo_files, args=(self.folder_path,))
-        self.file_loading_thread.start()
-
-    def scan_nfo_files(self, folder_path):
         try:
-            for root_dir, dirs, files in os.walk(folder_path):
+            for root, dirs, files in os.walk(self.folder_path):
                 for file in files:
                     if file.endswith('.nfo'):
-                        nfo_file_path = os.path.join(root_dir, file)
-                        relative_path = os.path.relpath(nfo_file_path, folder_path)
+                        self.nfo_files.append(os.path.join(root, file))
+                        nfo_file_path = os.path.join(root, file)
+                        relative_path = os.path.relpath(nfo_file_path, self.folder_path)
                         parts = relative_path.split(os.sep)
 
                         if len(parts) > 1:
@@ -245,21 +216,15 @@ class NFOEditorApp:
                             second_level_dir = ""
                             first_level_dirs = ""
 
-                        self.directory_queue.put((first_level_dirs, second_level_dir, nfo_file))
-        except Exception as e:
-            self.directory_queue.put(("Error", "", str(e)))
+                        self.file_treeview.insert("", "end", values=(first_level_dirs, second_level_dir, nfo_file))
+        except OSError as e:
+            messagebox.showerror("Error", f"Error loading files from folder: {str(e)}")
 
-    def process_directory_queue(self):
-        try:
-            while not self.directory_queue.empty():
-                item = self.directory_queue.get_nowait()
-                if item[0] == "Error":
-                    messagebox.showerror("Error", f"Error loading files from folder: {item[2]}")
-                else:
-                    self.file_treeview.insert("", "end", values=item)
-        except queue.Empty:
-            pass
-        self.root.after(100, self.process_directory_queue)
+        if self.nfo_files:
+            first_item = self.file_treeview.get_children()[0]
+            self.file_treeview.selection_set(first_item)
+            self.file_treeview.see(first_item)
+            self.on_file_select(None)
 
     def open_selected_nfo(self):
         selected_items = self.file_treeview.selection()
@@ -271,7 +236,7 @@ class NFOEditorApp:
                 if os.path.exists(nfo_file_path):
                     os.startfile(nfo_file_path)
                 else:
-                    messagebox.showerror("Error", f"NFO文件不存在: {nfo_file_path}")
+                    messagebox.showerror("Error", f"NFO file does not exist: {nfo_file_path}")
 
     def open_selected_folder(self):
         selected_items = self.file_treeview.selection()
@@ -284,7 +249,7 @@ class NFOEditorApp:
                     folder_path = os.path.dirname(nfo_file_path)
                     os.startfile(folder_path)
                 else:
-                    messagebox.showerror("Error", f"NFO文件不存在: {nfo_file_path}")
+                    messagebox.showerror("Error", f"NFO file does not exist: {nfo_file_path}")
 
     def open_selected_video(self):
         video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.strm']
@@ -300,21 +265,17 @@ class NFOEditorApp:
                         video_file = video_file_base + ext
                         if os.path.exists(video_file):
                             if ext == '.strm':
-                                try:
-                                    with open(video_file, 'r') as strm_file:
-                                        video_file_path = strm_file.readline().strip()
-                                        if os.path.exists(video_file_path):
-                                            os.startfile(video_file_path)
-                                            break
-                                        else:
-                                            messagebox.showerror("错误", f"视频文件路径不存在：{video_file_path}")
-                                except Exception as e:
-                                    messagebox.showerror("错误", f"读取strm文件失败：{str(e)}")
+                                with open(video_file, 'r') as strm_file:
+                                    video_file_path = strm_file.readline().strip()
+                                    if os.path.exists(video_file_path):
+                                        os.startfile(video_file_path)
+                                        return
+                                    else:
+                                        messagebox.showerror("错误", f"视频文件路径不存在：{video_file_path}")
                             else:
                                 os.startfile(video_file)
-                                break
-                    else:
-                        messagebox.showerror("错误", "没有找到支持的格式的视频文件：.mp4, .mkv, .avi, .mov, .strm")
+                                return
+                    messagebox.showerror("错误", "没有找到支持的格式的视频文件：.mp4, .mkv, .avi, .mov, .strm")
                 else:
                     messagebox.showerror("错误", f"NFO文件不存在：{nfo_file_path}")
 
@@ -325,11 +286,20 @@ class NFOEditorApp:
                 item = self.file_treeview.item(selected_item)
                 values = item["values"]
                 if values[2]:
+                    # 构建文件路径
                     self.current_file_path = os.path.join(self.folder_path, values[0], values[1], values[2]) if values[1] else os.path.join(self.folder_path, values[0], values[2])
+                    
+                    # 检查文件是否存在
+                    if not os.path.exists(self.current_file_path):
+                        # 文件不存在时刷新整个列表
+                        self.load_files_in_folder()
+                        return
+                    
+                    # 文件存在则加载信息和图片
                     self.load_nfo_fields()
                     if self.show_images_var.get():
                         self.display_image()
-            self.selected_index_cache = selected_items
+                self.selected_index_cache = selected_items
 
     def load_nfo_fields(self):
         for entry in self.fields_entries.values():
@@ -380,7 +350,7 @@ class NFOEditorApp:
             webbrowser.open(url)
 
     def on_entry_focus_out(self, event):
-        if hasattr(self, 'selected_index_cache') and self.selected_index_cache:
+        if self.selected_index_cache:
             for selected_index in self.selected_index_cache:
                 self.file_treeview.selection_set(selected_index)
                 self.file_treeview.see(selected_index)
@@ -450,11 +420,11 @@ class NFOEditorApp:
 
             self.update_save_time()
 
-            if hasattr(self, 'selected_index_cache') and self.selected_index_cache:
+            if self.selected_index_cache:
                 self.file_treeview.selection_set(self.selected_index_cache)
                 for selected_index in self.selected_index_cache:
                     self.file_treeview.see(selected_index)
-
+            
         except Exception as e:
             messagebox.showerror("Error", f"Error saving changes to NFO file: {str(e)}")
 
@@ -476,7 +446,7 @@ class NFOEditorApp:
                     root = tree.getroot()
                     
                     if sort_by == "actors":
-                        actors = {actor_elem.find('name').text.strip() for actor_elem in root.findall('actor') if actor_elem.find('name') is not None and actor_elem.find('name').text}
+                        actors = {actor_elem.find('name').text.strip() for actor_elem in root.findall('actor') if actor_elem.find('name') is not None}
                         return ', '.join(sorted(actors)) if actors else ""
                     
                     elif sort_by == "series":
@@ -492,8 +462,6 @@ class NFOEditorApp:
                             if child.tag == sort_by and child.text is not None:
                                 return child.text.strip()
                 except ET.ParseError:
-                    pass
-                except Exception:
                     pass
                 return ""
             
@@ -642,35 +610,96 @@ class NFOEditorApp:
         move_thread.start()
 
     def move_selected_folder(self):
+        """移动选中的文件夹到目标目录"""
+        # 检查是否选中了文件
         selected_items = self.file_treeview.selection()
         if not selected_items:
             messagebox.showwarning("警告", "请先选择要移动的文件夹")
             return
+            
+        # 检查是否已选择目标目录
+        if not hasattr(self, 'current_target_path') or not self.current_target_path:
+            messagebox.showerror("错误", "请先选择目标目录")
+            return
+            
+        # 检查目标目录是否存在
+        if not os.path.exists(self.current_target_path):
+            messagebox.showerror("错误", "目标目录不存在")
+            return
 
-        for selected_item in selected_items:
-            item = self.file_treeview.item(selected_item)
-            values = item["values"]
-            src_folder_path = os.path.join(self.folder_path, values[0], values[1])
-            dest_folder_path = os.path.join(self.current_target_path, os.path.basename(src_folder_path))
-            if os.path.exists(dest_folder_path):
-                messagebox.showerror("错误", f"目标目录中已存在同名文件夹: {dest_folder_path}")
-                continue
-            try:
-                robocopy_cmd = f'robocopy "{src_folder_path}" "{dest_folder_path}" /MOVE /E /R:3 /W:5 /MT'
-                result = subprocess.run(robocopy_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            for selected_item in selected_items:
+                item = self.file_treeview.item(selected_item)
+                values = item["values"]
                 
-                # Robocopy 返回码：
-                # 0 - No changes were made.
-                # 1 - All files were copied successfully.
-                # 2-7 - Various levels of success.
-                # >=8 - Errors occurred.
-                if result.returncode >= 8:
-                    messagebox.showerror("错误", f"移动文件夹失败: {result.stderr}")
-                else:
-                    self.sorted_treeview.insert("", "end", values=(dest_folder_path,))
+                # 构建源路径
+                if values[1]:  # 如果有二级目录
+                    src_folder_path = os.path.join(self.folder_path, values[0], values[1])
+                    folder_name = values[1]
+                else:  # 如果只有一级目录
+                    src_folder_path = os.path.join(self.folder_path, values[0])
+                    folder_name = values[0]
+                    
+                # 构建目标路径
+                dest_folder_path = os.path.join(self.current_target_path, folder_name)
+                
+                # 检查源文件夹是否存在
+                if not os.path.exists(src_folder_path):
+                    print(f"源文件夹不存在，跳过: {src_folder_path}")
                     self.file_treeview.delete(selected_item)
-            except Exception as e:
-                messagebox.showerror("错误", f"移动文件夹失败: {str(e)}")
+                    continue
+                    
+                # 检查目标文件夹是否已存在
+                if os.path.exists(dest_folder_path):
+                    result = messagebox.askyesno("警告", 
+                        f"目标目录已存在同名文件夹:\n{dest_folder_path}\n是否覆盖?")
+                    if not result:
+                        continue
+
+                try:
+                    # 获取源和目标的盘符
+                    src_drive = os.path.splitdrive(src_folder_path)[0]
+                    dest_drive = os.path.splitdrive(dest_folder_path)[0]
+
+                    if src_drive.upper() == dest_drive.upper():
+                        # 同一盘符下使用os.rename直接移动
+                        print(f"同盘符移动: {src_folder_path} -> {dest_folder_path}")
+                        if os.path.exists(dest_folder_path):
+                            shutil.rmtree(dest_folder_path)
+                        os.rename(src_folder_path, dest_folder_path)
+                    else:
+                        # 不同盘符使用robocopy
+                        print(f"跨盘符移动: {src_folder_path} -> {dest_folder_path}")
+                        robocopy_cmd = f'robocopy "{src_folder_path}" "{dest_folder_path}" /MOVE /E /R:3 /W:5 /MT'
+                        
+                        result = subprocess.run(
+                            robocopy_cmd, 
+                            shell=True, 
+                            stdout=subprocess.PIPE, 
+                            stderr=subprocess.PIPE, 
+                            text=True
+                        )
+                        
+                        if result.returncode >= 8:
+                            raise Exception(f"Robocopy失败，返回码: {result.returncode}\n错误信息: {result.stderr}")
+                    
+                    # 移动成功，从源列表删除
+                    self.file_treeview.delete(selected_item)
+                    print(f"成功移动文件夹: {src_folder_path} -> {dest_folder_path}")
+                    
+                except Exception as e:
+                    error_msg = f"移动文件夹失败: {src_folder_path}\n错误信息: {str(e)}"
+                    print(error_msg)
+                    messagebox.showerror("错误", error_msg)
+                    continue
+                    
+        except Exception as e:
+            error_msg = f"处理过程中发生错误: {str(e)}"
+            print(error_msg)
+            messagebox.showerror("错误", error_msg)
+        finally:
+            # 刷新目标目录显示
+            self.load_target_files(self.current_target_path)
 
     def select_target_folder(self):
         target_folder = filedialog.askdirectory(title="选择目标目录")
@@ -723,69 +752,28 @@ class NFOEditorApp:
     def display_image(self):
         if self.current_file_path:
             folder = os.path.dirname(self.current_file_path)
-            try:
-                poster_files = [f for f in os.listdir(folder) if f.lower().endswith('.jpg') and 'poster' in f.lower()]
-                thumb_files = [f for f in os.listdir(folder) if f.lower().endswith('.jpg') and 'thumb' in f.lower()]
-            except Exception as e:
-                self.poster_label.config(text="读取文件夹失败", fg="black")
-                self.thumb_label.config(text="读取文件夹失败", fg="black")
-                return
+            poster_files = [f for f in os.listdir(folder) if f.lower().endswith('.jpg') and 'poster' in f.lower()]
+            thumb_files = [f for f in os.listdir(folder) if f.lower().endswith('.jpg') and 'thumb' in f.lower()]
 
             if poster_files:
-                self.load_image_async(poster_files[0], self.poster_label, (165, 225))
+                self.load_image(poster_files[0], self.poster_label, (165, 225))
             else:
                 self.poster_label.config(text="文件夹内无poster图片", fg="black")
 
             if thumb_files:
-                self.load_image_async(thumb_files[0], self.thumb_label, (333, 225))
+                self.load_image(thumb_files[0], self.thumb_label, (333, 225))
             else:
                 self.thumb_label.config(text="文件夹内无thumb图片", fg="black")
-
-    def load_image_async(self, image_file, label, size):
-        image_path = os.path.join(os.path.dirname(self.current_file_path), image_file)
-        threading.Thread(target=self.enqueue_image, args=(image_path, label, size)).start()
-
-    def enqueue_image(self, image_path, label, size):
-        try:
-            img = self.image_loader.load_image(image_path, size)
-            self.image_queue.put((label, img))
-        except Exception as e:
-            self.image_queue.put((label, f"加载图片失败: {e}"))
-
-    def process_image_queue(self):
-        try:
-            while not self.image_queue.empty():
-                label, img = self.image_queue.get_nowait()
-                if isinstance(img, Image.Image):
-                    img_tk = ImageTk.PhotoImage(img)
-                    label.config(image=img_tk)
-                    label.image = img_tk
-                else:
-                    label.config(text=img, fg="black")
-        except queue.Empty:
-            pass
-        self.root.after(100, self.process_image_queue)
-
-    def process_directory_queue(self):
-        try:
-            while not self.directory_queue.empty():
-                item = self.directory_queue.get_nowait()
-                if item[0] == "Error":
-                    messagebox.showerror("Error", f"Error loading files from folder: {item[2]}")
-                else:
-                    self.file_treeview.insert("", "end", values=item)
-        except queue.Empty:
-            pass
-        self.root.after(100, self.process_directory_queue)
 
     def load_image(self, image_file, label, size):
         folder = os.path.dirname(self.current_file_path)
         image_path = os.path.join(folder, image_file)
         try:
-            img = self.image_loader.load_image(image_path, size)
-            img_tk = ImageTk.PhotoImage(img)
-            label.config(image=img_tk)
-            label.image = img_tk
+            img = Image.open(image_path)
+            img.thumbnail(size, Image.LANCZOS)
+            img = ImageTk.PhotoImage(img)
+            label.config(image=img)
+            label.image = img
         except Exception as e:
             label.config(text="加载图片失败: " + str(e))
 
@@ -804,14 +792,11 @@ class NFOEditorApp:
 
     def open_image_and_crop(self, image_type):
         folder = os.path.dirname(self.current_file_path)
-        try:
-            image_files = [f for f in os.listdir(folder) if f.lower().endswith('.jpg') and image_type in f.lower()]
-            if image_files:
-                self.launch_crop_tool(os.path.join(folder, image_files[0]))
-            else:
-                messagebox.showerror("错误", f"未找到{image_type}图片")
-        except Exception as e:
-            messagebox.showerror("错误", f"读取图片文件夹失败: {str(e)}")
+        image_files = [f for f in os.listdir(folder) if f.lower().endswith('.jpg') and image_type in f.lower()]
+        if image_files:
+            self.launch_crop_tool(os.path.join(folder, image_files[0]))
+        else:
+            messagebox.showerror("错误", f"未找到{image_type}图片")
 
 if __name__ == "__main__":
     root = tk.Tk()
