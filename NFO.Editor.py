@@ -9,11 +9,12 @@ from datetime import datetime
 from PIL import Image, ImageTk
 from idlelib.tooltip import Hovertip
 import xml.dom.minidom as minidom
+import subprocess
 
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v9.0.2")
+        self.root.title("大锤 NFO Editor v9.0.3")
 
         self.current_file_path = None
         self.fields_entries = {}
@@ -280,6 +281,7 @@ class NFOEditorApp:
                     messagebox.showerror("错误", f"NFO文件不存在：{nfo_file_path}")
 
     def on_file_select(self, event):
+        """当选择文件时触发的函数"""
         selected_items = self.file_treeview.selection()
         if selected_items:
             for selected_item in selected_items:
@@ -291,8 +293,8 @@ class NFOEditorApp:
                     
                     # 检查文件是否存在
                     if not os.path.exists(self.current_file_path):
-                        # 文件不存在时刷新整个列表
-                        self.load_files_in_folder()
+                        # 只删除不存在的文件项
+                        self.file_treeview.delete(selected_item)
                         return
                     
                     # 文件存在则加载信息和图片
@@ -611,26 +613,57 @@ class NFOEditorApp:
 
     def move_selected_folder(self):
         """移动选中的文件夹到目标目录"""
-        # 检查是否选中了文件
-        selected_items = self.file_treeview.selection()
-        if not selected_items:
-            messagebox.showwarning("警告", "请先选择要移动的文件夹")
-            return
-            
-        # 检查是否已选择目标目录
-        if not hasattr(self, 'current_target_path') or not self.current_target_path:
-            messagebox.showerror("错误", "请先选择目标目录")
-            return
-            
-        # 检查目标目录是否存在
-        if not os.path.exists(self.current_target_path):
-            messagebox.showerror("错误", "目标目录不存在")
-            return
-
         try:
+            # 检查是否选中了文件
+            selected_items = self.file_treeview.selection()
+            if not selected_items or len(selected_items) == 0:
+                messagebox.showwarning("警告", "请先选择要移动的文件夹")
+                return
+                
+            # 检查是否已选择目标目录
+            if not hasattr(self, 'current_target_path') or not self.current_target_path:
+                messagebox.showerror("错误", "请先选择目标目录")
+                return
+                
+            # 检查目标目录是否存在
+            if not os.path.exists(self.current_target_path):
+                messagebox.showerror("错误", "目标目录不存在")
+                return
+
+            # 创建进度窗口
+            progress_window = Toplevel(self.root)
+            progress_window.title("移动进度")
+            progress_window.geometry("400x150")
+            
+            # 确保进度窗口始终在最前
+            progress_window.transient(self.root)
+            progress_window.grab_set()
+            
+            # 添加进度条和标签
+            progress_label = ttk.Label(progress_window, text="准备移动...", padding=(10, 5))
+            progress_label.pack()
+            
+            progress_bar = ttk.Progressbar(progress_window, mode='determinate', length=300)
+            progress_bar.pack(pady=10)
+            
+            status_label = ttk.Label(progress_window, text="", padding=(10, 5))
+            status_label.pack()
+
+            # 计算总文件数
+            total_items = len(selected_items)
+            progress_bar['maximum'] = total_items
+            current_item = 0
+
             for selected_item in selected_items:
+                current_item += 1
                 item = self.file_treeview.item(selected_item)
                 values = item["values"]
+                
+                # 更新进度显示
+                progress_label.config(text=f"正在处理: {values[1] if values[1] else values[0]}")
+                progress_bar['value'] = current_item
+                status_label.config(text=f"进度: {current_item}/{total_items}")
+                progress_window.update()
                 
                 # 构建源路径
                 if values[1]:  # 如果有二级目录
@@ -662,44 +695,72 @@ class NFOEditorApp:
                     dest_drive = os.path.splitdrive(dest_folder_path)[0]
 
                     if src_drive.upper() == dest_drive.upper():
-                        # 同一盘符下使用os.rename直接移动
+                        # 同一盘符下使用shutil.move移动
+                        status_label.config(text=f"同盘符移动: {current_item}/{total_items}")
+                        progress_window.update()
                         print(f"同盘符移动: {src_folder_path} -> {dest_folder_path}")
                         if os.path.exists(dest_folder_path):
                             shutil.rmtree(dest_folder_path)
-                        os.rename(src_folder_path, dest_folder_path)
+                        shutil.move(src_folder_path, dest_folder_path)
                     else:
-                        # 不同盘符使用robocopy
+                        # 不同盘符使用copy和rd命令
+                        status_label.config(text=f"跨盘符移动: {current_item}/{total_items}")
+                        progress_window.update()
                         print(f"跨盘符移动: {src_folder_path} -> {dest_folder_path}")
-                        robocopy_cmd = f'robocopy "{src_folder_path}" "{dest_folder_path}" /MOVE /E /R:3 /W:5 /MT'
-                        
+                        if os.path.exists(dest_folder_path):
+                            # 使用rd命令删除已存在的目标文件夹
+                            rd_cmd = f'rd /s /q "{dest_folder_path}"'
+                            subprocess.run(rd_cmd, shell=True, check=True)
+
+                        # 使用copy命令复制文件夹
+                        progress_label.config(text=f"正在复制: {folder_name}")
+                        copy_cmd = f'cmd /c "echo D | xcopy "{src_folder_path}" "{dest_folder_path}" /E /I /H /R /Y"'
                         result = subprocess.run(
-                            robocopy_cmd, 
-                            shell=True, 
-                            stdout=subprocess.PIPE, 
-                            stderr=subprocess.PIPE, 
+                            copy_cmd,
+                            shell=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
                             text=True
                         )
-                        
-                        if result.returncode >= 8:
-                            raise Exception(f"Robocopy失败，返回码: {result.returncode}\n错误信息: {result.stderr}")
-                    
-                    # 移动成功，从源列表删除
+
+                        # 检查复制结果
+                        if result.returncode == 0 and os.path.exists(dest_folder_path):
+                            progress_label.config(text=f"正在删除源文件夹: {folder_name}")
+                            progress_window.update()
+                            # 复制成功后，删除源文件夹
+                            rd_src_cmd = f'rd /s /q "{src_folder_path}"'
+                            del_result = subprocess.run(rd_src_cmd, shell=True, check=True)
+                            if del_result.returncode != 0:
+                                raise Exception("删除源文件夹失败")
+                        else:
+                            raise Exception(f"复制失败: {result.stderr}")
+
+                    # 移动成功，从列表中删除该项
                     self.file_treeview.delete(selected_item)
                     print(f"成功移动文件夹: {src_folder_path} -> {dest_folder_path}")
                     
+                except subprocess.CalledProcessError as e:
+                    error_msg = f"命令执行失败: {str(e)}"
+                    print(error_msg)
+                    messagebox.showerror("错误", error_msg)
+                    continue
                 except Exception as e:
                     error_msg = f"移动文件夹失败: {src_folder_path}\n错误信息: {str(e)}"
                     print(error_msg)
                     messagebox.showerror("错误", error_msg)
                     continue
+
+            # 完成后关闭进度窗口
+            progress_window.destroy()
                     
         except Exception as e:
             error_msg = f"处理过程中发生错误: {str(e)}"
             print(error_msg)
             messagebox.showerror("错误", error_msg)
         finally:
-            # 刷新目标目录显示
-            self.load_target_files(self.current_target_path)
+            if hasattr(self, 'current_target_path'):
+                # 刷新目标目录显示
+                self.load_target_files(self.current_target_path)
 
     def select_target_folder(self):
         target_folder = filedialog.askdirectory(title="选择目标目录")
