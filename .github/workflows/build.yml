@@ -53,7 +53,7 @@ jobs:
 
     - name: 运行 PyInstaller
       run: |
-        pyinstaller --name "NFO.Editor" --onefile --noconsole --icon="chuizi.ico" --add-data "Img;Img" "NFO.Editor.py"
+        pyinstaller --name "NFO.Editor" --onefile --noconsole --icon="chuizi.ico" --add-data "Img;Img" --add-data "mapping_actor.xml;." "NFO.Editor.py"
 
     - name: 列出 dist 目录
       run: |
