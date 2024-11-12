@@ -55,7 +55,7 @@ class NFOEditorApp:
             ("🖊", self.open_selected_nfo, '打开选中的NFO文件'),
             ("📁", self.open_selected_folder, '打开选中的文件夹'),
             ("⏯", self.open_selected_video, '播放选中的视频文件'),
-            ("🔗", self.open_batch_copy_tool, '打开strm同步工具'),
+            ("🔗", self.open_batch_rename_tool, '统一演员名并重命名文件夹'),
             ("🔁", self.load_files_in_folder, '刷新文件列表'),
             ("=>", self.start_move_thread, '移动nfo所在文件夹到目标目录'),
         ]
@@ -793,11 +793,19 @@ class NFOEditorApp:
             self.current_target_path = selected_path
             self.load_target_files(selected_path)
 
-    def open_batch_copy_tool(self):
-        from cg_strm import BatchCopyTool
-        new_window = tk.Toplevel(self.root)
-        batch_copy_tool_app = BatchCopyTool(new_window, self.folder_path)
-        new_window.grab_set()
+    def open_batch_rename_tool(self):
+        if not hasattr(self, 'folder_path') or not self.folder_path:
+            messagebox.showerror("错误", "请先选择NFO目录")
+            return
+
+        try:
+            from cg_rename import start_rename_process
+            start_rename_process(self.folder_path, self.root)
+            
+        except ImportError:
+            messagebox.showerror("错误", "找不到 cg_rename.py 文件，请确保它与主程序在同一目录。")
+        except Exception as e:
+            messagebox.showerror("错误", f"启动重命名工具时出错：{str(e)}")
 
     def toggle_image_display(self):
         if self.show_images_var.get():
