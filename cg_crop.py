@@ -16,7 +16,10 @@ class ImageLabel(QtWidgets.QLabel):
         super(ImageLabel, self).__init__(parent)
         self.original_pixmap = None
         self.crop_rect = QtCore.QRect(210, 0, 381, 540)  # Initial rectangle size
-        self.nfo_base_name = nfo_base_name  # 存储 NFO 基础文件名
+        self.nfo_base_name = None  # Initialize nfo_base_name as None
+
+    def set_nfo_base_name(self, name):
+        self.nfo_base_name = name
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -36,9 +39,10 @@ class ImageLabel(QtWidgets.QLabel):
         self.update()  # Trigger repaint
 
 class Ui_Dialog_cut_poster(QMainWindow):
-    def __init__(self, main_window):
+    def __init__(self, main_window, nfo_base_name=None):
         super().__init__(main_window)
         self.main_window = main_window
+        self.nfo_base_name = nfo_base_name  # Store nfo_base_name as instance variable
 
     def setupUi(self, Dialog_cut_poster):
         Dialog_cut_poster.setObjectName("Dialog_cut_poster")
@@ -50,6 +54,7 @@ class Ui_Dialog_cut_poster(QMainWindow):
         self.widget_cutimage = ImageLabel(self.centralwidget)
         self.widget_cutimage.setGeometry(QtCore.QRect(10, 10, 800, 540))
         self.widget_cutimage.setStyleSheet("background-color: rgb(200, 200, 200);")
+        self.widget_cutimage.set_nfo_base_name(self.nfo_base_name)  # Pass nfo_base_name to ImageLabel
 
         self.slider = QSlider(QtCore.Qt.Horizontal, self.centralwidget)
         self.slider.setGeometry(20, 580, 800, 20)
