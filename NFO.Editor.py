@@ -838,16 +838,16 @@ class NFOEditorApp:
         except Exception as e:
             label.config(text="加载图片失败: " + str(e))
 
-    def launch_crop_tool(self, image_path):
+    def launch_crop_tool(self, image_path, nfo_base_name):
         from PyQt5 import QtWidgets
         from cg_crop import Ui_Dialog_cut_poster
         import sys
 
         app = QtWidgets.QApplication(sys.argv)
         main_window = QtWidgets.QMainWindow()
-        ui = Ui_Dialog_cut_poster(main_window)
+        ui = Ui_Dialog_cut_poster(main_window, nfo_base_name)  # 传递 nfo_base_name
         ui.setupUi(main_window)
-        ui.load_image(image_path)  # 使用新的 load_image 方法
+        ui.load_image(image_path)
         main_window.show()
         app.exec_()
 
@@ -855,7 +855,9 @@ class NFOEditorApp:
         folder = os.path.dirname(self.current_file_path)
         image_files = [f for f in os.listdir(folder) if f.lower().endswith('.jpg') and image_type in f.lower()]
         if image_files:
-            self.launch_crop_tool(os.path.join(folder, image_files[0]))
+            # 获取当前 NFO 文件的基础名称
+            nfo_base_name = os.path.splitext(os.path.basename(self.current_file_path))[0]
+            self.launch_crop_tool(os.path.join(folder, image_files[0]), nfo_base_name)
         else:
             messagebox.showerror("错误", f"未找到{image_type}图片")
 

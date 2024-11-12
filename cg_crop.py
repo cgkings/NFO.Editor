@@ -16,6 +16,7 @@ class ImageLabel(QtWidgets.QLabel):
         super(ImageLabel, self).__init__(parent)
         self.original_pixmap = None
         self.crop_rect = QtCore.QRect(210, 0, 381, 540)  # Initial rectangle size
+        self.nfo_base_name = nfo_base_name  # 存储 NFO 基础文件名
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -146,14 +147,24 @@ class Ui_Dialog_cut_poster(QMainWindow):
         cropped_image = original_image.crop((left, top, right, bottom))
 
         directory = os.path.dirname(self.image_path)
-        poster_path = os.path.join(directory, 'poster.jpg')
+        # 使用传入的 NFO 基础文件名
+        if self.nfo_base_name:
+            poster_path = os.path.join(directory, f'{self.nfo_base_name}-poster.jpg')
+        else:
+            print("警告：未获取到NFO文件名，使用默认文件名")
+            poster_path = os.path.join(directory, 'poster.jpg')
+            
         cropped_image.save(poster_path)
 
         print(f"裁剪区域: Left={left}, Top={top}, Right={right}, Bottom={bottom}")
         print(f"裁剪后的图片已保存为 {poster_path}")
 
         self.add_watermark(poster_path)
-        self.add_watermark(self.image_path, output_path=os.path.join(directory, 'thumb.jpg'))
+        if self.nfo_base_name:
+            thumb_path = os.path.join(directory, f'{self.nfo_base_name}-thumb.jpg')
+        else:
+            thumb_path = os.path.join(directory, 'thumb.jpg')
+        self.add_watermark(self.image_path, output_path=thumb_path)
 
     def add_watermark(self, image_path, output_path=None):
         print(f"开始为 {image_path} 添加水印...")
