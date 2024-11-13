@@ -800,7 +800,18 @@ class NFOEditorApp:
 
         try:
             from cg_rename import start_rename_process
+            # 定义检查函数
+            def check_window():
+                if not any(child.winfo_exists() for child in self.root.winfo_children() if isinstance(child, tk.Toplevel)):
+                    # 如果没有任何 Toplevel 窗口存在，说明重命名窗口已关闭
+                    self.load_files_in_folder()
+                else:
+                    # 继续检查
+                    self.root.after(500, check_window)
+            
             start_rename_process(self.folder_path, self.root)
+            # 开始检查
+            self.root.after(500, check_window)
             
         except ImportError:
             messagebox.showerror("错误", "找不到 cg_rename.py 文件，请确保它与主程序在同一目录。")
