@@ -21,7 +21,7 @@ class StdoutRedirector:
 class RenameToolGUI:
     def __init__(self, parent=None):
         self.window = tk.Toplevel(parent) if parent else tk.Tk()
-        self.window.title("批量改名工具")
+        self.window.title("批量改名工具 v0.0.3")
         self.window.geometry("600x500")
         
         # 添加顶部控制框架
