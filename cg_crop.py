@@ -58,7 +58,7 @@ class CropLabel(QLabel):
             # 计算裁剪框高度，不超过图片高度和538
             crop_height = min(538, img_height)
             # 按2:3比例计算宽度
-            crop_width = int(crop_height * 2 / 3)
+            crop_width = int(crop_height * 0.7)
             
             # 确保裁剪框不超出图片范围
             if crop_width > img_width:
