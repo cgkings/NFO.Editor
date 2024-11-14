@@ -50,7 +50,7 @@ class RenameToolGUI:
         execute_btn.pack(side=tk.LEFT, padx=5)
 
         self.mapping_file_path = self.get_mapping_file_path()
-        mapping_label = tk.Label(self.window, text=f"配置文件: {self.mapping_file_path}", fg="blue")
+        mapping_label = tk.Label(self.window, text=self.mapping_file_path, fg="blue")
         mapping_label.pack(pady=10)
 
         self.log_frame = tk.Frame(self.window)
@@ -101,10 +101,12 @@ class RenameToolGUI:
             script_dir = os.path.dirname(os.path.abspath(__file__))
 
         external_mapping_file = os.path.join(script_dir, 'mapping_actor.xml')
+        
+        # 检查外部配置文件是否存在
         if os.path.exists(external_mapping_file):
-            return external_mapping_file
+            return f"外部配置: {external_mapping_file}"
         else:
-            return os.path.join(script_dir, 'mapping_actor.xml')
+            return f"内置配置: {external_mapping_file}"  # 显示内置配置路径
 
     def execute_rename(self):
         if hasattr(self, 'process_thread') and self.process_thread.is_alive():
