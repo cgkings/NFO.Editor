@@ -1,7 +1,6 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, Toplevel, ttk
 import os
-# import subprocess
 import shutil
 import threading
 import xml.etree.ElementTree as ET
@@ -10,11 +9,14 @@ from PIL import Image, ImageTk
 from idlelib.tooltip import Hovertip
 import xml.dom.minidom as minidom
 import subprocess
+import sys
+from PyQt5 import QtWidgets
+from cg_crop import EmbyPosterCrop
 
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v9.0.5")
+        self.root.title("大锤 NFO Editor v9.0.8")
 
         self.current_file_path = None
         self.fields_entries = {}
@@ -608,7 +610,17 @@ class NFOEditorApp:
                 self.sorted_treeview.insert("", "end", values=(item,))
 
     def start_move_thread(self):
-        move_thread = threading.Thread(target=self.move_selected_folder)
+        """启动移动文件的线程"""
+        def move_with_system_stdout():
+            original_stdout = sys.stdout  # 保存当前的标准输出
+            sys.stdout = sys.__stdout__   # 切换到系统标准输出
+            try:
+                self.move_selected_folder()
+            finally:
+                # 恢复原来的标准输出
+                sys.stdout = original_stdout
+                
+        move_thread = threading.Thread(target=move_with_system_stdout)
         move_thread.start()
 
     def move_selected_folder(self):
@@ -800,8 +812,19 @@ class NFOEditorApp:
 
         try:
             from cg_rename import start_rename_process
-            start_rename_process(self.folder_path, self.root)
             
+            # 启动重命名进程，并获取重命名窗口实例
+            rename_window = start_rename_process(self.folder_path, self.root)
+            
+            if rename_window:
+                # 设置回调函数
+                def on_rename_close():
+                    rename_window.window.destroy()
+                    self.load_files_in_folder()
+                
+                # 设置窗口关闭事件
+                rename_window.window.protocol("WM_DELETE_WINDOW", on_rename_close)
+                
         except ImportError:
             messagebox.showerror("错误", "找不到 cg_rename.py 文件，请确保它与主程序在同一目录。")
         except Exception as e:
@@ -847,27 +870,96 @@ class NFOEditorApp:
             label.config(text="加载图片失败: " + str(e))
 
     def launch_crop_tool(self, image_path, nfo_base_name):
-        from PyQt5 import QtWidgets
-        from cg_crop import Ui_Dialog_cut_poster
-        import sys
-
-        app = QtWidgets.QApplication(sys.argv)
-        main_window = QtWidgets.QMainWindow()
-        ui = Ui_Dialog_cut_poster(main_window, nfo_base_name)  # 传递 nfo_base_name
-        ui.setupUi(main_window)
-        ui.load_image(image_path)
-        main_window.show()
-        app.exec_()
+        try:
+            if not QtWidgets.QApplication.instance():
+                app = QtWidgets.QApplication([])
+            
+            main_window = QtWidgets.QMainWindow()
+            dialog = EmbyPosterCrop(parent=main_window, nfo_base_name=nfo_base_name)
+            
+            # 使用新方法直接加载图片
+            dialog.load_initial_image(image_path)
+            
+            result = dialog.exec_()
+            
+            if result == QtWidgets.QDialog.Accepted and self.show_images_var.get():
+                self.display_image()
+                
+        except Exception as e:
+            messagebox.showerror("错误", f"处理图片时出错：{str(e)}")
 
     def open_image_and_crop(self, image_type):
+        if not self.current_file_path:
+            return
+            
         folder = os.path.dirname(self.current_file_path)
         image_files = [f for f in os.listdir(folder) if f.lower().endswith('.jpg') and image_type in f.lower()]
-        if image_files:
-            # 获取当前 NFO 文件的基础名称
-            nfo_base_name = os.path.splitext(os.path.basename(self.current_file_path))[0]
-            self.launch_crop_tool(os.path.join(folder, image_files[0]), nfo_base_name)
-        else:
+        
+        if not image_files:
             messagebox.showerror("错误", f"未找到{image_type}图片")
+            return
+
+        try:
+            # 获取NFO文件内容
+            tree = ET.parse(self.current_file_path)
+            root = tree.getroot()
+            
+            # 初始化水印配置
+            has_subtitle = False
+            mark_type = "none"  # 默认无水印
+            
+            # 检查tag标签内容
+            for tag in root.findall('tag'):
+                tag_text = tag.text.lower() if tag.text else ""
+                if "中文字幕" in tag_text:
+                    has_subtitle = True
+                elif "无码破解" in tag_text:
+                    mark_type = "umr"
+                elif "无码流出" in tag_text:
+                    mark_type = "leak"
+                elif "无码" in tag_text:
+                    mark_type = "wuma"
+                # 如果已经找到非none的mark_type，就不再继续查找
+                if mark_type != "none":
+                    break
+
+            # 获取当前NFO文件的基础名称
+            nfo_base_name = os.path.splitext(os.path.basename(self.current_file_path))[0]
+            
+            # 创建QApplication实例（如果还没有创建）
+            if not QtWidgets.QApplication.instance():
+                app = QtWidgets.QApplication([])
+            
+            # 创建并显示裁剪窗口
+            main_window = QtWidgets.QMainWindow()
+            dialog = EmbyPosterCrop(main_window, nfo_base_name)
+            
+            # 设置初始图片
+            image_path = os.path.join(folder, image_files[0])
+            dialog.image_path = image_path
+            dialog.image_label.set_image(image_path)
+            
+            # 设置水印选项
+            if has_subtitle:
+                dialog.sub_check.setChecked(True)
+                
+            # 设置分类水印
+            for button in dialog.mark_group.buttons():
+                if button.property('value') == mark_type:
+                    button.setChecked(True)
+                    break
+                    
+            # 显示对话框并等待结果
+            result = dialog.exec_()
+            
+            # 如果用户确认了操作（点击了"裁剪并关闭"按钮）
+            if result == QtWidgets.QDialog.Accepted:
+                # 刷新图片显示
+                if self.show_images_var.get():
+                    self.display_image()
+                    
+        except Exception as e:
+            messagebox.showerror("错误", f"处理图片时出错：{str(e)}")
 
 if __name__ == "__main__":
     root = tk.Tk()

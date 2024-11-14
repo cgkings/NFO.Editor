@@ -4,8 +4,8 @@ import sys
 import xml.etree.ElementTree as ET
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+import threading
 
-# 将 StdoutRedirector 移到类外部
 class StdoutRedirector:
     def __init__(self, text_widget):
         self.text_widget = text_widget
@@ -21,52 +21,64 @@ class StdoutRedirector:
 class RenameToolGUI:
     def __init__(self, parent=None):
         self.window = tk.Toplevel(parent) if parent else tk.Tk()
-        self.window.title("批量改名工具")
+        self.window.title("批量改名工具 v0.0.3")
         self.window.geometry("600x500")
         
-        # 添加顶部控制框架
+        if parent:
+            self.window.transient(parent)
+            window_width = 600
+            window_height = 500
+            screen_width = self.window.winfo_screenwidth()
+            screen_height = self.window.winfo_screenheight()
+            x = (screen_width - window_width) // 2
+            y = (screen_height - window_height) // 2
+            self.window.geometry(f"{window_width}x{window_height}+{x}+{y}")
+            
         self.control_frame = tk.Frame(self.window)
         self.control_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        # 文件夹路径显示
         self.path_var = tk.StringVar(value=os.path.dirname(os.path.abspath(__file__)))
         path_label = tk.Label(self.control_frame, text="工作目录：")
         path_label.pack(side=tk.LEFT, padx=(0,5))
         self.path_entry = tk.Entry(self.control_frame, textvariable=self.path_var, width=50)
         self.path_entry.pack(side=tk.LEFT, padx=5)
         
-        # 浏览按钮
         browse_btn = tk.Button(self.control_frame, text="浏览", command=self.browse_folder)
         browse_btn.pack(side=tk.LEFT, padx=5)
         
-        # 执行按钮
         execute_btn = tk.Button(self.control_frame, text="执行", command=self.execute_rename)
         execute_btn.pack(side=tk.LEFT, padx=5)
-        
-        # 添加日志文本框
+
+        self.mapping_file_path = self.get_mapping_file_path()
+        mapping_label = tk.Label(self.window, text=f"配置文件: {self.mapping_file_path}", fg="blue")
+        mapping_label.pack(pady=10)
+
         self.log_frame = tk.Frame(self.window)
         self.log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
         self.log_text = tk.Text(self.log_frame, height=20, width=70)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        # 添加滚动条
         scrollbar = tk.Scrollbar(self.log_frame)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text.config(yscrollcommand=scrollbar.set)
         scrollbar.config(command=self.log_text.yview)
         
-        # 添加进度条
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(self.window, variable=self.progress_var, maximum=100)
         self.progress_bar.pack(fill=tk.X, padx=10, pady=5)
         
-        # 添加状态标签
         self.status_label = tk.Label(self.window, text="就绪")
         self.status_label.pack(pady=5)
 
-        # 重定向标准输出到日志窗口
         self.redirect_stdout()
+
+        if parent:
+            def on_closing():
+                sys.stdout = sys.__stdout__
+                self.window.destroy()
+            
+            self.window.protocol("WM_DELETE_WINDOW", on_closing)
 
     def browse_folder(self):
         folder_selected = filedialog.askdirectory()
@@ -82,8 +94,22 @@ class RenameToolGUI:
         self.status_label.config(text=f"进度: {current}/{total}")
         self.window.update()
 
+    def get_mapping_file_path(self):
+        if getattr(sys, 'frozen', False):
+            script_dir = os.path.dirname(sys.executable)
+        else:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+
+        external_mapping_file = os.path.join(script_dir, 'mapping_actor.xml')
+        if os.path.exists(external_mapping_file):
+            return external_mapping_file
+        else:
+            return os.path.join(script_dir, 'mapping_actor.xml')
+
     def execute_rename(self):
-        # 清空日志
+        if hasattr(self, 'process_thread') and self.process_thread.is_alive():
+            return
+            
         self.log_text.delete(1.0, tk.END)
         self.progress_var.set(0)
         self.status_label.config(text="开始处理...")
@@ -93,19 +119,23 @@ class RenameToolGUI:
             messagebox.showerror("错误", f"路径 '{directory}' 不是一个有效的目录。")
             return
 
+        self.process_thread = threading.Thread(
+            target=self._process_rename_thread,
+            daemon=True
+        )
+        self.process_thread.start()
+
+    def _process_rename_thread(self):
         try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            mapping_file = os.path.join(script_dir, 'mapping_actor.xml')
+            mapping_file = self.mapping_file_path
+            directory = self.path_var.get()
 
             if not os.path.exists(mapping_file):
                 messagebox.showerror("错误", "未找到 mapping_actor.xml 文件，请确保它位于脚本所在的文件夹中。")
                 return
 
             actor_mapping = load_actor_mapping(mapping_file)
-            
-            # 直接传递 self 作为 gui 参数，不再使用全局变量
             rename_directory(directory, actor_mapping, self)
-            
             self.status_label.config(text="处理完成！")
                 
         except Exception as e:
@@ -118,29 +148,37 @@ class RenameToolGUI:
         self.window.mainloop()
 
 def load_actor_mapping(mapping_file):
-    """
-    解析 mapping_actor.xml 文件，构建关键词到 zh_cn 的映射字典。
-    """
+    """解析 mapping_actor.xml 文件，构建关键词到 zh_cn 的映射字典。"""
     mapping = {}
     try:
-        tree = ET.parse(mapping_file)
-        root = tree.getroot()
-        for actor in root.findall('a'):
-            zh_cn = actor.get('zh_cn')
-            keywords = actor.get('keyword', '').strip(',').split(',')
-            for keyword in keywords:
-                if keyword:
+        with open(mapping_file, 'r', encoding='utf-8') as f:
+            tree = ET.parse(f)
+            root = tree.getroot()
+            
+            for actor in root.findall('a'):
+                zh_cn = actor.get('zh_cn')
+                if not zh_cn:
+                    continue
+                    
+                keywords = actor.get('keyword', '').strip(',').split(',')
+                keywords = [k.strip() for k in keywords if k.strip()]
+                
+                for keyword in keywords:
                     mapping[keyword] = zh_cn
-        print(f"成功加载 {len(mapping)} 个演员映射关系。")
+                    
+            print(f"成功加载 {len(mapping)} 个演员映射关系。")
+            
+    except ET.ParseError as e:
+        print(f"解析 mapping_actor.xml 时出错: {str(e)}")
+        raise
     except Exception as e:
-        print(f"解析 mapping_actor.xml 时出错: {e}")
+        print(f"加载映射文件出错: {str(e)}")
+        raise
+        
     return mapping
 
 def modify_nfo_actor(nfo_path, actor_mapping):
-    """
-    修改 nfo 文件中的所有 actor 字段，如果匹配到映射则替换为 zh_cn 值。
-    返回一个字典，包含是否有修改和所有 actor 的当前值。
-    """
+    """修改 nfo 文件中的 actor 字段"""
     modified = False
     actors = []
     try:
@@ -181,9 +219,7 @@ def modify_nfo_actor(nfo_path, actor_mapping):
     return {'modified': modified, 'actors': actors}
 
 def extract_actors(nfo_path):
-    """
-    从 nfo 文件中提取所有 actor 字段的值。
-    """
+    """从 nfo 文件中提取所有 actor 字段的值"""
     actors = []
     try:
         tree = ET.parse(nfo_path)
@@ -200,41 +236,41 @@ def extract_actors(nfo_path):
     return actors if actors else ["未知演员"]
 
 def extract_rating(nfo_path):
-    """
-    从 nfo 文件中提取 rating 值。
-    """
+    """从 nfo 文件中提取 rating 值"""
     try:
         tree = ET.parse(nfo_path)
         root = tree.getroot()
         rating_element = root.find('.//rating')
         if rating_element is not None and rating_element.text:
             return float(rating_element.text.strip())
-        else:
-            print(f"在文件 '{nfo_path}' 中未找到 <rating> 元素或内容为空。使用默认值 0.0。")
     except Exception as e:
         print(f"提取 rating 时出错: {e}")
     return 0.0
 
 def format_rating(rating):
-    """
-    格式化 rating 值为一位小数。
-    """
+    """格式化 rating 值为一位小数"""
     return '{:.1f}'.format(rating)
 
 def handle_folder_with_rating(actors, nfo_filename, rating):
-    """
-    根据指定的命名规则生成文件夹名称。
-    命名规则：actor1,actor2,... + 空格 + nfo 文件名 + 空格 + rating
-    """
+    """根据命名规则生成文件夹名称"""
     sanitized_actors = [re.sub(r'[\\/:*?"<>|]', '_', actor) for actor in actors]
     actors_str = ','.join(sanitized_actors)
     sanitized_nfo = re.sub(r'[\\/:*?"<>|]', '_', nfo_filename)
     return f"{actors_str} {sanitized_nfo} {format_rating(rating)}"
 
+def find_nfo_file(folder_path):
+    """查找文件夹中的 .nfo 文件"""
+    nfo_files = []
+    for root, _, files in os.walk(folder_path):
+        for file in files:
+            if file.lower().endswith('.nfo'):
+                nfo_files.append(os.path.join(root, file))
+    if len(nfo_files) > 1:
+        print(f"警告: 文件夹 '{folder_path}' 中找到多个 .nfo 文件，选择第一个找到的文件: {nfo_files[0]}")
+    return nfo_files[0] if nfo_files else None
+
 def replace_folder_name(folder_path, new_name):
-    """
-    重命名文件夹。
-    """
+    """重命名文件夹"""
     parent_path, _ = os.path.split(folder_path)
     new_path = os.path.join(parent_path, new_name)
     try:
@@ -245,27 +281,8 @@ def replace_folder_name(folder_path, new_name):
         print(f"错误信息: {str(e)}")
         return False
 
-def find_nfo_file(folder_path):
-    """
-    查找文件夹中的 .nfo 文件。
-    """
-    nfo_files = []
-    for root, _, files in os.walk(folder_path):
-        for file in files:
-            if file.lower().endswith('.nfo'):
-                nfo_files.append(os.path.join(root, file))
-    if len(nfo_files) > 1:
-        print(f"警告: 文件夹 '{folder_path}' 中找到多个 .nfo 文件，选择第一个找到的文件: {nfo_files[0]}")
-    return nfo_files[0] if nfo_files else None
-
 def rename_directory(directory, actor_mapping, gui=None):
-    """
-    遍历指定目录下的所有子文件夹，修改 .nfo 文件的 actor 字段，并根据需要重命名文件夹。
-    Args:
-        directory: 要处理的目录
-        actor_mapping: 演员名映射字典
-        gui: GUI实例，用于更新进度
-    """
+    """遍历指定目录下的所有子文件夹，修改 .nfo 文件并重命名文件夹"""
     subfolder_count = sum([len(dirs) for _, dirs, _ in os.walk(directory)])
     progress_count = 0
 
@@ -285,8 +302,6 @@ def rename_directory(directory, actor_mapping, gui=None):
             nfo_rating = extract_rating(nfo_path)
 
             progress_count += 1
-
-            # 修改这里：使用传入的 gui 参数而不是全局变量
             if gui:
                 gui.update_progress(progress_count, subfolder_count)
 
@@ -298,7 +313,6 @@ def rename_directory(directory, actor_mapping, gui=None):
                 print("actor 字段未做修改")
 
             current_actors = actors_modified['actors'] if actors_modified['modified'] else extract_actors(nfo_path)
-
             if not current_actors:
                 current_actors = ['未知演员']
                 print("未找到任何演员信息，使用默认值 '未知演员'。")
@@ -319,21 +333,17 @@ def rename_directory(directory, actor_mapping, gui=None):
     print("\n处理完成。")
 
 def start_rename_process(directory=None, parent_window=None):
-    """
-    启动重命名进程的入口函数
-    """
+    """启动重命名进程的入口函数"""
+    window = RenameToolGUI(parent_window)
+    if directory:
+        window.path_var.set(directory)
+    
     if parent_window:
-        # 作为子窗口时不需要调用 mainloop
-        window = RenameToolGUI(parent_window)
-        if directory:
-            window.path_var.set(directory)
-        window.window.focus_force()  # 使窗口获得焦点
+        window.window.focus_force()
     else:
-        # 独立运行时需要调用 mainloop
-        window = RenameToolGUI()
-        if directory:
-            window.path_var.set(directory)
         window.mainloop()
+        
+    return window
 
 if __name__ == '__main__':
     try:
