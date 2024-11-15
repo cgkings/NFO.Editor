@@ -16,7 +16,7 @@ from cg_crop import EmbyPosterCrop
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v9.1.5")
+        self.root.title("大锤 NFO Editor v9.1.6")
 
         self.current_file_path = None
         self.fields_entries = {}

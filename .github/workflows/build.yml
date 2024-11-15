@@ -58,11 +58,11 @@ jobs:
         Move-Item -Path "dist/NFO.Editor.exe" -Destination "dist/NFO.Editor.${{ env.BUILD_NAME }}.exe"
         
         # 构建 cg_crop
-        pyinstaller --name "cg_crop" --onefile --noconsole --icon="chuizi.ico" --add-data "Img;Img" "cg_crop.py"
+        pyinstaller --name "cg_crop" --onefile --noconsole --icon="chuizi.ico" --add-data "Img;Img" --add-data "chuizi.ico;." "cg_crop.py"
         Move-Item -Path "dist/cg_crop.exe" -Destination "dist/cg_crop.${{ env.BUILD_NAME }}.exe"
         
         # 构建 cg_rename
-        pyinstaller --name "cg_rename" --onefile --noconsole --icon="chuizi.ico" --add-data "mapping_actor.xml;." "cg_rename.py"
+        pyinstaller --name "cg_rename" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "mapping_actor.xml;." "cg_rename.py"
         Move-Item -Path "dist/cg_rename.exe" -Destination "dist/cg_rename.${{ env.BUILD_NAME }}.exe"
 
     - name: 列出 dist 目录

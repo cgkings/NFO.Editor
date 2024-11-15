@@ -6,6 +6,16 @@ from PyQt5.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QFileDialog, QGro
 from PyQt5.QtCore import Qt, QRect, pyqtSignal
 from PyQt5.QtGui import QIcon, QImage, QPixmap, QPainter, QPen
 
+def get_resource_path(relative_path):
+    """获取资源文件的绝对路径"""
+    if getattr(sys, 'frozen', False):
+        # 如果是打包后的exe
+        base_path = sys._MEIPASS
+    else:
+        # 如果是直接运行的py脚本
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
 class CropLabel(QLabel):
     original_info_updated = pyqtSignal(int, int)  # 发送原图宽度和高度
     crop_info_updated = pyqtSignal(QRect)  # 发送裁剪框信息
@@ -258,10 +268,13 @@ class EmbyPosterCrop(QDialog):
         self.setWindowTitle("EMBY海报裁剪工具 v1.0.0")
         self.setMinimumSize(1200, 640)
         
-        # Set window icon
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'chuizi.ico')
-        if os.path.exists(icon_path):
-            self.setWindowIcon(QIcon(icon_path))
+        # 设置窗口图标
+        try:
+            icon_path = get_resource_path('chuizi.ico')
+            if os.path.exists(icon_path):
+                self.setWindowIcon(QIcon(icon_path))
+        except Exception as e:
+            print(f"设置窗口图标失败: {str(e)}")
             
         self.setup_ui()
 

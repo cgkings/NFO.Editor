@@ -24,23 +24,38 @@ class RenameToolGUI:
         self.window.title("批量改名工具 v0.0.3")
         self.window.geometry("600x500")
         
-        # 修改图标设置逻辑
+        # 改进的图标设置逻辑
         try:
-            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chuizi.ico")
+            # 获取应用程序路径
+            if getattr(sys, 'frozen', False):
+                # 如果是打包后的exe
+                application_path = sys._MEIPASS
+            else:
+                # 如果是直接运行的py脚本
+                application_path = os.path.dirname(os.path.abspath(__file__))
+
+            icon_path = os.path.join(application_path, "chuizi.ico")
+            
             if os.path.exists(icon_path):
                 if sys.platform == 'win32':  # Windows系统
                     try:
                         self.window.iconbitmap(default=icon_path)
-                    except tk.TclError:
-                        print("Windows图标加载失败，使用默认图标")
+                    except tk.TclError as e:
+                        try:
+                            # 尝试直接设置iconbitmap
+                            self.window.iconbitmap(icon_path)
+                        except tk.TclError:
+                            print(f"Windows图标加载失败: {str(e)}")
                 else:  # Linux/Mac系统
                     try:
                         img = tk.PhotoImage(file=icon_path)
                         self.window.tk.call('wm', 'iconphoto', self.window._w, img)
-                    except tk.TclError:
-                        print("Linux/Mac图标加载失败，使用默认图标")
+                    except tk.TclError as e:
+                        print(f"Linux/Mac图标加载失败: {str(e)}")
+            else:
+                print(f"图标文件未找到: {icon_path}")
         except Exception as e:
-            print(f"图标设置失败（使用默认图标）: {str(e)}")
+            print(f"图标设置失败: {str(e)}")
 
         if parent:
             self.window.transient(parent)
