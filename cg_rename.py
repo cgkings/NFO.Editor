@@ -24,21 +24,23 @@ class RenameToolGUI:
         self.window.title("批量改名工具 v0.0.3")
         self.window.geometry("600x500")
         
-        # 添加图标设置
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chuizi.ico")
-        if os.path.exists(icon_path):
-            try:
-                if parent:
-                    # 对于 Toplevel 窗口，使用 iconbitmap
-                    self.window.iconbitmap(icon_path)
-                else:
-                    # 对于主窗口，同时设置 iconbitmap 和 iconphoto
-                    self.window.iconbitmap(icon_path)
-                    # 为了兼容性，也设置 iconphoto
-                    icon_image = tk.PhotoImage(file=icon_path)
-                    self.window.iconphoto(True, icon_image)
-            except Exception as e:
-                print(f"设置图标时出错: {str(e)}")
+        # 修改图标设置逻辑
+        try:
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chuizi.ico")
+            if os.path.exists(icon_path):
+                if sys.platform == 'win32':  # Windows系统
+                    try:
+                        self.window.iconbitmap(default=icon_path)
+                    except tk.TclError:
+                        print("Windows图标加载失败，使用默认图标")
+                else:  # Linux/Mac系统
+                    try:
+                        img = tk.PhotoImage(file=icon_path)
+                        self.window.tk.call('wm', 'iconphoto', self.window._w, img)
+                    except tk.TclError:
+                        print("Linux/Mac图标加载失败，使用默认图标")
+        except Exception as e:
+            print(f"图标设置失败（使用默认图标）: {str(e)}")
 
         if parent:
             self.window.transient(parent)
@@ -65,9 +67,13 @@ class RenameToolGUI:
         execute_btn = tk.Button(self.control_frame, text="执行", command=self.execute_rename)
         execute_btn.pack(side=tk.LEFT, padx=5)
 
+        # 创建一个框架来容纳标签，以便更好地控制对齐
+        mapping_frame = tk.Frame(self.window)
+        mapping_frame.pack(fill=tk.X, padx=10, pady=10)
+        
         self.mapping_file_path = self.get_mapping_file_path()
-        mapping_label = tk.Label(self.window, text=self.mapping_file_path, fg="blue")
-        mapping_label.pack(pady=10)
+        mapping_label = tk.Label(mapping_frame, text=self.mapping_file_path, fg="blue", anchor="w", justify=tk.LEFT)
+        mapping_label.pack(fill=tk.X)
 
         self.log_frame = tk.Frame(self.window)
         self.log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
@@ -145,11 +151,12 @@ class RenameToolGUI:
 
     def _process_rename_thread(self):
         try:
-            mapping_file = self.mapping_file_path
+            # 获取 mapping_file_path 中的实际路径
+            mapping_file = self.mapping_file_path.split(': ')[-1].strip()
             directory = self.path_var.get()
 
             if not os.path.exists(mapping_file):
-                messagebox.showerror("错误", "未找到 mapping_actor.xml 文件，请确保它位于脚本所在的文件夹中。")
+                messagebox.showerror("错误", "未找到 mapping_actor.xml 文件，请确保它位于程序所在的文件夹中。")
                 return
 
             actor_mapping = load_actor_mapping(mapping_file)
