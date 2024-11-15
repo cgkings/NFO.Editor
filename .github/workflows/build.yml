@@ -1,4 +1,4 @@
-name: Build NFO.Editor
+name: Build NFO Tools
 
 on:
   push:
@@ -51,43 +51,35 @@ jobs:
         }
         echo "BUILD_NAME=$BUILD_NAME" >> $env:GITHUB_ENV
 
-    - name: 运行 PyInstaller
+    - name: 构建所有程序
       run: |
+        # 构建 NFO.Editor
         pyinstaller --name "NFO.Editor" --onefile --noconsole --icon="chuizi.ico" --add-data "Img;Img" --add-data "mapping_actor.xml;." "NFO.Editor.py"
+        Move-Item -Path "dist/NFO.Editor.exe" -Destination "dist/NFO.Editor.${{ env.BUILD_NAME }}.exe"
+        
+        # 构建 cg_crop
+        pyinstaller --name "cg_crop" --onefile --noconsole --icon="chuizi.ico" --add-data "Img;Img" "cg_crop.py"
+        Move-Item -Path "dist/cg_crop.exe" -Destination "dist/cg_crop.${{ env.BUILD_NAME }}.exe"
+        
+        # 构建 cg_rename
+        pyinstaller --name "cg_rename" --onefile --noconsole --icon="chuizi.ico" --add-data "mapping_actor.xml;." "cg_rename.py"
+        Move-Item -Path "dist/cg_rename.exe" -Destination "dist/cg_rename.${{ env.BUILD_NAME }}.exe"
 
     - name: 列出 dist 目录
       run: |
         dir dist  # 列出 dist 目录下的文件，帮助确认可执行文件
 
-    - name: 重命名构建产物
-      run: |
-        $ORIGINAL_NAME = "dist/NFO.Editor.exe"  # 使用实际生成的文件名
-        $NEW_NAME = "dist/NFO.Editor.${{ env.BUILD_NAME }}.exe"
-        echo "原始名称: $ORIGINAL_NAME"
-        echo "新名称: $NEW_NAME"
-
-        if (Test-Path $ORIGINAL_NAME) {
-          Move-Item -Path $ORIGINAL_NAME -Destination $NEW_NAME  # 使用 Move-Item 进行重命名
-        } else {
-          echo "错误: 构建产物 ${ORIGINAL_NAME} 不存在。"
-          exit 1
-        }
-
     - name: 创建 Release
       id: create_release
       uses: softprops/action-gh-release@v1
       with:
-        tag_name: ${{ env.BUILD_NAME }}  # 使用现有的标签
+        tag_name: ${{ env.BUILD_NAME }}
         release_name: Release ${{ env.BUILD_NAME }}
         draft: false
         prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: 上传构建产物到 Release
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: ${{ env.BUILD_NAME }}  # 与创建 Release 时相同
-        files: dist/NFO.Editor.${{ env.BUILD_NAME }}.exe  # 上传的文件
+        files: |
+          dist/NFO.Editor.${{ env.BUILD_NAME }}.exe
+          dist/cg_crop.${{ env.BUILD_NAME }}.exe
+          dist/cg_rename.${{ env.BUILD_NAME }}.exe
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

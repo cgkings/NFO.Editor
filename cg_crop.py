@@ -4,7 +4,7 @@ from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QFileDialog, QGroupBox, QLabel, QMessageBox, QRadioButton, QVBoxLayout, QHBoxLayout, 
                            QPushButton, QWidget)
 from PyQt5.QtCore import Qt, QRect, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen
+from PyQt5.QtGui import QIcon, QImage, QPixmap, QPainter, QPen
 
 class CropLabel(QLabel):
     original_info_updated = pyqtSignal(int, int)  # 发送原图宽度和高度
@@ -256,18 +256,24 @@ class EmbyPosterCrop(QDialog):
         super().__init__(parent)
         self.nfo_base_name = nfo_base_name
         self.setWindowTitle("EMBY海报裁剪工具 v1.0.0")
-        self.setMinimumSize(1200, 600)
+        self.setMinimumSize(1200, 640)
+        
+        # Set window icon
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'chuizi.ico')
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+            
         self.setup_ui()
 
     def setup_ui(self):
         """设置UI界面"""
         self.setWindowTitle("封面图片裁剪")
-        self.setFixedSize(1200, 600)  # 固定窗口大小
+        self.setFixedSize(1200, 640)  # 固定窗口大小
         
         # 主布局
         main_layout = QHBoxLayout(self)
         main_layout.setSpacing(20)
-        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setContentsMargins(10, 5, 10, 5) # 设置布局的边距(左,上,右,下)
         
         # 左侧：图片显示区域
         self.image_label = CropLabel()
@@ -297,33 +303,61 @@ class EmbyPosterCrop(QDialog):
         right_layout.addWidget(self.open_button)
         
         # 2. 图片信息显示
-        info_group = QGroupBox()
+        info_group = QGroupBox("图片信息")
+        info_group.setFixedHeight(233)  # 设置固定高度
+        info_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #CCCCCC;
+                border-radius: 5px;
+                margin-top: 16px;
+                padding: 5px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 5px;
+                padding: 0 5px;
+            }
+            QLabel {
+                font-weight: normal;
+                font-size: 9pt;
+            }
+        """)
         info_layout = QVBoxLayout(info_group)
+        info_layout.setSpacing(1)  # 设置布局的整体间距
+        info_layout.setContentsMargins(10, 3, 5, 3)  # 设置布局的边距(左,上,右,下)
 
         # 原图尺寸
         original_size_label = QLabel("原图尺寸:")
         self.original_size = QLabel("800, 538")
-        info_layout.addWidget(original_size_label)
+        info_layout.addWidget(original_size_label, )
         info_layout.addWidget(self.original_size)
+        info_layout.addSpacing(5)  # 增加间距
         
         # 裁剪尺寸
         crop_size_label = QLabel("裁剪尺寸:")
         self.crop_size = QLabel("377, 538")
         info_layout.addWidget(crop_size_label)
         info_layout.addWidget(self.crop_size)
+        info_layout.addSpacing(5)  # 增加间距
         
         # 裁剪位置
         crop_pos_label = QLabel("裁剪位置:")
         self.crop_pos = QLabel("421, 0, 800, 538")
         info_layout.addWidget(crop_pos_label)
         info_layout.addWidget(self.crop_pos)
+        info_layout.addSpacing(5)  # 增加间距
         
         # 高宽比例
         ratio_label = QLabel("高宽比例:")
         self.ratio = QLabel("1.42")
         info_layout.addWidget(ratio_label)
         info_layout.addWidget(self.ratio)
-        
+        info_layout.addSpacing(5)  # 增加间距
+
+        # 在底部添加弹性空间
+        info_layout.addStretch()
+
         right_layout.addWidget(info_group)
 
         # 连接信号
@@ -529,6 +563,11 @@ class EmbyPosterCrop(QDialog):
 def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle('Fusion')
+    
+    # Set application icon
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'img', 'icon.ico')
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
     
     window = EmbyPosterCrop()
     window.show()

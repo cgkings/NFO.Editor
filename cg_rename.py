@@ -24,6 +24,22 @@ class RenameToolGUI:
         self.window.title("批量改名工具 v0.0.3")
         self.window.geometry("600x500")
         
+        # 添加图标设置
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chuizi.ico")
+        if os.path.exists(icon_path):
+            try:
+                if parent:
+                    # 对于 Toplevel 窗口，使用 iconbitmap
+                    self.window.iconbitmap(icon_path)
+                else:
+                    # 对于主窗口，同时设置 iconbitmap 和 iconphoto
+                    self.window.iconbitmap(icon_path)
+                    # 为了兼容性，也设置 iconphoto
+                    icon_image = tk.PhotoImage(file=icon_path)
+                    self.window.iconphoto(True, icon_image)
+            except Exception as e:
+                print(f"设置图标时出错: {str(e)}")
+
         if parent:
             self.window.transient(parent)
             window_width = 600
