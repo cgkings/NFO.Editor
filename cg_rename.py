@@ -132,18 +132,28 @@ class RenameToolGUI:
         self.window.update()
 
     def get_mapping_file_path(self):
-        if getattr(sys, 'frozen', False):
-            script_dir = os.path.dirname(sys.executable)
-        else:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
+        try:
+            if getattr(sys, 'frozen', False):
+                # 如果是打包后的exe
+                base_path = sys._MEIPASS
+            else:
+                # 如果是直接运行的py脚本
+                base_path = os.path.dirname(os.path.abspath(__file__))
 
-        external_mapping_file = os.path.join(script_dir, 'mapping_actor.xml')
-        
-        # 检查外部配置文件是否存在
-        if os.path.exists(external_mapping_file):
-            return f"外部配置: {external_mapping_file}"
-        else:
-            return f"内置配置: {external_mapping_file}"  # 显示内置配置路径
+            # 先检查外部配置文件
+            external_mapping_file = os.path.join(os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__), 'mapping_actor.xml')
+            if os.path.exists(external_mapping_file):
+                return f"外部配置: {external_mapping_file}"
+            
+            # 如果外部配置不存在，则使用内置配置
+            internal_mapping_file = os.path.join(base_path, 'mapping_actor.xml')
+            if os.path.exists(internal_mapping_file):
+                return f"内置配置: {internal_mapping_file}"
+                
+            return f"未找到配置文件"
+        except Exception as e:
+            print(f"获取配置文件路径时出错: {str(e)}")
+            return f"配置文件路径错误"
 
     def execute_rename(self):
         if hasattr(self, 'process_thread') and self.process_thread.is_alive():
@@ -166,14 +176,22 @@ class RenameToolGUI:
 
     def _process_rename_thread(self):
         try:
-            # 获取 mapping_file_path 中的实际路径
-            mapping_file = self.mapping_file_path.split(': ')[-1].strip()
+            # 获取实际的配置文件路径
+            mapping_path_info = self.mapping_file_path
+            if mapping_path_info.startswith("外部配置: "):
+                mapping_file = mapping_path_info.split(': ')[1].strip()
+            elif mapping_path_info.startswith("内置配置: "):
+                mapping_file = mapping_path_info.split(': ')[1].strip()
+            else:
+                raise Exception("未找到有效的配置文件")
+
             directory = self.path_var.get()
 
             if not os.path.exists(mapping_file):
-                messagebox.showerror("错误", "未找到 mapping_actor.xml 文件，请确保它位于程序所在的文件夹中。")
+                messagebox.showerror("错误", f"未找到配置文件: {mapping_file}")
                 return
 
+            print(f"使用配置文件: {mapping_file}")
             actor_mapping = load_actor_mapping(mapping_file)
             rename_directory(directory, actor_mapping, self)
             self.status_label.config(text="处理完成！")
