@@ -3,7 +3,7 @@ from tkinter import filedialog, messagebox, Toplevel, ttk
 import os
 import shutil
 import threading
-import xml.etree.ElementTree as ET
+import xml.etree.cElementTree as ET
 from datetime import datetime
 from PIL import Image, ImageTk
 from idlelib.tooltip import Hovertip
@@ -16,7 +16,7 @@ from cg_crop import EmbyPosterCrop
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v9.1.6")
+        self.root.title("大锤 NFO Editor v9.1.8")
 
         self.current_file_path = None
         self.fields_entries = {}
@@ -42,6 +42,7 @@ class NFOEditorApp:
         self.sorting_frame = tk.Frame(self.root)
         self.sorting_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
         self.create_sorting_options()
+        self.create_filter_frame()  # 添加筛选框架
 
         self.main_frame = tk.Frame(self.root)
         self.main_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -80,6 +81,151 @@ class NFOEditorApp:
         sorting_options = [("文件名 (Filename)", "filename"), ("演员 (Actors)", "actors"), ("系列 (Series)", "series"), ("评分 (Rating)", "rating")]
         for text, value in sorting_options:
             tk.Radiobutton(self.sorting_frame, text=text, variable=self.sorting_var, value=value, command=self.sort_files).pack(side=tk.LEFT, padx=5)
+
+    def create_filter_frame(self):
+        # 创建筛选框架
+        filter_frame = tk.Frame(self.sorting_frame)
+        filter_frame.pack(side=tk.RIGHT, padx=10)
+
+        # 创建字段下拉菜单
+        self.field_var = tk.StringVar(value="title")
+        field_options = [
+            ("标题", "title"),
+            ("标签", "tag"),
+            ("演员", "actor"),
+            ("系列", "series"),
+            ("评分", "rating")
+        ]
+        field_menu = ttk.Combobox(filter_frame, textvariable=self.field_var, width=8, state="readonly")
+        field_menu['values'] = [opt[0] for opt in field_options]
+        field_menu.current(0)
+        field_menu.pack(side=tk.LEFT, padx=2)
+
+        # 创建条件下拉菜单
+        self.condition_var = tk.StringVar(value="contains")
+        self.rating_conditions = [
+            ("包含", "contains"),
+            ("大于", "greater"),
+            ("小于", "less")
+        ]
+        self.normal_conditions = [("包含", "contains")]
+        
+        condition_menu = ttk.Combobox(filter_frame, textvariable=self.condition_var, width=8, state="readonly")
+        condition_menu['values'] = [opt[0] for opt in self.normal_conditions]
+        condition_menu.current(0)
+        condition_menu.pack(side=tk.LEFT, padx=2)
+
+        # 修改后的代码：
+        def on_field_change(event=None):
+            if self.field_var.get() == "评分":
+                condition_menu['values'] = [opt[0] for opt in self.rating_conditions]
+            else:
+                condition_menu['values'] = [opt[0] for opt in self.normal_conditions]
+                self.condition_var.set("包含")
+            
+            # 清空筛选输入框
+            self.filter_entry.delete(0, tk.END)
+
+        field_menu.bind('<<ComboboxSelected>>', on_field_change)
+
+        # 创建输入框
+        self.filter_entry = tk.Entry(filter_frame, width=15)
+        self.filter_entry.pack(side=tk.LEFT, padx=2)
+
+        # 创建筛选按钮
+        filter_button = tk.Button(filter_frame, text="筛选", command=self.apply_filter)
+        filter_button.pack(side=tk.LEFT, padx=2)
+        Hovertip(filter_button, '根据条件筛选文件列表')
+
+    def apply_filter(self):
+        # 获取筛选条件
+        field = self.field_var.get()
+        condition = self.condition_var.get()
+        filter_text = self.filter_entry.get().strip()
+
+        # 映射显示值到实际值
+        condition_map = dict(self.rating_conditions + self.normal_conditions)
+        condition_value = condition_map.get(condition, "contains")
+
+        # 如果筛选条件为空，显示所有文件
+        if not filter_text:
+            self.load_files_in_folder()
+            return
+
+        # 清空当前文件列表
+        self.file_treeview.delete(*self.file_treeview.get_children())
+
+        # 遍历所有NFO文件进行筛选
+        for root, dirs, files in os.walk(self.folder_path):
+            for file in files:
+                if file.endswith('.nfo'):
+                    nfo_file_path = os.path.join(root, file)
+                    try:
+                        # 解析NFO文件
+                        tree = ET.parse(nfo_file_path)
+                        root_elem = tree.getroot()
+                        
+                        # 获取字段值
+                        if field == "标题":
+                            elem = root_elem.find('title')
+                            value = elem.text.strip() if elem is not None and elem.text else ""
+                        elif field == "标签":
+                            tags = [tag.text.strip() for tag in root_elem.findall('tag') 
+                                if tag.text and tag.text.strip()]
+                            value = ", ".join(tags)
+                        elif field == "演员":
+                            actors = [actor.find('name').text.strip() 
+                                    for actor in root_elem.findall('actor') 
+                                    if actor.find('name') is not None 
+                                    and actor.find('name').text 
+                                    and actor.find('name').text.strip()]
+                            value = ", ".join(actors)
+                        elif field == "系列":
+                            elem = root_elem.find('series')
+                            value = elem.text.strip() if elem is not None and elem.text else ""
+                        elif field == "评分":
+                            elem = root_elem.find('rating')
+                            value = elem.text.strip() if elem is not None and elem.text else "0"
+                        
+                        # 根据条件进行筛选
+                        match = False
+                        if field == "评分":
+                            try:
+                                current_value = float(value)
+                                filter_value = float(filter_text)
+                                if condition_value == "contains":
+                                    match = str(filter_value) in str(current_value)
+                                elif condition_value == "greater":
+                                    match = current_value > filter_value
+                                elif condition_value == "less":
+                                    match = current_value < filter_value
+                            except ValueError:
+                                continue
+                        else:
+                            # 非评分字段只进行包含判断
+                            match = filter_text.lower() in value.lower()
+
+                        # 如果匹配，添加到列表中
+                        if match:
+                            relative_path = os.path.relpath(nfo_file_path, self.folder_path)
+                            parts = relative_path.split(os.sep)
+                            
+                            if len(parts) > 1:
+                                first_level_dirs = os.sep.join(parts[:-2]) if len(parts) > 2 else ""
+                                second_level_dir = parts[-2]
+                                nfo_file = parts[-1]
+                            else:
+                                first_level_dirs = ""
+                                second_level_dir = ""
+                                nfo_file = parts[-1]
+                                
+                            self.file_treeview.insert("", "end", values=(first_level_dirs, second_level_dir, nfo_file))
+                            
+                    except ET.ParseError:
+                        continue
+                    except Exception as e:
+                        print(f"Error processing {nfo_file_path}: {str(e)}")
+                        continue
 
     def create_file_list(self, parent):
         listbox_frame = tk.Frame(parent, width=150)
@@ -354,10 +500,29 @@ class NFOEditorApp:
             webbrowser.open(url)
 
     def on_entry_focus_out(self, event):
-        if self.selected_index_cache:
-            for selected_index in self.selected_index_cache:
-                self.file_treeview.selection_set(selected_index)
-                self.file_treeview.see(selected_index)
+        """当输入框失去焦点时触发的函数"""
+        if hasattr(self, 'selected_index_cache') and self.selected_index_cache:
+            # 验证每个缓存的选中项是否仍然存在
+            valid_items = []
+            for item_id in self.selected_index_cache:
+                try:
+                    # 检查项目是否仍然存在
+                    if self.file_treeview.exists(item_id):
+                        valid_items.append(item_id)
+                except:
+                    continue
+                    
+            # 清除当前选择
+            self.file_treeview.selection_remove(*self.file_treeview.selection())
+            
+            # 只选择仍然存在的项目
+            if valid_items:
+                for item_id in valid_items:
+                    self.file_treeview.selection_add(item_id)
+                    self.file_treeview.see(item_id)
+                
+                # 更新缓存
+                self.selected_index_cache = valid_items
 
     def save_changes(self):
         if not self.current_file_path:
@@ -604,10 +769,10 @@ class NFOEditorApp:
         self.sorted_treeview.delete(*self.sorted_treeview.get_children())
         if path != os.path.abspath(os.path.join(path, "..")):
             self.sorted_treeview.insert("", "end", values=("..",))
-        for item in os.listdir(path):
-            full_path = os.path.join(path, item)
-            if os.path.isdir(full_path):
-                self.sorted_treeview.insert("", "end", values=(item,))
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.is_dir():
+                    self.sorted_treeview.insert("", "end", values=(entry.name,))
 
     def start_move_thread(self):
         """启动移动文件的线程"""
@@ -844,8 +1009,16 @@ class NFOEditorApp:
     def display_image(self):
         if self.current_file_path:
             folder = os.path.dirname(self.current_file_path)
-            poster_files = [f for f in os.listdir(folder) if f.lower().endswith('.jpg') and 'poster' in f.lower()]
-            thumb_files = [f for f in os.listdir(folder) if f.lower().endswith('.jpg') and 'thumb' in f.lower()]
+            poster_files = []
+            thumb_files = []
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    name = entry.name.lower()
+                    if name.endswith('.jpg'):
+                        if 'poster' in name:
+                            poster_files.append(entry.name)
+                        elif 'thumb' in name:
+                            thumb_files.append(entry.name)
 
             if poster_files:
                 self.load_image(poster_files[0], self.poster_label, (165, 225))
