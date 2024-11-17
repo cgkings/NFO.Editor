@@ -54,11 +54,11 @@ jobs:
     - name: 构建所有程序
       run: |
         # 构建 NFO.Editor
-        pyinstaller --name "NFO.Editor" --onefile --noconsole --icon="chuizi.ico" --add-data "Img;Img" --add-data "mapping_actor.xml;." "NFO.Editor.py"
+        pyinstaller --name "NFO.Editor" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "Img;Img" --add-data "mapping_actor.xml;." "NFO.Editor.py"
         Move-Item -Path "dist/NFO.Editor.exe" -Destination "dist/NFO.Editor.${{ env.BUILD_NAME }}.exe"
         
         # 构建 cg_crop
-        pyinstaller --name "cg_crop" --onefile --noconsole --icon="chuizi.ico" --add-data "Img;Img" --add-data "chuizi.ico;." "cg_crop.py"
+        pyinstaller --name "cg_crop" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "Img;Img" "cg_crop.py"
         Move-Item -Path "dist/cg_crop.exe" -Destination "dist/cg_crop.${{ env.BUILD_NAME }}.exe"
         
         # 构建 cg_rename
