@@ -32,7 +32,6 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        pip install pyinstaller
 
     - name: 设置构建名称
       id: set_build_name
@@ -62,13 +61,13 @@ jobs:
         # 将 cg_crop.exe 复制到临时目录，供 NFO.Editor 使用
         Copy-Item -Path "dist/cg_crop.exe" -Destination "temp/cg_crop.exe"
         
-        # 构建 NFO.Editor，使用临时目录中的 cg_crop.exe
-        pyinstaller --name "NFO.Editor" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "temp/cg_crop.exe;." --add-data "mapping_actor.xml;." --add-data "Img;Img" "NFO.Editor.py"
+        # 构建 NFO.Editor
+        pyinstaller --name "NFO.Editor" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "temp/cg_crop.exe;." --add-data "mapping_actor.xml;." --add-data "Img;Img" --hidden-import win32com.client --hidden-import win32timezone "NFO.Editor.py"
         
         # 构建 cg_rename
         pyinstaller --name "cg_rename" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "mapping_actor.xml;." "cg_rename.py"
         
-        # 重命名生成的文件，使用环境变量中的版本号
+        # 重命名生成的文件
         Move-Item -Path "dist/NFO.Editor.exe" -Destination "dist/NFO.Editor.${{ env.BUILD_NAME }}.exe" -Force
         Move-Item -Path "dist/cg_crop.exe" -Destination "dist/cg_crop.${{ env.BUILD_NAME }}.exe" -Force
         Move-Item -Path "dist/cg_rename.exe" -Destination "dist/cg_rename.${{ env.BUILD_NAME }}.exe" -Force
