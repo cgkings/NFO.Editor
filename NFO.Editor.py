@@ -26,7 +26,7 @@ def get_resource_path(relative_path):
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v9.2.1")
+        self.root.title("大锤 NFO Editor v9.2.2")
         
         # 在创建任何UI组件之前设置图标
         try:
@@ -1116,10 +1116,10 @@ class NFOEditorApp:
         """使用子进程方式打开裁剪工具"""
         if not self.current_file_path:
             return
-                    
+                        
         folder = os.path.dirname(self.current_file_path)
         image_files = [f for f in os.listdir(folder) if f.lower().endswith('.jpg') and image_type in f.lower()]
-                
+                    
         if not image_files:
             messagebox.showerror("错误", f"未找到{image_type}图片")
             return
@@ -1128,11 +1128,11 @@ class NFOEditorApp:
             # 获取NFO文件内容以确定水印设置
             tree = ET.parse(self.current_file_path)
             root = tree.getroot()
-                    
+                        
             # 初始化水印配置
             has_subtitle = False
             mark_type = "none"  # 默认无水印
-                    
+                        
             # 检查tag标签内容
             for tag in root.findall('tag'):
                 tag_text = tag.text.lower() if tag.text else ""
@@ -1149,10 +1149,10 @@ class NFOEditorApp:
 
             # 获取NFO文件的基础名称
             nfo_base_name = os.path.splitext(os.path.basename(self.current_file_path))[0]
-                    
+                        
             # 获取图片的完整路径
             image_path = os.path.join(folder, image_files[0])
-                
+                    
             # 根据运行模式确定如何启动裁剪工具
             if getattr(sys, 'frozen', False):
                 # exe模式：使用打包的cg_crop.exe
@@ -1189,7 +1189,14 @@ class NFOEditorApp:
 
             # 启动裁剪工具作为独立进程
             process = subprocess.Popen(command, creationflags=subprocess.CREATE_NO_WINDOW)
-                    
+            
+            # 等待裁剪工具进程结束
+            process.wait()
+            
+            # 如果显示图片选项是打开的，刷新图片显示
+            if self.show_images_var.get():
+                self.display_image()
+                        
         except Exception as e:
             error_msg = str(e)
             print(f"Error: {error_msg}")
