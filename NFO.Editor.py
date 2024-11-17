@@ -11,13 +11,30 @@ import xml.dom.minidom as minidom
 import subprocess
 import sys
 import winshell
-from PyQt5 import QtWidgets
-from cg_crop import EmbyPosterCrop
+import tempfile  # 添加 tempfile 导入
+
+def get_resource_path(relative_path):
+    """获取资源文件的绝对路径"""
+    if getattr(sys, 'frozen', False):
+        # 如果是打包后的exe
+        base_path = sys._MEIPASS
+    else:
+        # 如果是直接运行的py脚本
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
 
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v9.1.9")
+        self.root.title("大锤 NFO Editor v9.2.0")
+        
+        # 在创建任何UI组件之前设置图标
+        try:
+            icon_path = get_resource_path('chuizi.ico')
+            if os.path.exists(icon_path):
+                self.root.iconbitmap(default=icon_path)
+        except Exception:
+            pass
 
         self.current_file_path = None
         self.fields_entries = {}
@@ -1095,45 +1112,27 @@ class NFOEditorApp:
         except Exception as e:
             label.config(text="加载图片失败: " + str(e))
 
-    def launch_crop_tool(self, image_path, nfo_base_name):
-        try:
-            if not QtWidgets.QApplication.instance():
-                app = QtWidgets.QApplication([])
-            
-            main_window = QtWidgets.QMainWindow()
-            dialog = EmbyPosterCrop(parent=main_window, nfo_base_name=nfo_base_name)
-            
-            # 使用新方法直接加载图片
-            dialog.load_initial_image(image_path)
-            
-            result = dialog.exec_()
-            
-            if result == QtWidgets.QDialog.Accepted and self.show_images_var.get():
-                self.display_image()
-                
-        except Exception as e:
-            messagebox.showerror("错误", f"处理图片时出错：{str(e)}")
-
     def open_image_and_crop(self, image_type):
+        """使用子进程方式打开裁剪工具"""
         if not self.current_file_path:
             return
-            
+                    
         folder = os.path.dirname(self.current_file_path)
         image_files = [f for f in os.listdir(folder) if f.lower().endswith('.jpg') and image_type in f.lower()]
-        
+                
         if not image_files:
             messagebox.showerror("错误", f"未找到{image_type}图片")
             return
 
         try:
-            # 获取NFO文件内容
+            # 获取NFO文件内容以确定水印设置
             tree = ET.parse(self.current_file_path)
             root = tree.getroot()
-            
+                    
             # 初始化水印配置
             has_subtitle = False
             mark_type = "none"  # 默认无水印
-            
+                    
             # 检查tag标签内容
             for tag in root.findall('tag'):
                 tag_text = tag.text.lower() if tag.text else ""
@@ -1145,47 +1144,56 @@ class NFOEditorApp:
                     mark_type = "leak"
                 elif "无码" in tag_text:
                     mark_type = "wuma"
-                # 如果已经找到非none的mark_type，就不再继续查找
                 if mark_type != "none":
                     break
 
-            # 获取当前NFO文件的基础名称
+            # 获取NFO文件的基础名称
             nfo_base_name = os.path.splitext(os.path.basename(self.current_file_path))[0]
-            
-            # 创建QApplication实例（如果还没有创建）
-            if not QtWidgets.QApplication.instance():
-                app = QtWidgets.QApplication([])
-            
-            # 创建并显示裁剪窗口
-            main_window = QtWidgets.QMainWindow()
-            dialog = EmbyPosterCrop(main_window, nfo_base_name)
-            
-            # 设置初始图片
-            image_path = os.path.join(folder, image_files[0])
-            dialog.image_path = image_path
-            dialog.image_label.set_image(image_path)
-            
-            # 设置水印选项
-            if has_subtitle:
-                dialog.sub_check.setChecked(True)
-                
-            # 设置分类水印
-            for button in dialog.mark_group.buttons():
-                if button.property('value') == mark_type:
-                    button.setChecked(True)
-                    break
                     
-            # 显示对话框并等待结果
-            result = dialog.exec_()
+            # 获取图片的完整路径
+            image_path = os.path.join(folder, image_files[0])
+                
+            # 根据运行模式确定如何启动裁剪工具
+            if getattr(sys, 'frozen', False):
+                # exe模式：使用打包的cg_crop.exe
+                crop_tool = get_resource_path('cg_crop.exe')
+                temp_exe = os.path.join(tempfile.gettempdir(), 'cg_crop.exe')
+                
+                if not os.path.exists(temp_exe) or os.path.getsize(temp_exe) != os.path.getsize(crop_tool):
+                    shutil.copy2(crop_tool, temp_exe)
+                
+                # 构建命令行参数
+                command = [
+                    temp_exe,
+                    '--image', image_path,
+                    '--nfo-name', nfo_base_name,
+                    '--mark-type', mark_type
+                ]
+            else:
+                # 脚本模式：直接运行Python脚本
+                crop_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cg_crop.py')
+                if not os.path.exists(crop_script):
+                    raise FileNotFoundError("找不到裁剪工具脚本(cg_crop.py)")
+                    
+                command = [
+                    sys.executable,
+                    crop_script,
+                    '--image', image_path,
+                    '--nfo-name', nfo_base_name,
+                    '--mark-type', mark_type
+                ]
             
-            # 如果用户确认了操作（点击了"裁剪并关闭"按钮）
-            if result == QtWidgets.QDialog.Accepted:
-                # 刷新图片显示
-                if self.show_images_var.get():
-                    self.display_image()
+            # 如果有字幕标记，添加参数
+            if has_subtitle:
+                command.append('--subtitle')
+
+            # 启动裁剪工具作为独立进程
+            process = subprocess.Popen(command, creationflags=subprocess.CREATE_NO_WINDOW)
                     
         except Exception as e:
-            messagebox.showerror("错误", f"处理图片时出错：{str(e)}")
+            error_msg = str(e)
+            print(f"Error: {error_msg}")
+            messagebox.showerror("错误", f"启动裁剪工具时出错：{error_msg}")
 
 if __name__ == "__main__":
     root = tk.Tk()

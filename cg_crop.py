@@ -1,5 +1,6 @@
 import sys
 import os
+import traceback
 from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QFileDialog, QGroupBox, QLabel, QMessageBox, QRadioButton, QVBoxLayout, QHBoxLayout, 
                            QPushButton, QWidget)
@@ -265,7 +266,7 @@ class EmbyPosterCrop(QDialog):
     def __init__(self, parent=None, nfo_base_name=None):
         super().__init__(parent)
         self.nfo_base_name = nfo_base_name
-        self.setWindowTitle("EMBY海报裁剪工具 v1.0.0")
+        self.setWindowTitle("EMBY海报裁剪工具 v2.0.0")
         self.setMinimumSize(1200, 640)
         
         # 设置窗口图标
@@ -573,18 +574,58 @@ class EmbyPosterCrop(QDialog):
             self.image_path = image_path
             self.image_label.set_image(image_path)
 
-def main():
-    app = QtWidgets.QApplication(sys.argv)
-    app.setStyle('Fusion')
-    
-    # Set application icon
-    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'img', 'icon.ico')
-    if os.path.exists(icon_path):
-        app.setWindowIcon(QIcon(icon_path))
-    
-    window = EmbyPosterCrop()
-    window.show()
-    sys.exit(app.exec_())
-
 if __name__ == "__main__":
-    main()
+    import argparse
+    import sys
+    
+    try:
+        # 创建QApplication实例
+        app = QtWidgets.QApplication(sys.argv)
+        app.setStyle('Fusion')
+        
+        # 设置应用程序图标
+        try:
+            icon_path = get_resource_path('chuizi.ico')
+            if os.path.exists(icon_path):
+                app.setWindowIcon(QIcon(icon_path))
+        except Exception as e:
+            print(f"设置窗口图标失败: {str(e)}")
+        
+        # 创建参数解析器
+        parser = argparse.ArgumentParser(description='图片裁剪工具')
+        parser.add_argument('--image', help='要处理的图片路径')
+        parser.add_argument('--nfo-name', help='NFO文件基础名称')
+        parser.add_argument('--subtitle', action='store_true', help='是否添加字幕水印')
+        parser.add_argument('--mark-type', 
+                          choices=['none', 'umr', 'leak', 'wuma', 'youma'],
+                          default='none',
+                          help='水印类型')
+
+        # 解析命令行参数
+        args = parser.parse_args()
+        
+        # 创建主窗口
+        window = EmbyPosterCrop(nfo_base_name=args.nfo_name)
+        
+        # 如果提供了图片路径且文件存在，则加载图片
+        if args.image and os.path.exists(args.image):
+            window.load_initial_image(args.image)
+            
+            # 设置水印选项
+            if args.subtitle:
+                window.sub_check.setChecked(True)
+                
+            # 设置水印类型
+            if args.mark_type != 'none':
+                for button in window.mark_group.buttons():
+                    if button.property('value') == args.mark_type:
+                        button.setChecked(True)
+                        break
+        
+        window.show()
+        sys.exit(app.exec_())
+        
+    except Exception as e:
+        print(f"启动失败：{str(e)}")
+        traceback.print_exc()
+        sys.exit(1)
