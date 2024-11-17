@@ -10,13 +10,14 @@ from idlelib.tooltip import Hovertip
 import xml.dom.minidom as minidom
 import subprocess
 import sys
+import winshell
 from PyQt5 import QtWidgets
 from cg_crop import EmbyPosterCrop
 
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v9.1.8")
+        self.root.title("大锤 NFO Editor v9.1.9")
 
         self.current_file_path = None
         self.fields_entries = {}
@@ -51,6 +52,10 @@ class NFOEditorApp:
         self.create_fields_frame(self.main_frame)
         self.create_operations_panel()
 
+        # 添加快捷键
+        self.root.bind('<F5>', lambda e: self.load_files_in_folder())
+        self.root.bind('<Right>', lambda e: self.start_move_thread())
+
     def create_top_buttons(self):
         buttons_info = [
             ("选择nfo目录", self.open_folder, '选择目录以加载NFO文件'),
@@ -59,8 +64,8 @@ class NFOEditorApp:
             ("📁", self.open_selected_folder, '打开选中的文件夹'),
             ("⏯", self.open_selected_video, '播放选中的视频文件'),
             ("🔗", self.open_batch_rename_tool, '统一演员名并重命名文件夹'),
-            ("🔁", self.load_files_in_folder, '刷新文件列表'),
-            ("=>", self.start_move_thread, '移动nfo所在文件夹到目标目录'),
+            ("🔁", self.load_files_in_folder, '刷新文件列表,快捷键F5'),
+            ("=>", self.start_move_thread, '移动nfo所在文件夹到目标目录,快捷键方向键→'),
         ]
 
         for text, command, tooltip in buttons_info:
@@ -246,6 +251,7 @@ class NFOEditorApp:
         self.file_treeview.config(yscrollcommand=scrollbar.set)
 
         self.file_treeview.bind('<<TreeviewSelect>>', self.on_file_select)
+        self.file_treeview.bind('<Delete>', self.delete_selected_folders)  # 添加这一行
 
     def create_sorted_list(self, parent):
         sorted_list_frame = tk.Frame(parent, width=300)
@@ -374,6 +380,53 @@ class NFOEditorApp:
             self.file_treeview.selection_set(first_item)
             self.file_treeview.see(first_item)
             self.on_file_select(None)
+
+    def delete_selected_folders(self, event):
+        """当按下删除键时，确认后将选中的文件夹移动到回收站"""
+        selected_items = self.file_treeview.selection()
+        if not selected_items:
+            return
+            
+        # 获取选中的文件夹数量
+        count = len(selected_items)
+        
+        # 构建确认消息
+        if count == 1:
+            item = self.file_treeview.item(selected_items[0])
+            values = item["values"]
+            folder_name = values[1] if values[1] else values[0]
+            message = f"确定要将文件夹 '{folder_name}' 移动到回收站吗？"
+        else:
+            message = f"确定要将这 {count} 个文件夹移动到回收站吗？"
+        
+        # 弹出确认对话框
+        if not messagebox.askyesno("确认删除", message):
+            return
+            
+        try:
+            for selected_item in selected_items:
+                item = self.file_treeview.item(selected_item)
+                values = item["values"]
+                
+                # 构建文件夹路径
+                if values[1]:  # 如果有二级目录
+                    folder_path = os.path.join(self.folder_path, values[0], values[1])
+                else:  # 如果只有一级目录
+                    folder_path = os.path.join(self.folder_path, values[0])
+                
+                # 检查文件夹是否存在
+                if os.path.exists(folder_path):
+                    try:
+                        winshell.delete_file(folder_path, no_confirm=True)  # 删除到回收站
+                        self.file_treeview.delete(selected_item)  # 从列表中移除
+                    except Exception as e:
+                        print(f"删除文件夹失败: {folder_path}\n错误信息: {str(e)}")
+                else:
+                    # 如果文件夹不存在，仅从列表中移除
+                    self.file_treeview.delete(selected_item)
+                    
+        except Exception as e:
+            messagebox.showerror("错误", f"删除文件夹时发生错误: {str(e)}")
 
     def open_selected_nfo(self):
         selected_items = self.file_treeview.selection()
