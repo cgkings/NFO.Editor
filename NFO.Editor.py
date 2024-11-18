@@ -26,7 +26,7 @@ def get_resource_path(relative_path):
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v9.2.2")
+        self.root.title("大锤 NFO Editor v9.2.3")
         
         # 在创建任何UI组件之前设置图标
         try:
@@ -336,13 +336,62 @@ class NFOEditorApp:
                 entry = tk.Label(frame, text="", width=60, height=height, fg="blue", cursor="hand2", anchor='w', font=("Arial", 12, "bold"))
                 entry.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=True)
                 entry.bind("<Button-1>", self.open_num_url)
+            elif field == 'rating':  # 评分特殊处理
+                entry = tk.Text(frame, width=60, height=height)
+                entry.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=True)
+                entry.bind('<FocusIn>', self.on_rating_focus_in)  # 获得焦点时全选
+                entry.bind('<KeyRelease>', self.on_rating_key_release)  # 键盘输入时格式化
+                # 不再绑定通用的FocusOut事件
             else:
                 entry = tk.Text(frame, width=60, height=height)
                 entry.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=True)
 
             self.fields_entries[field] = entry
-            if field != 'num':
-                entry.bind('<FocusOut>', self.on_entry_focus_out)
+
+    def on_rating_focus_in(self, event):
+        """当评分输入框获得焦点时，全选内容"""
+        event.widget.tag_add('sel', '1.0', 'end-1c')
+        return 'break'  # 防止默认行为
+
+    def on_rating_key_release(self, event):
+        """处理评分输入的格式化"""
+        try:
+            # 获取输入值并去除空格
+            current_text = event.widget.get('1.0', 'end').strip()
+            
+            # 空值不处理
+            if not current_text:
+                return
+                
+            # 获取按键输入的字符
+            key_char = event.char
+            
+            # 如果按下的是数字键
+            if key_char.isdigit():
+                # 如果当前文本包含小数点（即已经格式化过）
+                if '.' in current_text:
+                    # 获取小数点前的数字
+                    main_num = current_text.split('.')[0]
+                    # 新数字作为小数点后的值
+                    formatted_rating = f"{main_num}.{key_char}"
+                    
+                    # 检查是否超过9.9
+                    if float(formatted_rating) <= 9.9:
+                        event.widget.delete('1.0', 'end')
+                        event.widget.insert('1.0', formatted_rating)
+                    else:
+                        event.widget.delete('1.0', 'end')
+                        event.widget.insert('1.0', "9.9")
+                # 如果是单个数字，格式化为 x.0
+                elif current_text.isdigit():
+                    formatted_rating = f"{float(current_text):.1f}"
+                    event.widget.delete('1.0', 'end')
+                    event.widget.insert('1.0', formatted_rating)
+                    
+            event.widget.mark_set(tk.INSERT, 'end-1c')  # 光标移到末尾
+                
+        except Exception as e:
+            print(f"处理评分输入时出错: {str(e)}")
 
     def create_operations_panel(self):
         operations_frame = tk.Frame(self.fields_frame, padx=10, pady=10)
@@ -498,27 +547,83 @@ class NFOEditorApp:
                 else:
                     messagebox.showerror("错误", f"NFO文件不存在：{nfo_file_path}")
 
+    def has_unsaved_changes(self):
+        """检查是否有未保存的更改"""
+        try:
+            # 如果没有当前文件或文件不存在，则无需检查
+            if not self.current_file_path or not os.path.exists(self.current_file_path):
+                return False
+                
+            # 解析当前NFO文件
+            tree = ET.parse(self.current_file_path)
+            root = tree.getroot()
+
+            # 检查基本字段是否有变化
+            basic_fields = ['title', 'plot', 'series', 'rating']
+            for field in basic_fields:
+                current_value = self.fields_entries[field].get(1.0, tk.END).strip()
+                elem = root.find(field)
+                original_value = elem.text.strip() if elem is not None and elem.text else ""
+                if current_value != original_value:
+                    return True
+
+            # 检查演员列表是否有变化
+            current_actors = set(actor.strip() for actor in self.fields_entries['actors'].get(1.0, tk.END).strip().split(',') if actor.strip())
+            original_actors = {actor.find('name').text.strip() for actor in root.findall('actor') 
+                            if actor.find('name') is not None and actor.find('name').text}
+            if current_actors != original_actors:
+                return True
+
+            # 检查标签是否有变化
+            current_tags = set(tag.strip() for tag in self.fields_entries['tags'].get(1.0, tk.END).strip().split(',') if tag.strip())
+            original_tags = {tag.text.strip() for tag in root.findall('tag') if tag is not None and tag.text}
+            if current_tags != original_tags:
+                return True
+
+            # 检查类别是否有变化
+            current_genres = set(genre.strip() for genre in self.fields_entries['genres'].get(1.0, tk.END).strip().split(',') if genre.strip())
+            original_genres = {genre.text.strip() for genre in root.findall('genre') if genre is not None and genre.text}
+            if current_genres != original_genres:
+                return True
+
+            return False
+
+        except Exception:
+            # 发生错误时不打印错误信息，直接返回False
+            return False
+
     def on_file_select(self, event):
         """当选择文件时触发的函数"""
         selected_items = self.file_treeview.selection()
-        if selected_items:
-            for selected_item in selected_items:
-                item = self.file_treeview.item(selected_item)
-                values = item["values"]
-                if values[2]:
-                    # 构建文件路径
-                    self.current_file_path = os.path.join(self.folder_path, values[0], values[1], values[2]) if values[1] else os.path.join(self.folder_path, values[0], values[2])
+        if not selected_items:
+            return
+
+        # 检查当前是否有未保存的更改
+        if hasattr(self, 'current_file_path') and self.current_file_path:
+            if self.has_unsaved_changes():
+                result = messagebox.askyesnocancel("保存更改", "当前有未保存的更改，是否保存？")
+                if result is None:  # 用户点击取消
+                    return
+                if result:  # 用户点击是
+                    self.save_changes()  # 这里会清除缓存
+                else:  # 用户点击否
+                    # 不保存时也清除缓存
+                    self.current_file_path = None
+                    self.selected_index_cache = None
+
+        for selected_item in selected_items:
+            item = self.file_treeview.item(selected_item)
+            values = item["values"]
+            if values[2]:
+                self.current_file_path = os.path.join(self.folder_path, values[0], values[1], values[2]) if values[1] else os.path.join(self.folder_path, values[0], values[2])
+                
+                if not os.path.exists(self.current_file_path):
+                    self.file_treeview.delete(selected_item)
+                    return
                     
-                    # 检查文件是否存在
-                    if not os.path.exists(self.current_file_path):
-                        # 只删除不存在的文件项
-                        self.file_treeview.delete(selected_item)
-                        return
-                    
-                    # 文件存在则加载信息和图片
-                    self.load_nfo_fields()
-                    if self.show_images_var.get():
-                        self.display_image()
+                self.load_nfo_fields()
+                if self.show_images_var.get():
+                    self.display_image()
                 self.selected_index_cache = selected_items
 
     def load_nfo_fields(self):
