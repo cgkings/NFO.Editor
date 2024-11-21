@@ -66,12 +66,16 @@ jobs:
         
         # 构建 cg_rename
         pyinstaller --name "cg_rename" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "mapping_actor.xml;." "cg_rename.py"
-        
+
+        # 构建 cg_dedupe
+        pyinstaller --name "cg_dedupe" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." "cg_dedupe.py"
+
         # 重命名生成的文件
         Move-Item -Path "dist/NFO.Editor.exe" -Destination "dist/NFO.Editor.${{ env.BUILD_NAME }}.exe" -Force
         Move-Item -Path "dist/cg_crop.exe" -Destination "dist/cg_crop.${{ env.BUILD_NAME }}.exe" -Force
         Move-Item -Path "dist/cg_rename.exe" -Destination "dist/cg_rename.${{ env.BUILD_NAME }}.exe" -Force
-        
+        Move-Item -Path "dist/cg_dedupe.exe" -Destination "dist/cg_dedupe.${{ env.BUILD_NAME }}.exe" -Force
+
         # 清理临时文件
         Remove-Item -Path "temp" -Recurse -Force
 
@@ -87,5 +91,6 @@ jobs:
           dist/NFO.Editor.${{ env.BUILD_NAME }}.exe
           dist/cg_crop.${{ env.BUILD_NAME }}.exe
           dist/cg_rename.${{ env.BUILD_NAME }}.exe
+          dist/cg_dedupe.${{ env.BUILD_NAME }}.exe
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
