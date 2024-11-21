@@ -3,7 +3,9 @@ import re
 import sys
 import subprocess
 from PyQt5 import QtWidgets, QtGui, QtCore
-from multiprocessing import Pool, cpu_count, freeze_support
+from concurrent.futures import ThreadPoolExecutor
+import xml.etree.ElementTree as ET
+from multiprocessing import cpu_count, freeze_support
 import signal
 
 
@@ -108,6 +110,15 @@ class NfoDuplicateOperations:
     def __init__(self, ui_instance):
         self.ui = ui_instance
 
+    def update_directories(self, directory, remove=False):
+        if remove:
+            if directory in self.ui.selected_directories:
+                self.ui.selected_directories.remove(directory)
+        else:
+            self.ui.selected_directories.append(directory)
+            self.ui.last_directory = directory
+        self.ui.update_selected_directories_display()
+
     def select_directories(self):
         directories = QtWidgets.QFileDialog.getExistingDirectory(
             self.ui,
@@ -118,21 +129,60 @@ class NfoDuplicateOperations:
             | QtWidgets.QFileDialog.ReadOnly,
         )
         if directories:
-            self.ui.selected_directories.append(directories)
-            self.ui.last_directory = directories
-            self.ui.update_selected_directories_display()
+            self.update_directories(directories)
+
+    def remove_selected_directory(self):
+        directory, ok = QtWidgets.QInputDialog.getItem(
+            self.ui,
+            "取消选择目录",
+            "请选择要取消的目录:",
+            self.ui.selected_directories,
+            0,
+            False,
+        )
+        if ok and directory:
+            self.update_directories(directory, remove=True)
 
     def find_duplicates(self):
         if not self.ui.selected_directories:
             QtWidgets.QMessageBox.warning(self.ui, "错误", "请先选择至少一个目录！")
             return
 
+        self.ui.start_button.setEnabled(False)
+        self.ui.start_button.setText("正在查找...")
+
         selected_field = self.ui.field_combo_box.currentText()
         self.ui.progress_bar.setValue(0)
-        duplicates = self.ui.logic.get_duplicates(
-            self.ui.selected_directories, selected_field, self.ui.progress_bar
-        )
-        self.display_duplicates(duplicates)
+
+        nfo_files = self.ui.logic.get_all_nfo_files(self.ui.selected_directories)
+        total_files = len(nfo_files)
+        self.ui.progress_bar.setMaximum(total_files)
+
+        duplicates = {}
+        with ThreadPoolExecutor(max_workers=cpu_count()) as executor:
+            futures = [
+                executor.submit(
+                    self.ui.logic.process_nfo_file, (nfo_file, selected_field)
+                )
+                for nfo_file in nfo_files
+            ]
+            for i, future in enumerate(futures, 1):
+                result = future.result()
+                if result[0]:
+                    if result[0] in duplicates:
+                        duplicates[result[0]].append(result[1])
+                    else:
+                        duplicates[result[0]] = [result[1]]
+                self.ui.progress_bar.setValue(i)
+
+        # 过滤掉没有重复项的记录
+        filtered_duplicates = {
+            key: value for key, value in duplicates.items() if len(value) > 1
+        }
+
+        self.display_duplicates(filtered_duplicates)
+        self.ui.start_button.setEnabled(True)
+        self.ui.start_button.setText("查找重复项")
 
     def display_duplicates(self, duplicates):
         self.ui.result_list.setRowCount(0)
@@ -160,26 +210,13 @@ class NfoDuplicateOperations:
             else:
                 subprocess.Popen(["xdg-open", path])
 
-    def remove_selected_directory(self):
-        directories, ok = QtWidgets.QInputDialog.getItem(
-            self.ui,
-            "取消选择目录",
-            "请选择要取消的目录:",
-            self.ui.selected_directories,
-            0,
-            False,
-        )
-        if ok and directories:
-            self.ui.selected_directories.remove(directories)
-            self.ui.update_selected_directories_display()
-
     def clear_results_on_change(self):
         # 当更换字段选择时，清空结果列表区内容
         self.ui.result_list.setRowCount(0)
 
 
 class NfoDuplicateLogic:
-    def get_duplicates(self, directories, field, progress_bar):
+    def get_all_nfo_files(self, directories):
         # 获取所有的 .nfo 文件路径
         nfo_files = []
         for directory in directories:
@@ -187,58 +224,25 @@ class NfoDuplicateLogic:
                 for file in files:
                     if file.endswith(".nfo"):
                         nfo_files.append(os.path.join(root, file))
-
-        total_files = len(nfo_files)
-        progress_bar.setMaximum(total_files)
-
-        # 使用多进程池来并行处理文件内容的读取和匹配
-        with Pool(processes=cpu_count()) as pool:
-            try:
-                results = []
-                for i, result in enumerate(
-                    pool.imap(
-                        self.process_nfo_file,
-                        [(nfo_file, field) for nfo_file in nfo_files],
-                    ),
-                    1,
-                ):
-                    results.append(result)
-                    progress_bar.setValue(i)
-            except KeyboardInterrupt:
-                pool.terminate()
-                pool.join()
-                raise
-
-        # 收集重复项
-        field_dict = {}
-        for field_value, nfo_file in results:
-            if field_value:
-                if field_value in field_dict:
-                    field_dict[field_value].append(nfo_file)
-                else:
-                    field_dict[field_value] = [nfo_file]
-
-        duplicates = {key: value for key, value in field_dict.items() if len(value) > 1}
-        return duplicates
+        return nfo_files
 
     def process_nfo_file(self, args):
         nfo_file, field = args
         try:
-            with open(nfo_file, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-                if field == "番号":
-                    match = re.search(r"<num>(.*?)</num>", content)
-                elif field == "系列":
-                    match = re.search(r"<series>(.*?)</series>", content)
-                else:
-                    match = None
+            tree = ET.parse(nfo_file)
+            root = tree.getroot()
+            if field == "番号":
+                field_value = root.find("num")
+            elif field == "系列":
+                field_value = root.find("series")
+            else:
+                field_value = None
 
-                if match:
-                    field_value = match.group(1).strip()
-                    return field_value, nfo_file
-                else:
-                    return None, nfo_file
-        except Exception as e:
+            if field_value is not None and field_value.text:
+                return field_value.text.strip(), nfo_file
+            else:
+                return None, nfo_file
+        except ET.ParseError as e:
             print(f"Error processing file {nfo_file}: {e}")
             return None, nfo_file
 
