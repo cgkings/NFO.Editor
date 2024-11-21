@@ -46,12 +46,6 @@ class RenameToolGUI:
                             self.window.iconbitmap(icon_path)
                         except tk.TclError:
                             print(f"Windows图标加载失败: {str(e)}")
-                else:  # Linux/Mac系统
-                    try:
-                        img = tk.PhotoImage(file=icon_path)
-                        self.window.tk.call('wm', 'iconphoto', self.window._w, img)
-                    except tk.TclError as e:
-                        print(f"Linux/Mac图标加载失败: {str(e)}")
             else:
                 print(f"图标文件未找到: {icon_path}")
         except Exception as e:
