@@ -24,9 +24,29 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
 
     def init_ui(self):
         # 设置窗口
-        self.setWindowTitle("NFO重复查找工具  v1.0.0")
+        self.setWindowTitle("NFO重复查找工具  v9.2.6")
         self.setGeometry(100, 100, 800, 600)
-        self.setWindowIcon(QtGui.QIcon("chuizi.ico"))
+
+        try:
+            # 获取应用程序路径
+            if getattr(sys, "frozen", False):
+                # 如果是打包后的exe
+                application_path = sys._MEIPASS
+            else:
+                # 如果是直接运行的py脚本
+                application_path = os.path.dirname(os.path.abspath(__file__))
+
+            # 图标路径
+            icon_path = os.path.join(application_path, "chuizi.ico")
+
+            if os.path.exists(icon_path):
+                # 设置窗口图标
+                self.setWindowIcon(QtGui.QIcon(icon_path))
+            else:
+                print(f"图标文件未找到: {icon_path}")
+
+        except Exception as e:
+            print(f"图标设置失败: {str(e)}")
 
         # 布局
         layout = QtWidgets.QVBoxLayout()

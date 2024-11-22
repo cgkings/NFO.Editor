@@ -28,7 +28,7 @@ def get_resource_path(relative_path):
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v9.2.5")
+        self.root.title("大锤 NFO Editor v9.2.6")
 
         # 在创建任何UI组件之前设置图标
         try:
@@ -74,6 +74,7 @@ class NFOEditorApp:
         # 添加快捷键
         self.root.bind("<F5>", lambda e: self.load_files_in_folder())
         self.root.bind("<Return>", lambda e: self.save_changes())
+
         self.root.bind(
             "<Control-Right>", lambda e: self.start_move_thread()
         )  # Ctrl+→ 移动文件
@@ -352,6 +353,13 @@ class NFOEditorApp:
         self.file_treeview.bind("<<TreeviewSelect>>", self.on_file_select)
         self.file_treeview.bind("<Delete>", self.delete_selected_folders)  # 添加这一行
 
+        # 设置焦点和选择绑定
+        self.file_treeview.bind("<KeyRelease-Up>", lambda e: self.on_file_select(e))
+        self.file_treeview.bind("<KeyRelease-Down>", lambda e: self.on_file_select(e))
+
+        # 自动设置焦点到文件列表
+        self.file_treeview.focus_force()
+
     def create_sorted_list(self, parent):
         sorted_list_frame = tk.Frame(parent, width=300)
         sorted_list_frame.pack(side=tk.LEFT, fill=tk.Y, expand=False)
@@ -572,14 +580,17 @@ class NFOEditorApp:
                             "end",
                             values=(first_level_dirs, second_level_dir, nfo_file),
                         )
+
+            # 设置焦点和选中第一项
+            if self.file_treeview.get_children():
+                first_item = self.file_treeview.get_children()[0]
+                self.file_treeview.focus(first_item)
+                self.file_treeview.selection_set(first_item)
+                self.file_treeview.see(first_item)
+                self.on_file_select(None)
+
         except OSError as e:
             messagebox.showerror("Error", f"Error loading files from folder: {str(e)}")
-
-        if self.nfo_files:
-            first_item = self.file_treeview.get_children()[0]
-            self.file_treeview.selection_set(first_item)
-            self.file_treeview.see(first_item)
-            self.on_file_select(None)
 
     def delete_selected_folders(self, event):
         """当按下删除键时，确认后将选中的文件夹移动到回收站"""
@@ -668,7 +679,7 @@ class NFOEditorApp:
                     )
 
     def open_selected_video(self):
-        video_extensions = [".mp4", ".mkv", ".avi", ".mov", ".strm"]
+        video_extensions = [".mp4", ".mkv", ".avi", ".mov", ".rm", ".mpeg", ".ts"]
         selected_items = self.file_treeview.selection()
         for selected_item in selected_items:
             item = self.file_treeview.item(selected_item)
@@ -684,20 +695,9 @@ class NFOEditorApp:
                     for ext in video_extensions:
                         video_file = video_file_base + ext
                         if os.path.exists(video_file):
-                            if ext == ".strm":
-                                with open(video_file, "r") as strm_file:
-                                    video_file_path = strm_file.readline().strip()
-                                    if os.path.exists(video_file_path):
-                                        os.startfile(video_file_path)
-                                        return
-                                    else:
-                                        messagebox.showerror(
-                                            "错误",
-                                            f"视频文件路径不存在：{video_file_path}",
-                                        )
-                            else:
-                                os.startfile(video_file)
-                                return
+                            # 直接用系统默认程序打开文件
+                            os.startfile(video_file)
+                            return
                     messagebox.showerror(
                         "错误",
                         "没有找到支持的格式的视频文件：.mp4, .mkv, .avi, .mov, .strm",
