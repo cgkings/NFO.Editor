@@ -28,7 +28,7 @@ def get_resource_path(relative_path):
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v9.2.6")
+        self.root.title("大锤 NFO Editor v9.2.8")
 
         # 在创建任何UI组件之前设置图标
         try:
@@ -443,26 +443,54 @@ class NFOEditorApp:
             label.pack(side=tk.LEFT, padx=5, pady=5, anchor=tk.W)
 
             if field == "num":
+                # 创建一个新的Frame来容纳番号和发行日期
+                num_frame = tk.Frame(frame)
+                num_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                
+                # 创建左侧Frame用于番号
+                left_frame = tk.Frame(num_frame)
+                left_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                
+                # 创建番号标签
                 entry = tk.Label(
-                    frame,
+                    left_frame,
                     text="",
-                    width=60,
-                    height=height,
                     fg="blue",
                     cursor="hand2",
                     anchor="w",
-                    font=("Arial", 12, "bold"),
+                    font=("Arial", 12, "bold")
                 )
-                entry.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=True)
+                entry.pack(side=tk.LEFT, padx=5)
                 entry.bind("<Button-1>", self.open_num_url)
-            elif field == "rating":  # 评分特殊处理
+
+                # 创建右侧Frame用于发行日期
+                right_frame = tk.Frame(num_frame)
+                right_frame.pack(side=tk.RIGHT)  # 第二个值50可以调大调小来控制右边距
+                
+                # 创建发行日期标签文字
+                release_text = tk.Label(
+                    right_frame,
+                    text="<<发行日期",
+                    anchor="e",
+                    font=("Arial", 12, "bold")
+                )
+                release_text.pack(side=tk.RIGHT, padx=(0, 5))
+                
+                # 创建发行日期值标签
+                self.release_label = tk.Label(
+                    right_frame,
+                    text="",
+                    anchor="w",
+                    font=("Arial", 12)
+                )
+                self.release_label.pack(side=tk.LEFT)
+                
+                self.fields_entries[field] = entry
+            elif field == "rating":
                 entry = tk.Text(frame, width=60, height=height)
                 entry.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=True)
-                entry.bind("<FocusIn>", self.on_rating_focus_in)  # 获得焦点时全选
-                entry.bind(
-                    "<KeyRelease>", self.on_rating_key_release
-                )  # 键盘输入时格式化
-                # 不再绑定通用的FocusOut事件
+                entry.bind("<FocusIn>", self.on_rating_focus_in)
+                entry.bind("<KeyRelease>", self.on_rating_key_release)
             else:
                 entry = tk.Text(frame, width=60, height=height)
                 entry.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.X, expand=True)
@@ -831,6 +859,10 @@ class NFOEditorApp:
             elif isinstance(entry, tk.Label):
                 entry.config(text="")
 
+        # 重置发行日期标签
+        if hasattr(self, 'release_label'):
+            self.release_label.config(text="")
+
         try:
             tree = ET.parse(self.current_file_path)
             root = tree.getroot()
@@ -858,6 +890,11 @@ class NFOEditorApp:
                 elif child.tag == "genre":
                     if child.text:
                         genres.append(child.text)
+                elif child.tag == 'release':
+                    if hasattr(self, 'release_label'):
+                        release_text = child.text.strip() if child.text else ""
+                        if release_text:
+                            self.release_label.config(text=f"{release_text}")
 
             self.fields_entries["actors"].insert(1.0, ", ".join(unique_actors))
             self.fields_entries["tags"].insert(1.0, ", ".join(tags))
