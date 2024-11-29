@@ -32,7 +32,7 @@ class CropLabel(QLabel):
             }
         """)
         self.setAlignment(Qt.AlignCenter)
-        self.setText("请点击右上角的'打开图片'按钮")
+        self.setText("请点击右上角的'打开图片'按钮或拖拽图片到此处")  # 更新提示文本
         
         self.pixmap = None
         self.scaled_pixmap = None
@@ -42,6 +42,46 @@ class CropLabel(QLabel):
         self.dragging = False
         self.drag_start = None
         self.setMouseTracking(True)
+        
+        # 启用拖拽
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        """处理拖拽进入事件"""
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                # 检查是否是支持的图片格式
+                file_path = url.toLocalFile()
+                if any(file_path.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.bmp']):
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        """处理拖拽移动事件"""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        """处理拖拽释放事件"""
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                file_path = url.toLocalFile()
+                if any(file_path.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.bmp']):
+                    # 更新父窗口的图片路径
+                    parent = self.parent()
+                    while parent and not isinstance(parent, EmbyPosterCrop):
+                        parent = parent.parent()
+                    if parent:
+                        parent.image_path = file_path
+                    
+                    # 设置图片
+                    self.set_image(file_path)
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
 
     def set_image(self, image_path):
         self.pixmap = QPixmap(image_path)
@@ -266,7 +306,7 @@ class EmbyPosterCrop(QDialog):
     def __init__(self, parent=None, nfo_base_name=None):
         super().__init__(parent)
         self.nfo_base_name = nfo_base_name
-        self.setWindowTitle("EMBY海报裁剪工具 v2.0.0")
+        self.setWindowTitle("大锤EMBY海报裁剪工具 v3.0.0")
         self.setMinimumSize(1200, 640)
         
         # 设置窗口图标
