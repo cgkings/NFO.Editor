@@ -1,3 +1,4 @@
+import ctypes
 import tkinter as tk
 from tkinter import filedialog, messagebox, Toplevel, ttk
 import os
@@ -28,7 +29,7 @@ def get_resource_path(relative_path):
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v9.2.9")
+        self.root.title("大锤 NFO Editor v9.3.0")
 
         # 在创建任何UI组件之前设置图标
         try:
@@ -119,7 +120,7 @@ class NFOEditorApp:
 
         for text, command, tooltip in buttons_info:
             button = tk.Button(
-                self.top_frame, text=text, command=command, font=("Arial", 12)
+                self.top_frame, text=text, command=command, font=("DengXian", 12)
             )
             button.pack(side=tk.LEFT, padx=5)
             Hovertip(button, tooltip)
@@ -386,7 +387,7 @@ class NFOEditorApp:
         image_frame = tk.Frame(self.fields_frame)
         image_frame.pack(anchor=tk.W, pady=10)
 
-        image_label = tk.Label(image_frame, text="图片:", font=("Arial", 12, "bold"))
+        image_label = tk.Label(image_frame, text="图片:", font=("DengXian", 12, "bold"))
         image_label.pack(side=tk.LEFT, padx=5, pady=5)
 
         poster_frame = tk.Frame(
@@ -439,7 +440,7 @@ class NFOEditorApp:
             frame = tk.Frame(self.fields_frame)
             frame.pack(fill=tk.X)
 
-            label = tk.Label(frame, text=label_text + ":", font=("Arial", 12, "bold"))
+            label = tk.Label(frame, text=label_text + ":", font=("DengXian", 12, "bold"))
             label.pack(side=tk.LEFT, padx=5, pady=5, anchor=tk.W)
 
             if field == "num":
@@ -458,7 +459,7 @@ class NFOEditorApp:
                     fg="blue",
                     cursor="hand2",
                     anchor="w",
-                    font=("Arial", 12, "bold")
+                    font=("DengXian", 12, "bold")
                 )
                 entry.pack(side=tk.LEFT, padx=5)
                 entry.bind("<Button-1>", self.open_num_url)
@@ -472,7 +473,7 @@ class NFOEditorApp:
                     right_frame,
                     text="<<发行日期",
                     anchor="e",
-                    font=("Arial", 12, "bold")
+                    font=("DengXian", 12, "bold")
                 )
                 release_text.pack(side=tk.RIGHT, padx=(0, 5))
                 
@@ -481,7 +482,7 @@ class NFOEditorApp:
                     right_frame,
                     text="",
                     anchor="w",
-                    font=("Arial", 12)
+                    font=("DengXian", 12)
                 )
                 self.release_label.pack(side=tk.LEFT)
                 
@@ -951,14 +952,28 @@ class NFOEditorApp:
             genres_text = self.fields_entries["genres"].get(1.0, tk.END).strip()
             rating = self.fields_entries["rating"].get(1.0, tk.END).strip()
 
-            updates = {"title": title, "plot": plot, "series": series, "rating": rating}
+            # 计算 criticrating 值
+            try:
+                rating_value = float(rating)
+                critic_rating = int(rating_value * 10)  # 将 rating 转换为 criticrating
+            except ValueError:
+                critic_rating = 0
 
+            # 更新常规字段
+            updates = {"title": title, "plot": plot, "series": series, "rating": rating}
             for field, value in updates.items():
                 element = root.find(field)
                 if element is None:
                     element = ET.SubElement(root, field)
                 element.text = value
 
+            # 更新或创建 criticrating 字段
+            critic_elem = root.find("criticrating")
+            if critic_elem is None:
+                critic_elem = ET.SubElement(root, "criticrating")
+            critic_elem.text = str(critic_rating)
+
+            # 更新演员信息
             unique_actors = set(actors_text.split(","))
             for actor_elem in root.findall("actor"):
                 root.remove(actor_elem)
@@ -968,6 +983,7 @@ class NFOEditorApp:
                 name_elem.text = actor_name.strip()
                 root.append(actor_elem)
 
+            # 更新标签
             for tag_elem in root.findall("tag"):
                 root.remove(tag_elem)
             tags = tags_text.split(",")
@@ -976,6 +992,7 @@ class NFOEditorApp:
                 tag_elem.text = tag.strip()
                 root.append(tag_elem)
 
+            # 更新类型
             for genre_elem in root.findall("genre"):
                 root.remove(genre_elem)
             genres = genres_text.split(",")
@@ -984,17 +1001,12 @@ class NFOEditorApp:
                 genre_elem.text = genre.strip()
                 root.append(genre_elem)
 
+            # 保存文件
             xml_str = ET.tostring(root, encoding="utf-8")
             parsed_str = minidom.parseString(xml_str)
             pretty_str = parsed_str.toprettyxml(indent="  ", encoding="utf-8")
 
-            pretty_str = "\n".join(
-                [
-                    line
-                    for line in pretty_str.decode("utf-8").split("\n")
-                    if line.strip()
-                ]
-            )
+            pretty_str = "\n".join([line for line in pretty_str.decode("utf-8").split("\n") if line.strip()])
 
             with open(self.current_file_path, "w", encoding="utf-8") as file:
                 file.write(pretty_str)
@@ -1007,7 +1019,7 @@ class NFOEditorApp:
                     self.file_treeview.see(selected_index)
 
         except Exception as e:
-            messagebox.showerror("Error", f"Error saving changes to NFO file: {str(e)}")
+            messagebox.showerror("错误", f"保存 NFO 文件时出错: {str(e)}")
 
     def update_save_time(self):
         self.save_time_label.config(
@@ -1640,7 +1652,8 @@ class NFOEditorApp:
             print(f"Error: {error_msg}")
             messagebox.showerror("错误", f"启动裁剪工具时出错：{error_msg}")
 
-
 if __name__ == "__main__":
+    if hasattr(ctypes, 'windll'):
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
     root = tk.Tk()
     app = NFOEditorApp(root)
