@@ -47,6 +47,7 @@ class NFOEditorImpl(NFOEditorQt):
         # 初始化类变量
         self.folder_path = None
         self.nfo_files = []
+        self.current_file_path = None
 
         # 获取release标签引用
         for child in self.findChildren(QLabel):
@@ -232,49 +233,29 @@ class NFOEditorImpl(NFOEditorQt):
 
                 # 获取相对路径
                 rel_path = os.path.relpath(root, self.folder_path)
+                
+                # 如果是根目录下的直接子目录
+                if rel_path == ".":
+                    continue
+                    
                 path_parts = rel_path.split(os.sep)
 
-                # 如果路径部分只有一级，放在第一级
+                # 根据路径深度确定显示层级
                 if len(path_parts) == 1:
-                    folder_structure[path_parts[0]] = {
-                        "nfo_files": nfo_files,
-                        "full_path": root,
-                    }
-                # 如果路径部分有多级，最后一级放在第二级，前面的级别合并为第一级
-                elif len(path_parts) > 1:
-                    first_level = os.sep.join(path_parts[:-1])
-                    second_level = path_parts[-1]
-
-                    if first_level not in folder_structure:
-                        folder_structure[first_level] = {}
-
-                    folder_structure[first_level][second_level] = {
-                        "nfo_files": nfo_files,
-                        "full_path": root,
-                    }
-
-            # 填充树视图
-            for first_level, content in sorted(folder_structure.items()):
-                if isinstance(content, dict) and "nfo_files" in content:
-                    # 一级目录直接包含NFO文件
-                    for nfo_file in content["nfo_files"]:
-                        item = QTreeWidgetItem([first_level, "", nfo_file])
+                    # 一级目录
+                    for nfo_file in nfo_files:
+                        item = QTreeWidgetItem([path_parts[0], "", nfo_file])
                         self.file_tree.addTopLevelItem(item)
-                        self.nfo_files.append(
-                            os.path.join(content["full_path"], nfo_file)
-                        )
+                        self.nfo_files.append(os.path.join(root, nfo_file))
                 else:
-                    # 一级目录包含二级目录
-                    for second_level, sub_content in sorted(content.items()):
-                        if isinstance(sub_content, dict) and "nfo_files" in sub_content:
-                            for nfo_file in sub_content["nfo_files"]:
-                                item = QTreeWidgetItem(
-                                    [first_level, second_level, nfo_file]
-                                )
-                                self.file_tree.addTopLevelItem(item)
-                                self.nfo_files.append(
-                                    os.path.join(sub_content["full_path"], nfo_file)
-                                )
+                    # 二级及以上目录，将第一个作为一级目录，最后一个作为二级目录
+                    first_level = path_parts[0]
+                    second_level = path_parts[-1]
+                    
+                    for nfo_file in nfo_files:
+                        item = QTreeWidgetItem([first_level, second_level, nfo_file])
+                        self.file_tree.addTopLevelItem(item)
+                        self.nfo_files.append(os.path.join(root, nfo_file))
 
             # 自动选择第一项
             if self.file_tree.topLevelItemCount() > 0:
@@ -285,59 +266,6 @@ class NFOEditorImpl(NFOEditorQt):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载文件时出错: {str(e)}")
 
-    def has_unsaved_changes(self):
-        """检查是否有未保存的更改"""
-        if not self.current_file_path or not os.path.exists(self.current_file_path):
-            return False
-
-        try:
-            tree = ET.parse(self.current_file_path)
-            root = tree.getroot()
-
-            # 检查基本字段
-            fields = ["title", "plot", "series", "rating"]
-            for field in fields:
-                current_value = self.fields_entries[field].toPlainText().strip()
-                elem = root.find(field)
-                original_value = (
-                    elem.text.strip() if elem is not None and elem.text else ""
-                )
-                if current_value != original_value:
-                    return True
-
-            # 检查演员列表
-            current_actors = set(
-                actor.strip()
-                for actor in self.fields_entries["actors"].toPlainText().split(",")
-                if actor.strip()
-            )
-            original_actors = set(
-                actor.find("name").text.strip()
-                for actor in root.findall("actor")
-                if actor.find("name") is not None and actor.find("name").text
-            )
-            if current_actors != original_actors:
-                return True
-
-            # 检查标签
-            current_tags = set(
-                tag.strip()
-                for tag in self.fields_entries["tags"].toPlainText().split(",")
-                if tag.strip()
-            )
-            original_tags = set(
-                tag.text.strip()
-                for tag in root.findall("tag")
-                if tag is not None and tag.text
-            )
-            if current_tags != original_tags:
-                return True
-
-            return False
-
-        except Exception:
-            return False
-
     def on_file_select(self):
         """Handle file selection in tree view"""
         selected_items = self.file_tree.selectedItems()
@@ -345,26 +273,12 @@ class NFOEditorImpl(NFOEditorQt):
             return
 
         try:
-            # 检查是否有未保存的更改
-            if hasattr(self, "current_file_path") and self.current_file_path:
-                if self.has_unsaved_changes():
-                    reply = QMessageBox.question(
-                        self,
-                        "保存更改",
-                        "当前有未保存的更改，是否保存？",
-                        QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-                    )
-
-                    if reply == QMessageBox.Cancel:
-                        return
-                    elif reply == QMessageBox.Yes:
-                        self.save_changes()
-
             item = selected_items[0]
             first_level = item.text(0)
             second_level = item.text(1)
             nfo_file = item.text(2)
 
+            # 构建文件路径
             if second_level:
                 self.current_file_path = os.path.join(
                     self.folder_path, first_level, second_level, nfo_file
@@ -374,6 +288,7 @@ class NFOEditorImpl(NFOEditorQt):
                     self.folder_path, first_level, nfo_file
                 )
 
+            # 加载文件内容
             if os.path.exists(self.current_file_path):
                 self.load_nfo_fields()
                 if self.show_images_checkbox.isChecked():
