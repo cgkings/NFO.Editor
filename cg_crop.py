@@ -1,23 +1,24 @@
-import sys
-import os
-import traceback
-from PyQt5 import QtWidgets
+# 基础必需的PyQt模块，保留必要的部分
 from PyQt5.QtWidgets import (
-    QButtonGroup,
-    QCheckBox,
     QDialog,
-    QFileDialog,
-    QGroupBox,
     QLabel,
+    QPushButton,
+    QFileDialog,
     QMessageBox,
-    QRadioButton,
+    QGroupBox,
     QVBoxLayout,
     QHBoxLayout,
-    QPushButton,
+    QCheckBox,
+    QRadioButton,
     QWidget,
+    QButtonGroup,
 )
 from PyQt5.QtCore import Qt, QRect, pyqtSignal
 from PyQt5.QtGui import QIcon, QImage, QPixmap, QPainter, QPen
+
+# 基础系统模块
+import os
+import sys
 
 
 def get_resource_path(relative_path):
@@ -666,9 +667,10 @@ class EmbyPosterCrop(QDialog):
 
 if __name__ == "__main__":
     import argparse
-    import sys
 
     try:
+        from PyQt5 import QtWidgets  # 移到这里，因为只在主入口使用
+
         # 创建QApplication实例
         app = QtWidgets.QApplication(sys.argv)
         app.setStyle("Fusion")
@@ -719,5 +721,4 @@ if __name__ == "__main__":
 
     except Exception as e:
         print(f"启动失败：{str(e)}")
-        traceback.print_exc()
         sys.exit(1)

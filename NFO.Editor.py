@@ -1,18 +1,11 @@
 import ctypes
-import tkinter as tk
-from tkinter import filedialog, messagebox, Toplevel, ttk
 import os
-import shutil
-import threading
-import xml.etree.cElementTree as ET
-from datetime import datetime
-from PIL import Image, ImageTk
-from idlelib.tooltip import Hovertip
-import xml.dom.minidom as minidom
-import subprocess
 import sys
-import winshell
-import tempfile  # 添加 tempfile 导入
+from tkinter import filedialog, messagebox, Toplevel, ttk
+import tkinter as tk
+
+from xml.dom import minidom
+from idlelib.tooltip import Hovertip
 
 
 def get_resource_path(relative_path):
@@ -28,24 +21,55 @@ def get_resource_path(relative_path):
 
 class NFOEditorApp:
     def __init__(self, root):
+        # 预加载常用模块
+        from xml.etree import cElementTree as ET
+
+        self.ET = ET
+
+        # 缓存机制
+        self._nfo_cache = {}
+        self._tree_cache = {}
+        self._update_queue = []
+        self._update_pending = False
+
         self.root = root
-        self.root.title("大锤 NFO Editor v9.3.2")
+        self.root.title("大锤 NFO Editor v9.3.3")
 
-        # 在创建任何UI组件之前设置图标
-        try:
-            icon_path = get_resource_path("chuizi.ico")
-            if os.path.exists(icon_path):
-                self.root.iconbitmap(default=icon_path)
-        except Exception:
-            pass
-
+        # UI组件初始化
         self.current_file_path = None
         self.fields_entries = {}
         self.show_images_var = tk.BooleanVar(value=False)
 
         self.setup_ui()
         self.center_window()
-        self.root.mainloop()
+        # 改进图片缓存的初始化
+        self._image_cache = (
+            {}
+        )  # 文件夹路径 -> {'poster': PhotoImage, 'thumb': PhotoImage}
+        self._current_folder = None  # 当前显示的文件夹路径
+
+    def clear_image_cache(self):
+        """清理图片缓存"""
+        self._image_cache.clear()
+        self._current_images = {"poster": None, "thumb": None}
+
+    def queue_update(self, widget, **kwargs):
+        """将更新添加到队列"""
+        self._update_queue.append((widget, kwargs))
+        if not self._update_pending:
+            self._update_pending = True
+            self.root.after(50, self._process_updates)
+
+    def _process_updates(self):
+        """批量处理更新"""
+        try:
+            while self._update_queue:
+                widget, kwargs = self._update_queue.pop(0)
+                widget.configure(**kwargs)
+        finally:
+            self._update_pending = False
+            if self._update_queue:  # 如果还有未处理的更新
+                self.root.after(50, self._process_updates)
 
     def center_window(self):
         self.root.update_idletasks()
@@ -103,6 +127,8 @@ class NFOEditorApp:
         return "break"
 
     def create_top_buttons(self):
+        from idlelib.tooltip import Hovertip
+
         buttons_info = [
             ("选择nfo目录", self.open_folder, "选择目录以加载NFO文件"),
             ("选择整理目录", self.select_target_folder, "选择整理目录"),
@@ -239,7 +265,7 @@ class NFOEditorApp:
                     nfo_file_path = os.path.join(root, file)
                     try:
                         # 解析NFO文件
-                        tree = ET.parse(nfo_file_path)
+                        tree = self.ET.parse(nfo_file_path)
                         root_elem = tree.getroot()
 
                         # 获取字段值
@@ -323,7 +349,7 @@ class NFOEditorApp:
                                 values=(first_level_dirs, second_level_dir, nfo_file),
                             )
 
-                    except ET.ParseError:
+                    except self.ET.ParseError:
                         continue
                     except Exception as e:
                         print(f"Error processing {nfo_file_path}: {str(e)}")
@@ -583,91 +609,117 @@ class NFOEditorApp:
             self.load_files_in_folder()
 
     def load_files_in_folder(self):
-        self.file_treeview.delete(*self.file_treeview.get_children())
-        self.nfo_files = []
-        try:
-            for root, dirs, files in os.walk(self.folder_path):
-                for file in files:
-                    if file.endswith(".nfo"):
-                        self.nfo_files.append(os.path.join(root, file))
-                        nfo_file_path = os.path.join(root, file)
-                        relative_path = os.path.relpath(nfo_file_path, self.folder_path)
-                        parts = relative_path.split(os.sep)
+        def process_files():
+            files_data = []
+            try:
+                for root, _, files in os.walk(self.folder_path):
+                    for file in files:
+                        if file.endswith(".nfo"):
+                            nfo_path = os.path.join(root, file)
+                            relative_path = os.path.relpath(nfo_path, self.folder_path)
+                            parts = relative_path.split(os.sep)
 
-                        if len(parts) > 1:
-                            nfo_file = parts[-1]
-                            second_level_dir = parts[-2]
-                            first_level_dirs = os.sep.join(parts[:-2])
-                        else:
-                            nfo_file = parts[-1]
-                            second_level_dir = ""
-                            first_level_dirs = ""
+                            if len(parts) > 1:
+                                files_data.append(
+                                    (
+                                        (
+                                            os.sep.join(parts[:-2])
+                                            if len(parts) > 2
+                                            else ""
+                                        ),
+                                        parts[-2],
+                                        parts[-1],
+                                    )
+                                )
+                            else:
+                                files_data.append(("", "", parts[-1]))
+                return files_data
+            except OSError as e:
+                messagebox.showerror("Error", f"Error loading files: {str(e)}")
+                return []
 
-                        self.file_treeview.insert(
-                            "",
-                            "end",
-                            values=(first_level_dirs, second_level_dir, nfo_file),
-                        )
+        def update_ui(files_data):
+            try:
+                # 批量删除
+                self.file_treeview.delete(*self.file_treeview.get_children())
 
-            # 设置焦点和选中第一项
-            if self.file_treeview.get_children():
-                first_item = self.file_treeview.get_children()[0]
-                self.file_treeview.focus(first_item)
-                self.file_treeview.selection_set(first_item)
-                self.file_treeview.see(first_item)
-                self.on_file_select(None)
+                # 批量插入
+                for data in files_data:
+                    self.file_treeview.insert("", "end", values=data)
 
-        except OSError as e:
-            messagebox.showerror("Error", f"Error loading files from folder: {str(e)}")
+                # 选择第一项
+                if self.file_treeview.get_children():
+                    first_item = self.file_treeview.get_children()[0]
+                    self.file_treeview.focus(first_item)
+                    self.file_treeview.selection_set(first_item)
+                    self.file_treeview.see(first_item)
+                    self.on_file_select(None)
+
+            except Exception as e:
+                messagebox.showerror("Error", f"Error updating UI: {str(e)}")
+
+        # 收集所有文件数据
+        files_data = process_files()
+
+        # 批量更新UI
+        self.root.after(0, lambda: update_ui(files_data))
 
     def delete_selected_folders(self, event):
-        """当按下删除键时，确认后将选中的文件夹移动到回收站"""
-        selected_items = self.file_treeview.selection()
-        if not selected_items:
-            return
-
-        # 获取选中的文件夹数量
-        count = len(selected_items)
-
-        # 构建确认消息
-        if count == 1:
-            item = self.file_treeview.item(selected_items[0])
-            values = item["values"]
-            folder_name = values[1] if values[1] else values[0]
-            message = f"确定要将文件夹 '{folder_name}' 移动到回收站吗？"
-        else:
-            message = f"确定要将这 {count} 个文件夹移动到回收站吗？"
-
-        # 弹出确认对话框
-        if not messagebox.askyesno("确认删除", message):
-            return
-
+        """删除文件夹时才导入winshell"""
         try:
-            for selected_item in selected_items:
-                item = self.file_treeview.item(selected_item)
+            import winshell
+
+            """当按下删除键时，确认后将选中的文件夹移动到回收站"""
+            selected_items = self.file_treeview.selection()
+            if not selected_items:
+                return
+
+            # 获取选中的文件夹数量
+            count = len(selected_items)
+
+            # 构建确认消息
+            if count == 1:
+                item = self.file_treeview.item(selected_items[0])
                 values = item["values"]
+                folder_name = values[1] if values[1] else values[0]
+                message = f"确定要将文件夹 '{folder_name}' 移动到回收站吗？"
+            else:
+                message = f"确定要将这 {count} 个文件夹移动到回收站吗？"
 
-                # 构建文件夹路径
-                if values[1]:  # 如果有二级目录
-                    folder_path = os.path.join(self.folder_path, values[0], values[1])
-                else:  # 如果只有一级目录
-                    folder_path = os.path.join(self.folder_path, values[0])
+            # 弹出确认对话框
+            if not messagebox.askyesno("确认删除", message):
+                return
 
-                # 检查文件夹是否存在
-                if os.path.exists(folder_path):
-                    try:
-                        winshell.delete_file(
-                            folder_path, no_confirm=True
-                        )  # 删除到回收站
-                        self.file_treeview.delete(selected_item)  # 从列表中移除
-                    except Exception as e:
-                        print(f"删除文件夹失败: {folder_path}\n错误信息: {str(e)}")
-                else:
-                    # 如果文件夹不存在，仅从列表中移除
-                    self.file_treeview.delete(selected_item)
+            try:
+                for selected_item in selected_items:
+                    item = self.file_treeview.item(selected_item)
+                    values = item["values"]
 
-        except Exception as e:
-            messagebox.showerror("错误", f"删除文件夹时发生错误: {str(e)}")
+                    # 构建文件夹路径
+                    if values[1]:  # 如果有二级目录
+                        folder_path = os.path.join(
+                            self.folder_path, values[0], values[1]
+                        )
+                    else:  # 如果只有一级目录
+                        folder_path = os.path.join(self.folder_path, values[0])
+
+                    # 检查文件夹是否存在
+                    if os.path.exists(folder_path):
+                        try:
+                            winshell.delete_file(
+                                folder_path, no_confirm=True
+                            )  # 删除到回收站
+                            self.file_treeview.delete(selected_item)  # 从列表中移除
+                        except Exception as e:
+                            print(f"删除文件夹失败: {folder_path}\n错误信息: {str(e)}")
+                    else:
+                        # 如果文件夹不存在，仅从列表中移除
+                        self.file_treeview.delete(selected_item)
+
+            except Exception as e:
+                messagebox.showerror("错误", f"删除文件夹时发生错误: {str(e)}")
+        except ImportError:
+            messagebox.showerror("错误", "未能加载 winshell 模块")
 
     def open_selected_nfo(self):
         selected_items = self.file_treeview.selection()
@@ -766,7 +818,7 @@ class NFOEditorApp:
                 return False
 
             # 解析当前NFO文件
-            tree = ET.parse(self.current_file_path)
+            tree = self.ET.parse(self.current_file_path)
             root = tree.getroot()
 
             # 检查基本字段是否有变化
@@ -843,6 +895,9 @@ class NFOEditorApp:
         if not selected_items:
             return
 
+        # 在加载新文件之前清除当前图片显示
+        self.clear_images()
+
         # 检查当前是否有未保存的更改
         if hasattr(self, "current_file_path") and self.current_file_path:
             if self.has_unsaved_changes():
@@ -878,6 +933,8 @@ class NFOEditorApp:
                 self.selected_index_cache = selected_items
 
     def load_nfo_fields(self):
+        # 批量清除字段
+        updates = []
         for entry in self.fields_entries.values():
             if isinstance(entry, tk.Text):
                 entry.delete(1.0, tk.END)
@@ -889,41 +946,58 @@ class NFOEditorApp:
             self.release_label.config(text="")
 
         try:
-            tree = ET.parse(self.current_file_path)
+            # 使用缓存的解析器
+            if self.current_file_path in self._tree_cache:
+                tree = self._tree_cache[self.current_file_path]
+            else:
+                tree = self.ET.parse(self.current_file_path)
+                self._tree_cache[self.current_file_path] = tree
+
             root = tree.getroot()
 
+            # 使用批量处理收集所有更新
             fields_to_load = ["title", "plot", "series", "rating", "num"]
             unique_actors = set()
             tags = []
             genres = []
+            field_updates = {}
 
+            # 使用迭代器处理XML，减少内存使用
             for child in root:
                 if child.tag in fields_to_load:
                     entry = self.fields_entries.get(child.tag)
                     if entry:
+                        text = child.text if child.text else ""
                         if child.tag == "num":
-                            entry.config(text=child.text if child.text else "")
+                            field_updates[child.tag] = {"text": text}
                         else:
-                            entry.insert(1.0, child.text if child.text else "")
+                            field_updates[child.tag] = text
                 elif child.tag == "actor":
                     name_elem = child.find("name")
                     if name_elem is not None and name_elem.text:
                         unique_actors.add(name_elem.text)
-                elif child.tag == "tag":
-                    if child.text:
-                        tags.append(child.text)
-                elif child.tag == "genre":
-                    if child.text:
-                        genres.append(child.text)
-                elif child.tag == "release":
-                    if hasattr(self, "release_label"):
-                        release_text = child.text.strip() if child.text else ""
-                        if release_text:
-                            self.release_label.config(text=f"{release_text}")
+                elif child.tag == "tag" and child.text:
+                    tags.append(child.text)
+                elif child.tag == "genre" and child.text:
+                    genres.append(child.text)
+                elif child.tag == "release" and hasattr(self, "release_label"):
+                    release_text = child.text.strip() if child.text else ""
+                    if release_text:
+                        self.release_label.config(text=release_text)
 
+            # 批量应用更新
+            for field, value in field_updates.items():
+                entry = self.fields_entries.get(field)
+                if isinstance(value, dict):
+                    entry.config(**value)
+                else:
+                    entry.insert(1.0, value)
+
+            # 批量更新集合型字段
             self.fields_entries["actors"].insert(1.0, ", ".join(unique_actors))
             self.fields_entries["tags"].insert(1.0, ", ".join(tags))
             self.fields_entries["genres"].insert(1.0, ", ".join(genres))
+
         except Exception as e:
             messagebox.showerror("Error", f"Error loading NFO file: {str(e)}")
 
@@ -965,7 +1039,7 @@ class NFOEditorApp:
             return
 
         try:
-            tree = ET.parse(self.current_file_path)
+            tree = self.ET.parse(self.current_file_path)
             root = tree.getroot()
 
             title = self.fields_entries["title"].get(1.0, tk.END).strip()
@@ -988,13 +1062,13 @@ class NFOEditorApp:
             for field, value in updates.items():
                 element = root.find(field)
                 if element is None:
-                    element = ET.SubElement(root, field)
+                    element = self.ET.SubElement(root, field)
                 element.text = value
 
             # 更新或创建 criticrating 字段
             critic_elem = root.find("criticrating")
             if critic_elem is None:
-                critic_elem = ET.SubElement(root, "criticrating")
+                critic_elem = self.ET.SubElement(root, "criticrating")
             critic_elem.text = str(critic_rating)
 
             # 更新演员信息
@@ -1002,8 +1076,8 @@ class NFOEditorApp:
             for actor_elem in root.findall("actor"):
                 root.remove(actor_elem)
             for actor_name in unique_actors:
-                actor_elem = ET.Element("actor")
-                name_elem = ET.SubElement(actor_elem, "name")
+                actor_elem = self.ET.Element("actor")
+                name_elem = self.ET.SubElement(actor_elem, "name")
                 name_elem.text = actor_name.strip()
                 root.append(actor_elem)
 
@@ -1012,7 +1086,7 @@ class NFOEditorApp:
                 root.remove(tag_elem)
             tags = tags_text.split(",")
             for tag in tags:
-                tag_elem = ET.Element("tag")
+                tag_elem = self.ET.Element("tag")
                 tag_elem.text = tag.strip()
                 root.append(tag_elem)
 
@@ -1021,12 +1095,12 @@ class NFOEditorApp:
                 root.remove(genre_elem)
             genres = genres_text.split(",")
             for genre in genres:
-                genre_elem = ET.Element("genre")
+                genre_elem = self.ET.Element("genre")
                 genre_elem.text = genre.strip()
                 root.append(genre_elem)
 
             # 保存文件
-            xml_str = ET.tostring(root, encoding="utf-8")
+            xml_str = self.ET.tostring(root, encoding="utf-8")
             parsed_str = minidom.parseString(xml_str)
             pretty_str = parsed_str.toprettyxml(indent="  ", encoding="utf-8")
 
@@ -1052,8 +1126,11 @@ class NFOEditorApp:
             messagebox.showerror("错误", f"保存 NFO 文件时出错: {str(e)}")
 
     def update_save_time(self):
-        self.save_time_label.config(
-            text=f"保存时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        from datetime import datetime
+
+        self.queue_update(
+            self.save_time_label,
+            text=f"保存时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         )
 
     def sort_files(self):
@@ -1078,7 +1155,7 @@ class NFOEditorApp:
                     nfo_file_path = os.path.join(
                         self.folder_path, item[0], item[1], item[2]
                     )
-                    tree = ET.parse(nfo_file_path)
+                    tree = self.ET.parse(nfo_file_path)
                     root = tree.getroot()
 
                     if sort_by == "actors":
@@ -1109,7 +1186,7 @@ class NFOEditorApp:
                         for child in root:
                             if child.tag == sort_by and child.text is not None:
                                 return child.text.strip()
-                except ET.ParseError:
+                except self.ET.ParseError:
                     pass
                 return ""
 
@@ -1136,17 +1213,17 @@ class NFOEditorApp:
                         self.folder_path, item_values[0], item_values[1], item_values[2]
                     )
                     try:
-                        tree = ET.parse(nfo_file)
+                        tree = self.ET.parse(nfo_file)
                         root = tree.getroot()
 
                         field_elem = root.find(field)
                         if field_elem is None:
-                            field_elem = ET.Element(field)
+                            field_elem = self.ET.Element(field)
                             root.append(field_elem)
 
                         field_elem.text = fill_value.strip()
 
-                        xml_str = ET.tostring(root, encoding="utf-8")
+                        xml_str = self.ET.tostring(root, encoding="utf-8")
                         parsed_str = minidom.parseString(xml_str)
                         pretty_str = parsed_str.toprettyxml(
                             indent="  ", encoding="utf-8"
@@ -1215,17 +1292,17 @@ class NFOEditorApp:
                         self.folder_path, item_values[0], item_values[1], item_values[2]
                     )
                     try:
-                        tree = ET.parse(nfo_file)
+                        tree = self.ET.parse(nfo_file)
                         root = tree.getroot()
 
                         field_elem = root.find(field)
                         if field_elem is None:
-                            field_elem = ET.Element(field)
+                            field_elem = self.ET.Element(field)
                             root.append(field_elem)
 
                         field_elem.text = add_value.strip()
 
-                        xml_str = ET.tostring(root, encoding="utf-8")
+                        xml_str = self.ET.tostring(root, encoding="utf-8")
                         parsed_str = minidom.parseString(xml_str)
                         pretty_str = parsed_str.toprettyxml(
                             indent="  ", encoding="utf-8"
@@ -1284,6 +1361,9 @@ class NFOEditorApp:
                     self.sorted_treeview.insert("", "end", values=(entry.name,))
 
     def start_move_thread(self):
+        """移动文件夹时才导入需要的模块"""
+        import threading
+
         """启动移动文件的线程"""
 
         def move_with_system_stdout():
@@ -1299,6 +1379,10 @@ class NFOEditorApp:
         move_thread.start()
 
     def move_selected_folder(self):
+        """移动文件夹时才导入需要的模块"""
+        import subprocess
+        import shutil
+
         """移动选中的文件夹到目标目录"""
         try:
             # 检查是否选中了文件
@@ -1548,31 +1632,105 @@ class NFOEditorApp:
                 self.thumb_label.config(image=None)
                 self.thumb_label.image = None
 
+    def clear_images(self):
+        """清除当前显示的图片并重置标签"""
+        self.poster_label.config(image="", text="封面图 (poster)")
+        self.thumb_label.config(image="", text="缩略图 (thumb)")
+        self._current_folder = None
+
     def display_image(self):
-        if self.current_file_path:
-            folder = os.path.dirname(self.current_file_path)
-            poster_files = []
-            thumb_files = []
-            with os.scandir(folder) as entries:
-                for entry in entries:
-                    name = entry.name.lower()
-                    if name.endswith(".jpg"):
-                        if "poster" in name:
-                            poster_files.append(entry.name)
-                        elif "thumb" in name:
-                            thumb_files.append(entry.name)
+        """显示图片时才导入PIL"""
+        if not self.show_images_var.get():
+            self.clear_images()
+            return
 
-            if poster_files:
-                self.load_image(poster_files[0], self.poster_label, (165, 225))
-            else:
-                self.poster_label.config(text="文件夹内无poster图片", fg="black")
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            messagebox.showerror("错误", "未能加载 PIL 模块，无法显示图片")
+            return
 
-            if thumb_files:
-                self.load_image(thumb_files[0], self.thumb_label, (333, 225))
-            else:
-                self.thumb_label.config(text="文件夹内无thumb图片", fg="black")
+        if not self.current_file_path:
+            return
+
+        current_folder = os.path.dirname(self.current_file_path)
+
+        # 如果切换了文件夹，清除当前显示
+        if self._current_folder != current_folder:
+            self.clear_images()
+            self._current_folder = current_folder
+
+        # 检查缓存
+        if current_folder in self._image_cache:
+            cached_images = self._image_cache[current_folder]
+            self._update_image_labels(cached_images)
+        else:
+            # 如果没有缓存，异步加载两张图片
+            self.root.after(0, lambda: self.load_images_async(current_folder))
+
+    def _update_image_labels(self, images):
+        """更新图片标签显示"""
+        if "poster" in images:
+            self.poster_label.config(image=images["poster"])
+        else:
+            self.poster_label.config(text="文件夹内无poster图片")
+
+        if "thumb" in images:
+            self.thumb_label.config(image=images["thumb"])
+        else:
+            self.thumb_label.config(text="文件夹内无thumb图片")
+
+    def load_images_async(self, folder):
+        """异步加载两张图片"""
+        try:
+            from PIL import Image, ImageTk
+
+            cached_images = {}
+
+            # 同时查找两种图片
+            image_files = {"poster": None, "thumb": None}
+
+            # 查找图片文件
+            for entry in os.scandir(folder):
+                name = entry.name.lower()
+                if name.endswith(".jpg"):
+                    if "poster" in name:
+                        image_files["poster"] = entry.name
+                    elif "thumb" in name:
+                        image_files["thumb"] = entry.name
+
+            # 批量加载图片
+            for img_type, filename in image_files.items():
+                if filename:
+                    try:
+                        image_path = os.path.join(folder, filename)
+                        img = Image.open(image_path)
+                        # 根据图片类型设置不同的缩略图大小
+                        size = (165, 225) if img_type == "poster" else (333, 225)
+                        img.thumbnail(size, Image.LANCZOS)
+                        photo = ImageTk.PhotoImage(img)
+                        cached_images[img_type] = photo
+                    except Exception as e:
+                        print(f"加载{img_type}图片失败: {str(e)}")
+
+            # 只有当当前文件夹没有改变时才更新显示
+            if folder == self._current_folder:
+                self._image_cache[folder] = cached_images
+                self._update_image_labels(cached_images)
+
+            # 限制缓存大小
+            if len(self._image_cache) > 50:
+                old_keys = list(self._image_cache.keys())[:-50]
+                for key in old_keys:
+                    del self._image_cache[key]
+
+        except Exception as e:
+            print(f"图片加载错误: {str(e)}")
+            self.clear_images()
 
     def load_image(self, image_file, label, size):
+        from PIL import Image, ImageTk
+
         folder = os.path.dirname(self.current_file_path)
         image_path = os.path.join(folder, image_file)
         try:
@@ -1614,7 +1772,7 @@ class NFOEditorApp:
             image_path = os.path.join(folder, image_files[0])
 
             # 获取NFO文件内容以确定水印设置
-            tree = ET.parse(self.current_file_path)
+            tree = self.ET.parse(self.current_file_path)
             root = tree.getroot()
 
             # 初始化水印配置
@@ -1676,3 +1834,4 @@ if __name__ == "__main__":
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     root = tk.Tk()
     app = NFOEditorApp(root)
+    root.mainloop()  # 移到这里
