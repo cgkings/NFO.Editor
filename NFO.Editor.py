@@ -29,7 +29,7 @@ def get_resource_path(relative_path):
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v9.3.0")
+        self.root.title("大锤 NFO Editor v9.3.1")
 
         # 在创建任何UI组件之前设置图标
         try:
@@ -440,18 +440,20 @@ class NFOEditorApp:
             frame = tk.Frame(self.fields_frame)
             frame.pack(fill=tk.X)
 
-            label = tk.Label(frame, text=label_text + ":", font=("DengXian", 12, "bold"))
+            label = tk.Label(
+                frame, text=label_text + ":", font=("DengXian", 12, "bold")
+            )
             label.pack(side=tk.LEFT, padx=5, pady=5, anchor=tk.W)
 
             if field == "num":
                 # 创建一个新的Frame来容纳番号和发行日期
                 num_frame = tk.Frame(frame)
                 num_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-                
+
                 # 创建左侧Frame用于番号
                 left_frame = tk.Frame(num_frame)
                 left_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-                
+
                 # 创建番号标签
                 entry = tk.Label(
                     left_frame,
@@ -459,7 +461,7 @@ class NFOEditorApp:
                     fg="blue",
                     cursor="hand2",
                     anchor="w",
-                    font=("DengXian", 12, "bold")
+                    font=("DengXian", 12, "bold"),
                 )
                 entry.pack(side=tk.LEFT, padx=5)
                 entry.bind("<Button-1>", self.open_num_url)
@@ -467,25 +469,22 @@ class NFOEditorApp:
                 # 创建右侧Frame用于发行日期
                 right_frame = tk.Frame(num_frame)
                 right_frame.pack(side=tk.RIGHT)  # 第二个值50可以调大调小来控制右边距
-                
+
                 # 创建发行日期标签文字
                 release_text = tk.Label(
                     right_frame,
                     text="<<发行日期",
                     anchor="e",
-                    font=("DengXian", 12, "bold")
+                    font=("DengXian", 12, "bold"),
                 )
                 release_text.pack(side=tk.RIGHT, padx=(0, 5))
-                
+
                 # 创建发行日期值标签
                 self.release_label = tk.Label(
-                    right_frame,
-                    text="",
-                    anchor="w",
-                    font=("DengXian", 12)
+                    right_frame, text="", anchor="w", font=("DengXian", 12)
                 )
                 self.release_label.pack(side=tk.LEFT)
-                
+
                 self.fields_entries[field] = entry
             elif field == "rating":
                 entry = tk.Text(frame, width=60, height=height)
@@ -708,7 +707,16 @@ class NFOEditorApp:
                     )
 
     def open_selected_video(self):
-        video_extensions = [".mp4", ".mkv", ".avi", ".mov", ".rm", ".mpeg", ".ts"]
+        video_extensions = [
+            ".mp4",
+            ".mkv",
+            ".avi",
+            ".mov",
+            ".rm",
+            ".mpeg",
+            ".ts",
+            ".strm",
+        ]
         selected_items = self.file_treeview.selection()
         for selected_item in selected_items:
             item = self.file_treeview.item(selected_item)
@@ -724,8 +732,24 @@ class NFOEditorApp:
                     for ext in video_extensions:
                         video_file = video_file_base + ext
                         if os.path.exists(video_file):
-                            # 直接用系统默认程序打开文件
-                            os.startfile(video_file)
+                            if ext == ".strm":
+                                try:
+                                    with open(video_file, "r", encoding="utf-8") as f:
+                                        strm_url = f.readline().strip()
+                                    if strm_url:
+                                        # 使用 mpvnet 播放地址
+                                        os.system(f'mpvnet "{strm_url}"')
+                                    else:
+                                        messagebox.showerror(
+                                            "错误", "STRM文件内容为空或无效。"
+                                        )
+                                except Exception as e:
+                                    messagebox.showerror(
+                                        "错误", f"读取STRM文件时发生错误：{e}"
+                                    )
+                            else:
+                                # 直接用 mpvnet 播放文件
+                                os.system(f'mpvnet "{video_file}"')
                             return
                     messagebox.showerror(
                         "错误",
@@ -861,7 +885,7 @@ class NFOEditorApp:
                 entry.config(text="")
 
         # 重置发行日期标签
-        if hasattr(self, 'release_label'):
+        if hasattr(self, "release_label"):
             self.release_label.config(text="")
 
         try:
@@ -891,8 +915,8 @@ class NFOEditorApp:
                 elif child.tag == "genre":
                     if child.text:
                         genres.append(child.text)
-                elif child.tag == 'release':
-                    if hasattr(self, 'release_label'):
+                elif child.tag == "release":
+                    if hasattr(self, "release_label"):
                         release_text = child.text.strip() if child.text else ""
                         if release_text:
                             self.release_label.config(text=f"{release_text}")
@@ -1006,7 +1030,13 @@ class NFOEditorApp:
             parsed_str = minidom.parseString(xml_str)
             pretty_str = parsed_str.toprettyxml(indent="  ", encoding="utf-8")
 
-            pretty_str = "\n".join([line for line in pretty_str.decode("utf-8").split("\n") if line.strip()])
+            pretty_str = "\n".join(
+                [
+                    line
+                    for line in pretty_str.decode("utf-8").split("\n")
+                    if line.strip()
+                ]
+            )
 
             with open(self.current_file_path, "w", encoding="utf-8") as file:
                 file.write(pretty_str)
@@ -1471,6 +1501,7 @@ class NFOEditorApp:
             self.load_target_files(selected_path)
 
     def open_batch_rename_tool(self):
+        """打开重命名工具并设置窗口大小"""
         if not hasattr(self, "folder_path") or not self.folder_path:
             messagebox.showerror("错误", "请先选择NFO目录")
             return
@@ -1482,6 +1513,15 @@ class NFOEditorApp:
             rename_window = start_rename_process(self.folder_path, self.root)
 
             if rename_window:
+                # 设置窗口大小和位置
+                window_width = 900
+                window_height = 500
+                screen_width = self.root.winfo_screenwidth()
+                screen_height = self.root.winfo_screenheight()
+                x = (screen_width - window_width) // 2
+                y = (screen_height - window_height) // 2
+                rename_window.window.geometry(f"{window_width}x{window_height}+{x}+{y}")
+
                 # 设置回调函数
                 def on_rename_close():
                     rename_window.window.destroy()
@@ -1545,7 +1585,7 @@ class NFOEditorApp:
             label.config(text="加载图片失败: " + str(e))
 
     def open_image_and_crop(self, image_type):
-        """使用子进程方式打开裁剪工具"""
+        """使用UI方式打开裁剪工具"""
         if not self.current_file_path:
             return
 
@@ -1561,6 +1601,18 @@ class NFOEditorApp:
             return
 
         try:
+            # 动态导入裁剪工具
+            from cg_crop import EmbyPosterCrop
+            from PyQt5.QtWidgets import QApplication
+
+            # 初始化 QApplication
+            app = QApplication.instance()
+            if not app:  # 防止重复初始化
+                app = QApplication([])
+
+            # 获取图片的完整路径
+            image_path = os.path.join(folder, image_files[0])
+
             # 获取NFO文件内容以确定水印设置
             tree = ET.parse(self.current_file_path)
             root = tree.getroot()
@@ -1588,72 +1640,39 @@ class NFOEditorApp:
                 0
             ]
 
-            # 获取图片的完整路径
-            image_path = os.path.join(folder, image_files[0])
+            # 创建裁剪工具窗口
+            crop_tool = EmbyPosterCrop(nfo_base_name=nfo_base_name)
 
-            # 根据运行模式确定如何启动裁剪工具
-            if getattr(sys, "frozen", False):
-                # exe模式：使用打包的cg_crop.exe
-                crop_tool = get_resource_path("cg_crop.exe")
-                temp_exe = os.path.join(tempfile.gettempdir(), "cg_crop.exe")
+            # 加载初始图片
+            crop_tool.load_initial_image(image_path)
 
-                if not os.path.exists(temp_exe) or os.path.getsize(
-                    temp_exe
-                ) != os.path.getsize(crop_tool):
-                    shutil.copy2(crop_tool, temp_exe)
-
-                # 构建命令行参数
-                command = [
-                    temp_exe,
-                    "--image",
-                    image_path,
-                    "--nfo-name",
-                    nfo_base_name,
-                    "--mark-type",
-                    mark_type,
-                ]
-            else:
-                # 脚本模式：直接运行Python脚本
-                crop_script = os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)), "cg_crop.py"
-                )
-                if not os.path.exists(crop_script):
-                    raise FileNotFoundError("找不到裁剪工具脚本(cg_crop.py)")
-
-                command = [
-                    sys.executable,
-                    crop_script,
-                    "--image",
-                    image_path,
-                    "--nfo-name",
-                    nfo_base_name,
-                    "--mark-type",
-                    mark_type,
-                ]
-
-            # 如果有字幕标记，添加参数
+            # 设置水印选项
             if has_subtitle:
-                command.append("--subtitle")
+                crop_tool.sub_check.setChecked(True)
+            for button in crop_tool.mark_group.buttons():
+                if button.property("value") == mark_type:
+                    button.setChecked(True)
+                    break
 
-            # 启动裁剪工具作为独立进程
-            process = subprocess.Popen(
-                command, creationflags=subprocess.CREATE_NO_WINDOW
-            )
-
-            # 等待裁剪工具进程结束
-            process.wait()
+            # 运行裁剪工具窗口
+            crop_tool.exec_()
 
             # 如果显示图片选项是打开的，刷新图片显示
             if self.show_images_var.get():
                 self.display_image()
 
+        except ImportError:
+            messagebox.showerror(
+                "错误", "找不到 cg_crop.py 文件，请确保它与主程序在同一目录。"
+            )
         except Exception as e:
             error_msg = str(e)
             print(f"Error: {error_msg}")
             messagebox.showerror("错误", f"启动裁剪工具时出错：{error_msg}")
 
+
 if __name__ == "__main__":
-    if hasattr(ctypes, 'windll'):
+    if hasattr(ctypes, "windll"):
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     root = tk.Tk()
     app = NFOEditorApp(root)

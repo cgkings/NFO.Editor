@@ -62,7 +62,7 @@ jobs:
         Copy-Item -Path "dist/cg_crop.exe" -Destination "temp/cg_crop.exe"
         
         # 构建 NFO.Editor
-        pyinstaller --name "NFO.Editor" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "temp/cg_crop.exe;." --add-data "mapping_actor.xml;." --add-data "Img;Img" --hidden-import win32com.client --hidden-import win32timezone "NFO.Editor.py"
+        pyinstaller --name "NFO.Editor" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "mapping_actor.xml;." --add-data "Img;Img" --hidden-import win32com.client --hidden-import win32timezone "NFO.Editor.py"
         
         # 构建 cg_rename
         pyinstaller --name "cg_rename" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "mapping_actor.xml;." "cg_rename.py"
