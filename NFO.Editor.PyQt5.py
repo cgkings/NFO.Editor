@@ -233,11 +233,11 @@ class NFOEditorImpl(NFOEditorQt):
 
                 # 获取相对路径
                 rel_path = os.path.relpath(root, self.folder_path)
-                
+
                 # 如果是根目录下的直接子目录
                 if rel_path == ".":
                     continue
-                    
+
                 path_parts = rel_path.split(os.sep)
 
                 # 根据路径深度确定显示层级
@@ -251,7 +251,7 @@ class NFOEditorImpl(NFOEditorQt):
                     # 二级及以上目录，将第一个作为一级目录，最后一个作为二级目录
                     first_level = path_parts[0]
                     second_level = path_parts[-1]
-                    
+
                     for nfo_file in nfo_files:
                         item = QTreeWidgetItem([first_level, second_level, nfo_file])
                         self.file_tree.addTopLevelItem(item)
@@ -707,10 +707,12 @@ class NFOEditorImpl(NFOEditorQt):
             from cg_crop import EmbyPosterCrop
 
             folder = os.path.dirname(self.current_file_path)
+            # 修改为查找包含 fanart 的文件
             image_files = [
                 f
                 for f in os.listdir(folder)
-                if f.lower().endswith(".jpg") and "-fanart" in f.lower()
+                if f.lower().endswith((".jpg", ".jpeg", ".png"))
+                and "fanart" in f.lower()
             ]
 
             if not image_files:
