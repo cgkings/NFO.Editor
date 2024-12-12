@@ -738,7 +738,7 @@ class NFOEditorApp:
                                         strm_url = f.readline().strip()
                                     if strm_url:
                                         # 使用 mpvnet 播放地址
-                                        os.system(f'mpvnet "{strm_url}"')
+                                        os.system(f'start "" "mpvnet.exe" "{strm_url}"')
                                     else:
                                         messagebox.showerror(
                                             "错误", "STRM文件内容为空或无效。"
@@ -749,7 +749,7 @@ class NFOEditorApp:
                                     )
                             else:
                                 # 直接用 mpvnet 播放文件
-                                os.system(f'mpvnet "{video_file}"')
+                                os.system(f'start "" "mpvnet.exe" "{video_file}"')
                             return
                     messagebox.showerror(
                         "错误",
