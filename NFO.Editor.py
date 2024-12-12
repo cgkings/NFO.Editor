@@ -29,7 +29,7 @@ def get_resource_path(relative_path):
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v9.3.2")
+        self.root.title("大锤 NFO Editor v9.3.5")
 
         # 在创建任何UI组件之前设置图标
         try:
