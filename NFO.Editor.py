@@ -29,7 +29,7 @@ def get_resource_path(relative_path):
 class NFOEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("大锤 NFO Editor v9.3.5")
+        self.root.title("大锤 NFO Editor v9.3.6")
 
         # 在创建任何UI组件之前设置图标
         try:
@@ -738,7 +738,7 @@ class NFOEditorApp:
                                         strm_url = f.readline().strip()
                                     if strm_url:
                                         # 使用 mpvnet 播放地址
-                                        os.system(f'mpvnet "{strm_url}"')
+                                        os.system(f'start "" "mpvnet" "{strm_url}"')
                                     else:
                                         messagebox.showerror(
                                             "错误", "STRM文件内容为空或无效。"
@@ -749,7 +749,7 @@ class NFOEditorApp:
                                     )
                             else:
                                 # 直接用 mpvnet 播放文件
-                                os.system(f'mpvnet "{video_file}"')
+                                os.system(f'start "" "mpvnet" "{video_file}"')
                             return
                     messagebox.showerror(
                         "错误",

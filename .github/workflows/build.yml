@@ -64,6 +64,9 @@ jobs:
         # 构建 NFO.Editor
         pyinstaller --name "NFO.Editor" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "mapping_actor.xml;." --add-data "Img;Img" --exclude-module matplotlib --exclude-module numpy --exclude-module pandas --clean --hidden-import xml.etree.ElementTree --hidden-import xml.dom.minidom "NFO.Editor.py"
 
+        # 构建 NFO.Editor.Qt5
+        pyinstaller --name "NFO.Editor.Qt5" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "mapping_actor.xml;." --add-data "Img;Img" --exclude-module matplotlib --exclude-module numpy --exclude-module pandas --clean --hidden-import xml.etree.ElementTree --hidden-import xml.dom.minidom "NFO.Editor.Qt5.py"
+
         # 构建 cg_rename
         pyinstaller --name "cg_rename" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "mapping_actor.xml;." "cg_rename.py"
 
@@ -72,6 +75,7 @@ jobs:
 
         # 重命名生成的文件
         Move-Item -Path "dist/NFO.Editor.exe" -Destination "dist/NFO.Editor.${{ env.BUILD_NAME }}.exe" -Force
+        Move-Item -Path "dist/NFO.Editor.Qt5.exe" -Destination "dist/NFO.Editor.Qt5.${{ env.BUILD_NAME }}.exe" -Force
         Move-Item -Path "dist/cg_crop.exe" -Destination "dist/cg_crop.${{ env.BUILD_NAME }}.exe" -Force
         Move-Item -Path "dist/cg_rename.exe" -Destination "dist/cg_rename.${{ env.BUILD_NAME }}.exe" -Force
         Move-Item -Path "dist/cg_dedupe.exe" -Destination "dist/cg_dedupe.${{ env.BUILD_NAME }}.exe" -Force
@@ -89,6 +93,7 @@ jobs:
         prerelease: false
         files: |
           dist/NFO.Editor.${{ env.BUILD_NAME }}.exe
+          dist/NFO.Editor.Qt5.${{ env.BUILD_NAME }}.exe
           dist/cg_crop.${{ env.BUILD_NAME }}.exe
           dist/cg_rename.${{ env.BUILD_NAME }}.exe
           dist/cg_dedupe.${{ env.BUILD_NAME }}.exe
