@@ -192,6 +192,18 @@ class NFOEditorQt5(NFOEditorQt):
         if save_button:
             save_button.clicked.connect(self.save_changes)
 
+        # 添加筛选按钮信号连接
+        filter_button = None
+        for btn in self.findChildren(QPushButton):
+            if btn.text() == "筛选":
+                filter_button = btn
+                break
+        if filter_button:
+            filter_button.clicked.connect(self.apply_filter)
+
+        # 添加筛选输入框回车键响应
+        self.filter_entry.returnPressed.connect(self.apply_filter)
+
     def eventFilter(self, obj, event):
         """事件过滤器"""
         if (
@@ -907,83 +919,110 @@ class NFOEditorQt5(NFOEditorQt):
 
     def apply_filter(self):
         """应用筛选"""
+        if not self.folder_path:
+            return
+
         field = self.field_combo.currentText()
         condition = self.condition_combo.currentText()
         filter_text = self.filter_entry.text().strip()
 
-        if not filter_text:
-            self.load_files_in_folder()
-            return
-
         self.file_tree.clear()
 
-        for nfo_file in self.nfo_files:
-            try:
-                tree = ET.parse(nfo_file)
-                root = tree.getroot()
+        try:
+            # 如果没有筛选文本，显示所有文件
+            if not filter_text:
+                self.load_files_in_folder()
+                return
 
-                # 获取字段值
-                if field == "标题":
-                    elem = root.find("title")
-                    value = elem.text.strip() if elem is not None else ""
-                elif field == "标签":
-                    value = ", ".join(
-                        tag.text.strip()
-                        for tag in root.findall("tag")
-                        if tag is not None and tag.text
-                    )
-                elif field == "演员":
-                    value = ", ".join(
-                        actor.find("name").text.strip()
-                        for actor in root.findall("actor")
-                        if actor.find("name") is not None
-                    )
-                elif field == "系列":
-                    elem = root.find("series")
-                    value = elem.text.strip() if elem is not None else ""
-                elif field == "评分":
-                    elem = root.find("rating")
-                    value = elem.text.strip() if elem is not None else "0"
+            # 遍历 NFO 文件
+            for nfo_file in self.nfo_files:
+                try:
+                    tree = ET.parse(nfo_file)
+                    root = tree.getroot()
 
-                # 判断是否匹配
-                match = False
-                if field == "评分":
-                    try:
-                        current_value = float(value)
-                        filter_value = float(filter_text)
-                        if condition == "包含":
-                            match = str(filter_value) in str(current_value)
-                        elif condition == "大于":
-                            match = current_value > filter_value
-                        elif condition == "小于":
-                            match = current_value < filter_value
-                    except ValueError:
-                        continue
-                else:
-                    match = filter_text.lower() in value.lower()
+                    # 获取字段值
+                    value = ""
+                    if field == "标题":
+                        elem = root.find("title")
+                        value = (
+                            elem.text.strip() if elem is not None and elem.text else ""
+                        )
+                    elif field == "标签":
+                        tags = [
+                            tag.text.strip()
+                            for tag in root.findall("tag")
+                            if tag is not None and tag.text
+                        ]
+                        value = ", ".join(tags)
+                    elif field == "演员":
+                        actors = [
+                            actor.find("name").text.strip()
+                            for actor in root.findall("actor")
+                            if actor.find("name") is not None
+                            and actor.find("name").text
+                        ]
+                        value = ", ".join(actors)
+                    elif field == "系列":
+                        elem = root.find("series")
+                        value = (
+                            elem.text.strip() if elem is not None and elem.text else ""
+                        )
+                    elif field == "评分":
+                        elem = root.find("rating")
+                        value = (
+                            elem.text.strip() if elem is not None and elem.text else "0"
+                        )
 
-                # 如果匹配,添加到树中
-                if match:
-                    relative_path = os.path.relpath(nfo_file, self.folder_path)
-                    parts = relative_path.split(os.sep)
-
-                    if len(parts) > 1:
-                        first_level = os.sep.join(parts[:-2]) if len(parts) > 2 else ""
-                        second_level = parts[-2]
-                        nfo_name = parts[-1]
+                    # 判断是否匹配
+                    match = False
+                    if field == "评分":
+                        try:
+                            current_value = float(value)
+                            filter_value = float(filter_text)
+                            if condition == "大于":
+                                match = current_value > filter_value
+                            elif condition == "小于":
+                                match = current_value < filter_value
+                        except ValueError:
+                            continue
                     else:
-                        first_level = ""
-                        second_level = ""
-                        nfo_name = parts[-1]
+                        match = filter_text.lower() in value.lower()
 
-                    item = QTreeWidgetItem([first_level, second_level, nfo_name])
-                    self.file_tree.addTopLevelItem(item)
+                    # 如果匹配，添加到树中
+                    if match:
+                        relative_path = os.path.relpath(nfo_file, self.folder_path)
+                        parts = relative_path.split(os.sep)
 
-            except ET.ParseError:
-                continue
-            except Exception as e:
-                print(f"Error processing {nfo_file}: {str(e)}")
-                continue
+                        if len(parts) > 1:
+                            first_level = (
+                                os.sep.join(parts[:-2]) if len(parts) > 2 else ""
+                            )
+                            second_level = parts[-2]
+                            nfo_name = parts[-1]
+                        else:
+                            first_level = ""
+                            second_level = ""
+                            nfo_name = parts[-1]
+
+                        item = QTreeWidgetItem([first_level, second_level, nfo_name])
+                        self.file_tree.addTopLevelItem(item)
+
+                except ET.ParseError:
+                    print(f"解析文件失败: {nfo_file}")
+                    continue
+                except Exception as e:
+                    print(f"处理文件出错 {nfo_file}: {str(e)}")
+                    continue
+
+            # 更新状态栏信息
+            matched_count = self.file_tree.topLevelItemCount()
+            total_count = len(self.nfo_files)
+            self.statusBar().showMessage(
+                f"筛选结果: 匹配 {matched_count} / 总计 {total_count}"
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"筛选过程出错: {str(e)}")
 
     def batch_filling(self):
         """批量填充"""
