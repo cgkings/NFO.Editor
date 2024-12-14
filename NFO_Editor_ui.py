@@ -459,8 +459,8 @@ class NFOEditorQt(QMainWindow):
         # 将水平布局容器添加到主网格
         grid.addWidget(image_container, 0, 1)
 
-        self.poster_label.mousePressEvent = lambda e: self.open_image_and_crop("poster")
-        self.thumb_label.mousePressEvent = lambda e: self.open_image_and_crop("thumb")
+        self.poster_label.mousePressEvent = lambda e: self.open_image_and_crop("fanart")
+        self.thumb_label.mousePressEvent = lambda e: self.open_image_and_crop("fanart")
 
         return frame
 

@@ -498,6 +498,17 @@ class NFOEditorQt5(NFOEditorQt):
                     elem = ET.SubElement(root, field)
                 elem.text = value
 
+            # 更新 criticrating 字段
+            try:
+                rating_value = float(rating)
+                critic_rating = int(rating_value * 10)  # 将 rating 转换为 criticrating
+                critic_elem = root.find("criticrating")
+                if critic_elem is None:
+                    critic_elem = ET.SubElement(root, "criticrating")
+                critic_elem.text = str(critic_rating)
+            except ValueError:
+                pass
+
             # 更新演员信息
             for actor_elem in root.findall("actor"):
                 root.remove(actor_elem)
@@ -508,26 +519,33 @@ class NFOEditorQt5(NFOEditorQt):
                     name_elem = ET.SubElement(actor_elem, "name")
                     name_elem.text = actor
 
-            # 更新标签
+            # 更新标签和类型（联动更新）
+            # 删除现有的标签和类型
             for tag_elem in root.findall("tag"):
                 root.remove(tag_elem)
+            for genre_elem in root.findall("genre"):
+                root.remove(genre_elem)
+
+            # 从 tags 字段获取值，同时添加到 tag 和 genre 节点
             for tag in tags_text.split(","):
                 tag = tag.strip()
                 if tag:
+                    # 添加标签
                     tag_elem = ET.SubElement(root, "tag")
                     tag_elem.text = tag
+                    # 添加类型
+                    genre_elem = ET.SubElement(root, "genre")
+                    genre_elem.text = tag
 
-            # 保存XML
+            # 保存文件
             xml_str = ET.tostring(root, encoding="utf-8")
             parsed_str = minidom.parseString(xml_str)
             pretty_str = parsed_str.toprettyxml(indent="  ", encoding="utf-8")
 
-            # 移除空行
             pretty_str = "\n".join(
                 line for line in pretty_str.decode("utf-8").split("\n") if line.strip()
             )
 
-            # 写入文件
             with open(self.current_file_path, "w", encoding="utf-8") as file:
                 file.write(pretty_str)
 
@@ -1315,9 +1333,9 @@ class NFOEditorQt5(NFOEditorQt):
             root = tree.getroot()
 
             has_subtitle = False
-            mark_type = "none"
+            mark_type = "none"  # 默认无水印
 
-            # 检查标签内容
+            # 检查tag标签内容
             for tag in root.findall("tag"):
                 tag_text = tag.text.lower() if tag.text else ""
                 if "中文字幕" in tag_text:
@@ -1331,7 +1349,7 @@ class NFOEditorQt5(NFOEditorQt):
                 if mark_type != "none":
                     break
 
-            # 获取基础名称
+            # 获取NFO文件的基础名称
             nfo_base_name = os.path.splitext(os.path.basename(self.current_file_path))[
                 0
             ]
@@ -1342,7 +1360,7 @@ class NFOEditorQt5(NFOEditorQt):
             # 加载图片
             crop_tool.load_initial_image(image_path)
 
-            # 设置水印
+            # 设置水印选项
             if has_subtitle:
                 crop_tool.sub_check.setChecked(True)
             for button in crop_tool.mark_group.buttons():
@@ -1350,15 +1368,15 @@ class NFOEditorQt5(NFOEditorQt):
                     button.setChecked(True)
                     break
 
-            # 运行窗口
+            # 运行窗口并等待其完成
             crop_tool.exec_()
 
-            # 刷新显示
+            # 如果显示图片选项是打开的，刷新图片显示
             if self.show_images_checkbox.isChecked():
                 self.display_image()
 
         except ImportError:
-            QMessageBox.critical(self, "错误", "找不到cg_crop.py文件")
+            QMessageBox.critical(self, "错误", "找不到 cg_crop.py 文件")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"裁剪工具出错: {str(e)}")
 
