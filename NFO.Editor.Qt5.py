@@ -1182,33 +1182,20 @@ class NFOEditorQt5(NFOEditorQt):
             return
 
         try:
-            from cg_rename import start_rename_process
+            # 使用subprocess启动独立进程
+            import subprocess
+            import sys
 
-            # 启动重命名进程
-            rename_window = start_rename_process(self.folder_path, self)
+            # 获取 Python 解释器路径
+            python_executable = sys.executable
 
-            if rename_window:
-                # 设置窗口大小和位置
-                window_width = 900
-                window_height = 500
-                screen = QApplication.primaryScreen()
-                screen_geometry = screen.availableGeometry()
-                x = (screen_geometry.width() - window_width) // 2
-                y = (screen_geometry.height() - window_height) // 2
-                rename_window.window.setGeometry(x, y, window_width, window_height)
+            # 构建命令
+            rename_script = os.path.join(os.path.dirname(__file__), "cg_rename.py")
+            cmd = [python_executable, rename_script, self.folder_path]
 
-                # 设置关闭回调
-                def on_rename_close():
-                    rename_window.window.close()
-                    self.load_files_in_folder()
+            # 启动独立进程
+            subprocess.Popen(cmd)
 
-                # 设置窗口关闭事件
-                rename_window.window.closeEvent = lambda e: on_rename_close()
-
-        except ImportError:
-            QMessageBox.critical(
-                self, "错误", "找不到 cg_rename.py 文件,请确保它与主程序在同一目录。"
-            )
         except Exception as e:
             QMessageBox.critical(self, "错误", f"启动重命名工具时出错: {str(e)}")
 
