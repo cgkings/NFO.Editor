@@ -46,7 +46,7 @@ class NFOEditorQt(QMainWindow):
         self.screen_dpi = self.screen().logicalDotsPerInch()
         self.scale_factor = self.screen_dpi / 96.0
 
-        self.setWindowTitle("大锤 NFO Editor Qt v9.3.7")
+        self.setWindowTitle("大锤 NFO Editor Qt v9.3.8")
         self.resize(1280, 800)
 
         try:
@@ -356,6 +356,8 @@ class NFOEditorQt(QMainWindow):
 
         self.file_tree = QTreeWidget()
         self.file_tree.setHeaderLabels(["一级目录", "二级目录", "NFO文件"])
+        # 添加多选支持
+        self.file_tree.setSelectionMode(QTreeWidget.ExtendedSelection)
         # 根据DPI缩放调整列宽
         self.file_tree.setColumnWidth(0, int(160 * self.scale_factor))
         self.file_tree.setColumnWidth(1, int(160 * self.scale_factor))

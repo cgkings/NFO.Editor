@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import xml.etree.ElementTree as ET
 import xml.dom.minidom as minidom
@@ -45,14 +46,17 @@ class FileOperationThread(QThread):
         self.operation_type = operation_type
         self.kwargs = kwargs
         self.is_running = True
-        # 启用拖放
-        self.setAcceptDrops(True)
 
     def run(self):
         if self.operation_type == "move":
             self.move_files()
 
+    def stop(self):
+        """停止线程"""
+        self.is_running = False
+
     def move_files(self):
+        """移动文件的实现"""
         try:
             src_paths = self.kwargs.get("src_paths", [])
             dest_path = self.kwargs.get("dest_path")
@@ -66,32 +70,40 @@ class FileOperationThread(QThread):
                     folder_name = os.path.basename(src_path)
                     dest_folder_path = os.path.join(dest_path, folder_name)
 
+                    # 检查目标路径
+                    if not os.path.exists(dest_path):
+                        raise Exception(f"目标目录不存在: {dest_path}")
+
                     # 同盘符移动判断逻辑
                     if (
                         os.path.splitdrive(src_path)[0]
                         == os.path.splitdrive(dest_path)[0]
                     ):
                         if os.path.exists(dest_folder_path):
-                            # 通过信号发送显示确认对话框的请求
-                            # 实际实现需要处理用户响应
-                            os.remove(dest_folder_path)
-                        os.rename(src_path, dest_folder_path)
+                            try:
+                                shutil.rmtree(dest_folder_path)
+                            except Exception as e:
+                                raise Exception(f"删除已存在的目标文件夹失败: {str(e)}")
+
+                        try:
+                            shutil.move(src_path, dest_folder_path)
+                        except Exception as e:
+                            raise Exception(f"移动文件夹失败: {str(e)}")
                     else:
                         # 跨盘符复制后删除
                         if os.path.exists(dest_folder_path):
-                            subprocess.run(
-                                f'rd /s /q "{dest_folder_path}"', shell=True, check=True
-                            )
+                            try:
+                                shutil.rmtree(dest_folder_path)
+                            except Exception as e:
+                                raise Exception(f"删除已存在的目标文件夹失败: {str(e)}")
 
-                        # 复制文件
-                        subprocess.run(
-                            f'xcopy "{src_path}" "{dest_folder_path}" /E /I /H /R /Y',
-                            shell=True,
-                            check=True,
-                        )
-
-                        # 删除源文件
-                        subprocess.run(f'rd /s /q "{src_path}"', shell=True, check=True)
+                        try:
+                            shutil.copytree(src_path, dest_folder_path)
+                            shutil.rmtree(src_path)
+                        except Exception as e:
+                            if os.path.exists(dest_folder_path):
+                                shutil.rmtree(dest_folder_path)
+                            raise Exception(f"复制并删除文件夹失败: {str(e)}")
 
                     self.progress.emit(i, total)
                     self.status.emit(f"正在处理: {folder_name}")
@@ -104,10 +116,6 @@ class FileOperationThread(QThread):
 
         except Exception as e:
             self.error.emit(f"操作过程中发生错误: {str(e)}")
-
-    def stop(self):
-        """停止线程"""
-        self.is_running = False
 
 
 class NFOEditorQt5(NFOEditorQt):
@@ -356,6 +364,11 @@ class NFOEditorQt5(NFOEditorQt):
                 self.file_tree.setCurrentItem(first_item)
                 self.on_file_select()
 
+            # 更新状态栏信息
+            total_folders = len(set(os.path.dirname(f) for f in self.nfo_files))
+            status_msg = f"目录: {self.folder_path} (共加载 {total_folders} 个文件夹)"
+            self.statusBar().showMessage(status_msg)
+
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载文件失败: {str(e)}")
 
@@ -575,52 +588,72 @@ class NFOEditorQt5(NFOEditorQt):
 
     def start_move_thread(self):
         """启动移动文件的线程"""
-        # 检查选择
-        selected_items = self.file_tree.selectedItems()
-        if not selected_items:
-            QMessageBox.warning(self, "警告", "请先选择要移动的文件夹")
-            return
+        try:
+            # 检查选择
+            selected_items = self.file_tree.selectedItems()
+            if not selected_items:
+                QMessageBox.warning(self, "警告", "请先选择要移动的文件夹")
+                return
 
-        if not self.current_target_path:
-            QMessageBox.critical(self, "错误", "请先选择目标目录")
-            return
+            if not self.current_target_path:
+                QMessageBox.critical(self, "错误", "请先选择目标目录")
+                return
 
-        # 收集源路径
-        src_paths = []
-        for item in selected_items:
-            values = [item.text(i) for i in range(3)]
-            if values[1]:  # 有二级目录
-                src_path = os.path.join(self.folder_path, values[0], values[1])
-            else:  # 只有一级目录
-                src_path = os.path.join(self.folder_path, values[0])
-            src_paths.append(src_path)
+            # 收集源路径
+            src_paths = []
+            for item in selected_items:
+                try:
+                    values = [item.text(i) for i in range(3)]
+                    if values[1]:  # 有二级目录
+                        src_path = os.path.join(self.folder_path, values[0], values[1])
+                    else:  # 只有一级目录
+                        src_path = os.path.join(self.folder_path, values[0])
 
-        # 创建并配置进度对话框
-        progress = QProgressDialog("准备移动...", "取消", 0, len(src_paths), self)
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setAutoClose(True)
-        progress.setAutoReset(True)
+                    if not os.path.exists(src_path):
+                        raise FileNotFoundError(f"源文件夹不存在: {src_path}")
 
-        # 创建移动线程
-        self.move_thread = FileOperationThread(
-            operation_type="move",
-            src_paths=src_paths,
-            dest_path=self.current_target_path,
-        )
+                    src_paths.append(src_path)
+                except Exception as e:
+                    QMessageBox.warning(self, "警告", f"处理路径时出错: {str(e)}")
+                    continue
 
-        # 连接信号
-        self.move_thread.progress.connect(progress.setValue)
-        self.move_thread.status.connect(progress.setLabelText)
-        self.move_thread.error.connect(
-            lambda msg: QMessageBox.critical(self, "错误", msg)
-        )
-        self.move_thread.finished.connect(self.on_move_finished)
+            if not src_paths:
+                QMessageBox.warning(self, "警告", "没有有效的源文件夹可以移动")
+                return
 
-        # 连接取消按钮
-        progress.canceled.connect(self.move_thread.stop)
+            # 创建并配置进度对话框
+            progress = QProgressDialog("准备移动...", "取消", 0, len(src_paths), self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setAutoClose(True)
+            progress.setAutoReset(True)
 
-        # 启动线程
-        self.move_thread.start()
+            # 创建移动线程
+            if self.move_thread is not None and self.move_thread.isRunning():
+                self.move_thread.stop()
+                self.move_thread.wait()
+
+            self.move_thread = FileOperationThread(
+                operation_type="move",
+                src_paths=src_paths,
+                dest_path=self.current_target_path,
+            )
+
+            # 连接信号
+            self.move_thread.progress.connect(progress.setValue)
+            self.move_thread.status.connect(progress.setLabelText)
+            self.move_thread.error.connect(
+                lambda msg: QMessageBox.critical(self, "错误", msg)
+            )
+            self.move_thread.finished.connect(self.on_move_finished)
+
+            # 连接取消按钮
+            progress.canceled.connect(self.move_thread.stop)
+
+            # 启动线程
+            self.move_thread.start()
+
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"启动移动操作时出错: {str(e)}")
 
     def on_move_finished(self):
         """文件移动完成回调"""
