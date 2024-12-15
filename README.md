@@ -5,7 +5,7 @@
 
 ## 功能展示
 
-### 1. NFO.Editor.exe (主程序)
+### NFO.Editor.exe (主程序)
 这是一个集成了所有功能的主程序：
 
 ![NFO Editor Main Window](pic/NFO.Editor.jpg)
@@ -19,7 +19,7 @@
 - 支持文件移动和整理
 - 集成了重命名工具和裁剪工具
 
-### 2. cg_rename.exe (重命名工具)
+### cg_rename.exe (重命名工具)
 独立的批量重命名工具，可以单独使用：
 
 ![Rename Tool](pic/cg_rename.jpg)
@@ -30,7 +30,7 @@
 - 支持演员名称统一化
 - 支持评分信息整合
 
-### 3. cg_crop.exe (封面裁剪工具)
+### cg_crop.exe (封面裁剪工具)
 独立的图片处理工具，可以单独使用：
 
 ![Crop Tool](pic/cg_crop.jpg)
@@ -40,6 +40,12 @@
 - 支持添加水印
 - 支持2:3标准比例裁剪
 - 支持批量处理
+
+### cg_dedupe.exe (封面裁剪工具)
+
+![Crop Tool](pic/cg_dedupe.jpg)
+
+
 
 ## 系统要求
 
