@@ -4,11 +4,143 @@ import sys
 import json
 import subprocess
 from PyQt5 import QtWidgets, QtGui, QtCore
+from PyQt5.QtCore import Qt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
 from multiprocessing import cpu_count, freeze_support
 import signal
 from threading import Lock
+
+
+class CustomSpinner(QtWidgets.QWidget):
+    valueChanged = QtCore.pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.initUI()
+        self.current_index = 0
+        self.options = ["番号", "系列"]
+
+    def initUI(self):
+        layout = QtWidgets.QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # 文本显示区域
+        self.display = QtWidgets.QLineEdit()
+        self.display.setReadOnly(True)
+        self.display.setText("番号")
+        self.display.setAlignment(Qt.AlignCenter)
+
+        # 按钮容器
+        button_container = QtWidgets.QWidget()
+        button_layout = QtWidgets.QVBoxLayout()
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        button_layout.setSpacing(0)
+
+        # 上下箭头按钮
+        self.up_button = QtWidgets.QPushButton("▲")
+        self.down_button = QtWidgets.QPushButton("▼")
+
+        # 设置按钮大小
+        button_height = 20
+        self.up_button.setFixedHeight(button_height)
+        self.down_button.setFixedHeight(button_height)
+
+        # 添加按钮到布局
+        button_layout.addWidget(self.up_button)
+        button_layout.addWidget(self.down_button)
+        button_container.setLayout(button_layout)
+        button_container.setFixedWidth(24)  # 设置按钮容器宽度
+
+        # 添加到主布局
+        layout.addWidget(self.display)
+        layout.addWidget(button_container)
+        self.setLayout(layout)
+
+        # 连接信号
+        self.up_button.clicked.connect(self.previous_item)
+        self.down_button.clicked.connect(self.next_item)
+
+        # 设置样式
+        self.setStyleSheet(
+            """
+            QLineEdit {
+                border: 1px solid #e2e8f0;
+                border-right: none;
+                border-top-left-radius: 4px;
+                border-bottom-left-radius: 4px;
+                padding: 5px;
+                background: white;
+                min-width: 60px;
+            }
+            QPushButton {
+                border: 1px solid #e2e8f0;
+                background: white;
+                font-size: 8px;
+                padding: 0px;
+            }
+            QPushButton:hover {
+                background: #f8fafc;
+            }
+            QPushButton:pressed {
+                background: #f1f5f9;
+            }
+        """
+        )
+
+    def previous_item(self):
+        self.current_index = (self.current_index - 1) % len(self.options)
+        self.display.setText(self.options[self.current_index])
+        self.valueChanged.emit()
+
+    def next_item(self):
+        self.current_index = (self.current_index + 1) % len(self.options)
+        self.display.setText(self.options[self.current_index])
+        self.valueChanged.emit()
+
+    def get_current_value(self):
+        return self.options[self.current_index]
+
+
+class DirectoryButton(QtWidgets.QPushButton):
+    rightClicked = QtCore.pyqtSignal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
+        self.setStyleSheet(
+            """
+            QPushButton {
+                text-align: left;
+                padding: 5px 8px;
+                background-color: white;
+                border: 1px solid #c0c0c0;
+                border-radius: 0px;
+            }
+            QPushButton:hover {
+                background-color: #f0f0f0;
+                border: 1px solid #2563eb;
+            }
+        """
+        )
+
+    def setText(self, text):
+        if text:
+            display_text = os.path.basename(text.rstrip("/\\")) or text
+            super().setText(display_text)
+            self.setToolTip(text)
+        else:
+            super().setText("")
+            self.setToolTip("")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            self.rightClicked.emit()
+        else:
+            super().mousePressEvent(event)
 
 
 class NfoDuplicateFinder(QtWidgets.QWidget):
@@ -17,18 +149,18 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.logic = NfoDuplicateLogic()
         self.operations = NfoDuplicateOperations(self)
         self.selected_directories = []
+        self.dir_buttons = []
         self.init_ui()
         self.load_directories()
         if initial_directory and os.path.exists(initial_directory):
-            if initial_directory not in self.selected_directories:
-                self.selected_directories.append(initial_directory)
-                self.save_directories()
-            self.update_selected_directories_display()
+            self.add_directory(initial_directory)
 
     def init_ui(self):
-        self.setWindowTitle("NFO重复查找工具  v9.3.5")
+        self.setWindowTitle("NFO重复查找工具 v9.5.1")
         self.setGeometry(100, 100, 800, 600)
+        self.setMinimumSize(600, 400)
 
+        # 加载窗口图标
         try:
             if getattr(sys, "frozen", False):
                 application_path = sys._MEIPASS
@@ -41,46 +173,71 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         except Exception as e:
             print(f"图标设置失败: {str(e)}")
 
-        layout = QtWidgets.QVBoxLayout()
+        # 主布局
+        main_layout = QtWidgets.QVBoxLayout()
+        main_layout.setSpacing(8)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+
+        # 顶部区域布局
+        top_container = QtWidgets.QWidget()
+        top_layout = QtWidgets.QHBoxLayout()
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(8)
+
+        # 左侧九宫格布局初始化...
+        self.grid_widget = QtWidgets.QWidget()
+        self.grid_layout = QtWidgets.QGridLayout()
+        self.grid_layout.setSpacing(1)
+        self.grid_layout.setContentsMargins(1, 1, 1, 1)
+
+        # 设置列和行等宽等高
+        for i in range(3):
+            self.grid_layout.setColumnStretch(i, 1)
+            self.grid_layout.setRowStretch(i, 1)
+
+        # 初始化按钮
+        for i in range(9):
+            btn = DirectoryButton()
+            btn.clicked.connect(
+                lambda checked, idx=i: self.operations.select_directories(idx)
+            )
+            btn.rightClicked.connect(lambda idx=i: self.remove_directory(idx))
+            self.dir_buttons.append(btn)
+            self.grid_layout.addWidget(btn, i // 3, i % 3)
+
+        self.grid_widget.setLayout(self.grid_layout)
+
+        # 右侧按钮区域
+        right_container = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout()
+        right_layout.setContentsMargins(0, 1, 0, 1)
+        right_layout.setSpacing(1)
 
         # 选择目录按钮
-        self.select_dir_button = QtWidgets.QPushButton("选择目录（可多选）")
-        self.select_dir_button.clicked.connect(self.operations.select_directories)
-        layout.addWidget(self.select_dir_button)
+        self.select_dir_button = QtWidgets.QPushButton("选择目录")
+        self.select_dir_button.setFixedSize(120, 40)
 
-        # 取消选择按钮
-        self.remove_dir_button = QtWidgets.QPushButton("取消选择的目录")
-        self.remove_dir_button.clicked.connect(
-            self.operations.remove_selected_directory
-        )
-        layout.addWidget(self.remove_dir_button)
+        # 创建Spinner控件
+        self.field_spinner = CustomSpinner()
+        self.field_spinner.setFixedSize(120, 40)
 
-        # 显示选定的目录
-        self.dir_label = QtWidgets.QLabel("未选择目录")
-        self.dir_label.setWordWrap(True)
-        self.dir_label.setAlignment(QtCore.Qt.AlignTop)
-        self.dir_scroll = QtWidgets.QScrollArea()
-        self.dir_scroll.setWidget(self.dir_label)
-        self.dir_scroll.setWidgetResizable(True)
-        self.dir_scroll.setFixedHeight(100)
-        layout.addWidget(self.dir_scroll)
+        # 查找按钮
+        self.start_button = QtWidgets.QPushButton("开始查重")
+        self.start_button.setFixedSize(120, 40)
 
-        # 查重依据
-        self.criteria_label = QtWidgets.QLabel("请选择查重依据")
-        layout.addWidget(self.criteria_label)
+        # 添加到右侧布局
+        right_layout.addWidget(self.select_dir_button, alignment=Qt.AlignTop)
+        right_layout.addStretch(1)
+        right_layout.addWidget(self.field_spinner, alignment=Qt.AlignVCenter)
+        right_layout.addStretch(1)
+        right_layout.addWidget(self.start_button, alignment=Qt.AlignBottom)
 
-        # 字段选择
-        self.field_combo_box = QtWidgets.QComboBox()
-        self.field_combo_box.addItems(["番号", "系列"])
-        self.field_combo_box.currentIndexChanged.connect(
-            self.operations.clear_results_on_change
-        )
-        layout.addWidget(self.field_combo_box)
+        right_container.setLayout(right_layout)
 
-        # 开始查找按钮
-        self.start_button = QtWidgets.QPushButton("查找重复项")
-        self.start_button.clicked.connect(self.operations.find_duplicates)
-        layout.addWidget(self.start_button)
+        # 添加到顶部布局
+        top_layout.addWidget(self.grid_widget, 4)
+        top_layout.addWidget(right_container, 1)
+        top_container.setLayout(top_layout)
 
         # 结果列表
         self.result_list = QtWidgets.QTableWidget()
@@ -88,17 +245,145 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.result_list.setHorizontalHeaderLabels(["重复内容", "NFO路径"])
         self.result_list.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.result_list.horizontalHeader().setStretchLastSection(True)
-        self.result_list.itemDoubleClicked.connect(self.operations.open_folder)
-        layout.addWidget(self.result_list)
+        self.result_list.verticalHeader().setVisible(False)
 
         # 进度条
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setValue(0)
-        layout.addWidget(self.progress_bar)
 
-        self.setLayout(layout)
+        # 添加所有组件到主布局
+        main_layout.addWidget(top_container)
+        main_layout.addWidget(self.result_list, 1)
+        main_layout.addWidget(self.progress_bar)
+
+        self.setLayout(main_layout)
+
+        # 连接信号
+        self.select_dir_button.clicked.connect(
+            lambda: self.operations.select_directories()
+        )
+        self.field_spinner.valueChanged.connect(self.operations.clear_results_on_change)
+        self.start_button.clicked.connect(self.operations.find_duplicates)
+        self.result_list.itemDoubleClicked.connect(self.operations.open_folder)
+
+        # 应用样式
+        self.apply_styles()
+
+    def apply_styles(self):
+        # 设置主窗口背景色
+        self.setStyleSheet(
+            """
+            QWidget {
+                background-color: white;
+            }
+        """
+        )
+
+        # 选择目录按钮样式
+        self.select_dir_button.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #2563eb;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1d4ed8;
+            }
+            QPushButton:pressed {
+                background-color: #1e40af;
+            }
+        """
+        )
+
+        # 开始查找按钮样式
+        self.start_button.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #2563eb;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1d4ed8;
+            }
+        """
+        )
+
+        # 表格样式
+        self.result_list.setStyleSheet(
+            """
+            QTableWidget {
+                border: 1px solid #e2e8f0;
+                border-radius: 6px;
+                background-color: white;
+                gridline-color: #f1f5f9;
+            }
+            QTableWidget::item {
+                padding: 4px;
+            }
+            QHeaderView::section {
+                background-color: #f8fafc;
+                padding: 6px;
+                border: none;
+                font-weight: bold;
+            }
+        """
+        )
+
+        # 进度条样式
+        self.progress_bar.setStyleSheet(
+            """
+            QProgressBar {
+                border: none;
+                border-radius: 6px;
+                background-color: #f1f5f9;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #2563eb;
+                border-radius: 6px;
+            }
+        """
+        )
+
+    def add_directory(self, directory):
+        """添加新目录到网格"""
+        if (
+            directory not in self.selected_directories
+            and len(self.selected_directories) < 9
+        ):
+            self.selected_directories.append(directory)
+            idx = len(self.selected_directories) - 1
+            self.dir_buttons[idx].setText(directory)
+            self.dir_buttons[idx].setVisible(True)
+            self.save_directories()
+
+    def remove_directory(self, index):
+        """移除指定位置的目录"""
+        if 0 <= index < len(self.selected_directories):
+            self.selected_directories.pop(index)
+            self.update_directory_display()
+            self.save_directories()
+
+    def update_directory_display(self):
+        """更新目录显示"""
+        # 清空所有按钮的文本
+        for btn in self.dir_buttons:
+            btn.setText("")
+
+        # 显示现有目录
+        for i, directory in enumerate(self.selected_directories):
+            self.dir_buttons[i].setText(directory)
 
     def load_directories(self):
+        """加载保存的目录"""
         settings = QtCore.QSettings("NfoDuplicateFinder", "Directories")
         saved_directories = settings.value("directories", [])
         self.selected_directories = (
@@ -106,17 +391,15 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             if saved_directories
             else []
         )
-        self.update_selected_directories_display()
+        self.update_directory_display()
 
-    def update_selected_directories_display(self):
-        if self.selected_directories:
-            self.dir_label.setText("\n".join(self.selected_directories))
-        else:
-            self.dir_label.setText("未选择目录")
-
-    def closeEvent(self, event):
+    def save_directories(self):
+        """保存目录列表"""
         settings = QtCore.QSettings("NfoDuplicateFinder", "Directories")
         settings.setValue("directories", self.selected_directories)
+
+    def closeEvent(self, event):
+        self.save_directories()
         event.accept()
 
 
@@ -128,21 +411,22 @@ class NfoDuplicateOperations:
         self.processed_files = 0
         self.batch_size = 1000  # 固定批处理大小
 
-    def select_directories(self):
-        last_dir = (
-            self.ui.selected_directories[-1] if self.ui.selected_directories else "."
-        )
+    def select_directories(self, index=-1):
+        """选择目录，index=-1表示新增，否则表示替换指定位置"""
         directory = QtWidgets.QFileDialog.getExistingDirectory(
             self.ui,
             "选择目录",
-            last_dir,
+            ".",
             QtWidgets.QFileDialog.ShowDirsOnly
             | QtWidgets.QFileDialog.DontUseNativeDialog,
         )
         if directory and os.path.exists(directory):
-            if directory not in self.ui.selected_directories:
-                self.ui.selected_directories.append(directory)
-                self.ui.update_selected_directories_display()
+            if index >= 0:  # 替换模式
+                if index < len(self.ui.selected_directories):
+                    self.ui.selected_directories[index] = directory
+                    self.ui.update_directory_display()
+            else:  # 新增模式
+                self.ui.add_directory(directory)
 
     def remove_selected_directory(self):
         if not self.ui.selected_directories:
@@ -170,7 +454,7 @@ class NfoDuplicateOperations:
         self.ui.start_button.setText("正在查找...")
         self.processed_files = 0
 
-        selected_field = self.ui.field_combo_box.currentText()
+        selected_field = self.ui.field_spinner.get_current_value()
         self.ui.progress_bar.setValue(0)
 
         # 使用生成器获取文件列表
@@ -318,7 +602,22 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         initial_directory = sys.argv[1]
 
+    # Enable High DPI support
+    if hasattr(QtCore.Qt, "AA_EnableHighDpiScaling"):
+        QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(QtCore.Qt, "AA_UseHighDpiPixmaps"):
+        QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+
     app = QtWidgets.QApplication(sys.argv)
+    app.setStyle("Fusion")
     window = NfoDuplicateFinder(initial_directory=initial_directory)
+
+    # Center window on screen
+    screen = app.primaryScreen().geometry()
+    window_geometry = window.geometry()
+    x = (screen.width() - window_geometry.width()) // 2
+    y = (screen.height() - window_geometry.height()) // 2
+    window.move(x, y)
+
     window.show()
     sys.exit(app.exec_())
