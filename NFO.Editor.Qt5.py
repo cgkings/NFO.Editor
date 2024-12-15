@@ -212,6 +212,11 @@ class NFOEditorQt5(NFOEditorQt):
         # 添加筛选输入框回车键响应
         self.filter_entry.returnPressed.connect(self.apply_filter)
 
+        # 为番号标签添加点击事件
+        if "num" in self.fields_entries:
+            num_label = self.fields_entries["num"]
+            num_label.mousePressEvent = lambda event: self.open_number_search(event)
+
     def eventFilter(self, obj, event):
         """事件过滤器"""
         if (
@@ -461,6 +466,19 @@ class NFOEditorQt5(NFOEditorQt):
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载NFO文件失败: {str(e)}")
+
+    def open_number_search(self, event):
+        """打开番号搜索网页"""
+        if event.button() == Qt.LeftButton:  # 只响应左键点击
+            num_text = self.fields_entries["num"].text().strip()
+            if num_text:
+                try:
+                    # 打开JavDB搜索
+                    webbrowser.open(f"https://javdb.com/search?q={num_text}&f=all")
+                    # 打开JavTrailers搜索
+                    webbrowser.open(f"https://javtrailers.com/search/{num_text}")
+                except Exception as e:
+                    QMessageBox.warning(self, "警告", f"打开网页失败: {str(e)}")
 
     def load_target_files(self, target_path):
         """加载目标文件夹内容"""
@@ -1254,19 +1272,38 @@ class NFOEditorQt5(NFOEditorQt):
             return
 
         try:
-            # 使用subprocess启动独立进程
-            import subprocess
-            import sys
+            # 检查目录是否存在
+            if not os.path.isdir(self.folder_path):
+                QMessageBox.critical(self, "错误", f"目录不存在: {self.folder_path}")
+                return
 
-            # 获取 Python 解释器路径
+            # 获取Python解释器路径
             python_executable = sys.executable
 
-            # 构建命令
+            # 构建重命名工具脚本路径
             rename_script = os.path.join(os.path.dirname(__file__), "cg_rename.py")
+
+            # 检查脚本文件是否存在
+            if not os.path.exists(rename_script):
+                QMessageBox.critical(self, "错误", "找不到重命名工具脚本(cg_rename.py)")
+                return
+
+            # 构建命令
             cmd = [python_executable, rename_script, self.folder_path]
 
-            # 启动独立进程
-            subprocess.Popen(cmd)
+            # 启动独立进程，并捕获可能的启动错误
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
+
+                # 可选：检查进程是否成功启动
+                if process.poll() is not None:  # 如果进程立即退出
+                    QMessageBox.warning(self, "警告", "重命名工具可能未正常启动")
+
+            except subprocess.SubprocessError as se:
+                raise Exception(f"启动进程失败: {se}")
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"启动重命名工具时出错: {str(e)}")

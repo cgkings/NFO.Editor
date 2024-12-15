@@ -55,17 +55,17 @@ jobs:
         # 首先构建 cg_crop
         pyinstaller --name "cg_crop" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "Img;Img" "cg_crop.py"
         
-        # 确保临时目录存在
-        New-Item -ItemType Directory -Force -Path "temp"
+        # # 确保临时目录存在
+        # New-Item -ItemType Directory -Force -Path "temp"
         
-        # 将 cg_crop.exe 复制到临时目录，供 NFO.Editor 使用
-        Copy-Item -Path "dist/cg_crop.exe" -Destination "temp/cg_crop.exe"
+        # # 将 cg_crop.exe 复制到临时目录
+        # Copy-Item -Path "dist/cg_crop.exe" -Destination "temp/cg_crop.exe"
         
-        # 构建 NFO.Editor
-        pyinstaller --name "NFO.Editor" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "mapping_actor.xml;." --add-data "Img;Img" --exclude-module matplotlib --exclude-module numpy --exclude-module pandas --clean --hidden-import xml.etree.ElementTree --hidden-import xml.dom.minidom "NFO.Editor.py"
+        # # 构建 NFO.Editor
+        # pyinstaller --name "NFO.Editor" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "mapping_actor.xml;." --add-data "Img;Img" --exclude-module matplotlib --exclude-module numpy --exclude-module pandas --clean --hidden-import xml.etree.ElementTree --hidden-import xml.dom.minidom "NFO.Editor.py"
 
         # 构建 NFO.Editor.Qt5
-        pyinstaller --name "NFO.Editor.Qt5" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "mapping_actor.xml;." --add-data "Img;Img" --exclude-module matplotlib --exclude-module numpy --exclude-module pandas --clean --hidden-import xml.etree.ElementTree --hidden-import xml.dom.minidom "NFO.Editor.Qt5.py"
+        pyinstaller --name "NFO.Editor.Qt5" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "mapping_actor.xml;." --add-data "Img;Img" "NFO.Editor.Qt5.py"
 
         # 构建 cg_rename
         pyinstaller --name "cg_rename" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "mapping_actor.xml;." "cg_rename.py"
@@ -74,14 +74,14 @@ jobs:
         pyinstaller --name "cg_dedupe" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." "cg_dedupe.py"
 
         # 重命名生成的文件
-        Move-Item -Path "dist/NFO.Editor.exe" -Destination "dist/NFO.Editor.${{ env.BUILD_NAME }}.exe" -Force
+        # Move-Item -Path "dist/NFO.Editor.exe" -Destination "dist/NFO.Editor.${{ env.BUILD_NAME }}.exe" -Force
         Move-Item -Path "dist/NFO.Editor.Qt5.exe" -Destination "dist/NFO.Editor.Qt5.${{ env.BUILD_NAME }}.exe" -Force
         Move-Item -Path "dist/cg_crop.exe" -Destination "dist/cg_crop.${{ env.BUILD_NAME }}.exe" -Force
         Move-Item -Path "dist/cg_rename.exe" -Destination "dist/cg_rename.${{ env.BUILD_NAME }}.exe" -Force
         Move-Item -Path "dist/cg_dedupe.exe" -Destination "dist/cg_dedupe.${{ env.BUILD_NAME }}.exe" -Force
 
-        # 清理临时文件
-        Remove-Item -Path "temp" -Recurse -Force
+        # # 清理临时文件
+        # Remove-Item -Path "temp" -Recurse -Force
 
     - name: 创建 Release
       id: create_release
@@ -92,7 +92,7 @@ jobs:
         draft: false
         prerelease: false
         files: |
-          dist/NFO.Editor.${{ env.BUILD_NAME }}.exe
+          # dist/NFO.Editor.${{ env.BUILD_NAME }}.exe
           dist/NFO.Editor.Qt5.${{ env.BUILD_NAME }}.exe
           dist/cg_crop.${{ env.BUILD_NAME }}.exe
           dist/cg_rename.${{ env.BUILD_NAME }}.exe
