@@ -156,7 +156,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             self.add_directory(initial_directory)
 
     def init_ui(self):
-        self.setWindowTitle("NFO重复查找工具 v9.5.1")
+        self.setWindowTitle("大锤 NFO查重工具 v9.5.1")
         self.setGeometry(100, 100, 800, 600)
         self.setMinimumSize(600, 400)
 
@@ -239,6 +239,20 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         top_layout.addWidget(right_container, 1)
         top_container.setLayout(top_layout)
 
+        # 添加提示文本标签
+        self.tip_label = QtWidgets.QLabel(
+            "使用说明：九宫格内已选目录，左键重选，右键删除"
+        )
+        self.tip_label.setStyleSheet(
+            """
+            QLabel {
+                color: #666666;
+                padding: 4px;
+                font-size: 16px;
+            }
+        """
+        )
+
         # 结果列表
         self.result_list = QtWidgets.QTableWidget()
         self.result_list.setColumnCount(2)
@@ -253,6 +267,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
 
         # 添加所有组件到主布局
         main_layout.addWidget(top_container)
+        main_layout.addWidget(self.tip_label)  # 添加提示标签
         main_layout.addWidget(self.result_list, 1)
         main_layout.addWidget(self.progress_bar)
 
