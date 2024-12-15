@@ -199,8 +199,8 @@ class RenameWorker(QThread):
 
 
 class RenameToolGUI(QMainWindow):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
         # 启用高DPI支持
         if hasattr(Qt, "AA_EnableHighDpiScaling"):
             QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
@@ -210,8 +210,8 @@ class RenameToolGUI(QMainWindow):
 
     def init_ui(self):
         """Initialize the UI"""
-        self.setWindowTitle("大锤批量改名工具 v9.3.9")
-        self.setMinimumSize(900, 600)
+        self.setWindowTitle("大锤批量改名工具 v9.5.0")
+        self.setMinimumSize(900, 800)
 
         # 设置窗口样式
         self.setStyleSheet(

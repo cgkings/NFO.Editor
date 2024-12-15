@@ -1,6 +1,7 @@
 import os
 import shutil
 import sys
+import webbrowser
 import xml.etree.ElementTree as ET
 import xml.dom.minidom as minidom
 from datetime import datetime
@@ -1277,34 +1278,15 @@ class NFOEditorQt5(NFOEditorQt):
                 QMessageBox.critical(self, "错误", f"目录不存在: {self.folder_path}")
                 return
 
-            # 获取Python解释器路径
-            python_executable = sys.executable
+            # 导入重命名工具
+            from cg_rename import RenameToolGUI
 
-            # 构建重命名工具脚本路径
-            rename_script = os.path.join(os.path.dirname(__file__), "cg_rename.py")
+            rename_tool = RenameToolGUI(parent=self)  # 设置父窗口
+            rename_tool.path_entry.setText(self.folder_path)  # 设置初始目录
+            rename_tool.show()
 
-            # 检查脚本文件是否存在
-            if not os.path.exists(rename_script):
-                QMessageBox.critical(self, "错误", "找不到重命名工具脚本(cg_rename.py)")
-                return
-
-            # 构建命令
-            cmd = [python_executable, rename_script, self.folder_path]
-
-            # 启动独立进程，并捕获可能的启动错误
-            try:
-                process = subprocess.Popen(
-                    cmd,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-                )
-
-                # 可选：检查进程是否成功启动
-                if process.poll() is not None:  # 如果进程立即退出
-                    QMessageBox.warning(self, "警告", "重命名工具可能未正常启动")
-
-            except subprocess.SubprocessError as se:
-                raise Exception(f"启动进程失败: {se}")
-
+        except ImportError:
+            QMessageBox.critical(self, "错误", "找不到重命名工具模块(cg_rename.py)")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"启动重命名工具时出错: {str(e)}")
 
