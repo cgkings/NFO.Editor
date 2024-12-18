@@ -1,6 +1,17 @@
 
-# NFO Tools Collection
-## 大锤 NFO.editor GUI版
+# 大锤 NFO.editor GUI版
+# NFO Tools
+
+![Build Status](https://github.com/cgkings/NFO.Editor/actions/workflows/build.yml/badge.svg)
+
+## 构建状态
+
+- [![NFO Editor Qt5](https://github.com/cgkings/NFO.Editor/actions/workflows/build.yml/badge.svg?branch=main&event=push)](https://github.com/cgkings/NFO.Editor/actions/workflows/build.yml)
+
+## 最新版本
+
+[![Latest Release](https://img.shields.io/github/v/release/cgkings/NFO.Editor?include_prereleases)](https://github.com/cgkings/NFO.Editor/releases/latest)
+
 这是一个用于管理NFO文件的工具集合，提供了三个独立的可执行程序。
 
 ## 功能展示

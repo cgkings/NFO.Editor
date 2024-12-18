@@ -6,40 +6,75 @@ on:
       - 'v*.*.*'  # 仅在创建符合格式 v*.*.* 的标签时触发
   workflow_dispatch:  # 允许手动触发构建
 
+env:
+  PYTHONUNBUFFERED: 1
+  PYTHONUTF8: 1
+  PYTHONDONTWRITEBYTECODE: 1
+
 jobs:
   build:
-    runs-on: windows-latest  # 只在 Windows 上构建
+    strategy:
+      matrix:
+        app: [
+          {
+            name: "cg_crop",
+            extra_data: "--add-data 'Img;Img'"
+          },
+          {
+            name: "NFO.Editor.Qt5",
+            extra_data: "--add-data 'mapping_actor.xml;.' --add-data 'Img;Img'"
+          },
+          {
+            name: "cg_rename",
+            extra_data: "--add-data 'mapping_actor.xml;.'"
+          },
+          {
+            name: "cg_dedupe",
+            extra_data: ""
+          }
+        ]
+      fail-fast: false  # 某个应用构建失败不影响其他应用
+
+    runs-on: windows-latest
+    timeout-minutes: 15  # 考虑到原构建时间约4分钟，设置15分钟超时
 
     steps:
     - name: 检出代码
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # 获取完整历史用于版本号生成
 
     - name: 设置 Python 版本
       uses: actions/setup-python@v5
       with:
-        python-version: '3.12.2'
+        python-version: '3.12.7'  # 使用您的开发环境版本
+        cache: 'pip'  # 启用 pip 缓存
 
-    - name: 缓存 pip 依赖
+    - name: 缓存 PyInstaller
       uses: actions/cache@v3
       with:
         path: |
-          ~/.cache/pip
-        key: windows-pip-${{ hashFiles('**/requirements.txt') }}
+          build
+          dist
+          *.spec
+        key: ${{ runner.os }}-pyinstaller-${{ hashFiles('**/*.py') }}-${{ matrix.app.name }}
         restore-keys: |
-          windows-pip-
+          ${{ runner.os }}-pyinstaller-${{ hashFiles('**/*.py') }}-
+          ${{ runner.os }}-pyinstaller-
+        # 使用默认的7天缓存时间
 
     - name: 安装依赖
       run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        python -m pip install --upgrade pip wheel setuptools
+        pip install -r requirements.txt --no-cache-dir
 
     - name: 设置构建名称
       id: set_build_name
+      shell: pwsh
       run: |
         if ($env:GITHUB_EVENT_NAME -eq "push" -and $env:GITHUB_REF -match '^refs/tags/v.*') {
-          $BUILD_NAME = $env:GITHUB_REF.Substring(10)  # 去掉 "refs/tags/"
+          $BUILD_NAME = $env:GITHUB_REF.Substring(10)
         } else {
-          # 获取最新的标签
           git fetch --tags
           $latestTag = git describe --tags $(git rev-list --tags --max-count=1)
           if ($null -eq $latestTag) {
@@ -50,52 +85,56 @@ jobs:
         }
         echo "BUILD_NAME=$BUILD_NAME" >> $env:GITHUB_ENV
 
-    - name: 构建所有程序
+    - name: 构建应用
+      shell: pwsh
       run: |
-        # 首先构建 cg_crop
-        pyinstaller --name "cg_crop" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "Img;Img" "cg_crop.py"
+        pyinstaller --name "${{ matrix.app.name }}" `
+          --onefile `
+          --noconsole `
+          --icon="chuizi.ico" `
+          --add-data "chuizi.ico;." `
+          ${{ matrix.app.extra_data }} `
+          --noupx `
+          --strip `
+          --clean `
+          "${{ matrix.app.name }}.py"
         
-        # # 确保临时目录存在
-        # New-Item -ItemType Directory -Force -Path "temp"
-        
-        # # 将 cg_crop.exe 复制到临时目录
-        # Copy-Item -Path "dist/cg_crop.exe" -Destination "temp/cg_crop.exe"
-        
-        # # 构建 NFO.Editor
-        # pyinstaller --name "NFO.Editor" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "mapping_actor.xml;." --add-data "Img;Img" --exclude-module matplotlib --exclude-module numpy --exclude-module pandas --clean --hidden-import xml.etree.ElementTree --hidden-import xml.dom.minidom "NFO.Editor.py"
+        Move-Item -Path "dist/${{ matrix.app.name }}.exe" `
+          -Destination "dist/${{ matrix.app.name }}.${{ env.BUILD_NAME }}.exe" -Force
 
-        # 构建 NFO.Editor.Qt5
-        pyinstaller --name "NFO.Editor.Qt5" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "mapping_actor.xml;." --add-data "Img;Img" "NFO.Editor.Qt5.py"
-
-        # 构建 cg_rename
-        pyinstaller --name "cg_rename" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." --add-data "mapping_actor.xml;." "cg_rename.py"
-
-        # 构建 cg_dedupe
-        pyinstaller --name "cg_dedupe" --onefile --noconsole --icon="chuizi.ico" --add-data "chuizi.ico;." "cg_dedupe.py"
-
-        # 重命名生成的文件
-        # Move-Item -Path "dist/NFO.Editor.exe" -Destination "dist/NFO.Editor.${{ env.BUILD_NAME }}.exe" -Force
-        Move-Item -Path "dist/NFO.Editor.Qt5.exe" -Destination "dist/NFO.Editor.Qt5.${{ env.BUILD_NAME }}.exe" -Force
-        Move-Item -Path "dist/cg_crop.exe" -Destination "dist/cg_crop.${{ env.BUILD_NAME }}.exe" -Force
-        Move-Item -Path "dist/cg_rename.exe" -Destination "dist/cg_rename.${{ env.BUILD_NAME }}.exe" -Force
-        Move-Item -Path "dist/cg_dedupe.exe" -Destination "dist/cg_dedupe.${{ env.BUILD_NAME }}.exe" -Force
-
-        # # 清理临时文件
-        # Remove-Item -Path "temp" -Recurse -Force
-
-    - name: 创建 Release
-      id: create_release
-      uses: softprops/action-gh-release@v1
+    - name: 上传构建工件
+      uses: actions/upload-artifact@v3
       with:
-        tag_name: ${{ env.BUILD_NAME }}
-        release_name: Release ${{ env.BUILD_NAME }}
-        draft: false
-        prerelease: false
-        files: |
-          # dist/NFO.Editor.${{ env.BUILD_NAME }}.exe
-          dist/NFO.Editor.Qt5.${{ env.BUILD_NAME }}.exe
-          dist/cg_crop.${{ env.BUILD_NAME }}.exe
-          dist/cg_rename.${{ env.BUILD_NAME }}.exe
-          dist/cg_dedupe.${{ env.BUILD_NAME }}.exe
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        name: ${{ matrix.app.name }}-build
+        path: dist/${{ matrix.app.name }}.${{ env.BUILD_NAME }}.exe
+        retention-days: 7  # 设置为7天，与GitHub缓存默认时间一致
+
+  release:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - name: 下载所有构建工件
+        uses: actions/download-artifact@v3
+        with:
+          path: dist
+
+      - name: 移动文件到正确位置
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path dist -Recurse -Filter "*.exe" | 
+          ForEach-Object {
+            Move-Item $_.FullName "dist/$($_.Name)" -Force
+          }
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.BUILD_NAME }}
+          release_name: Release ${{ env.BUILD_NAME }}
+          draft: false
+          prerelease: false  # 正式发布
+          generate_release_notes: true  # 自动生成发布说明
+          files: |
+            dist/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -210,7 +210,7 @@ class RenameToolGUI(QMainWindow):
 
     def init_ui(self):
         """Initialize the UI"""
-        self.setWindowTitle("大锤批量改名工具 v9.5.0")
+        self.setWindowTitle("大锤 批量改名工具 v9.5.1")
         self.setMinimumSize(900, 800)
 
         # 设置窗口样式
