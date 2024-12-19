@@ -159,6 +159,10 @@ class NFOEditorQt5(NFOEditorQt):
                 btn.clicked.connect(self.load_files_in_folder)
             elif text == "=>":
                 btn.clicked.connect(self.start_move_thread)
+            elif text == "批量填充 (Batch Filling)":
+                btn.clicked.connect(self.batch_filling)
+            elif text == "批量新增 (Batch Add)":
+                btn.clicked.connect(self.batch_add)
 
         # 显示图片复选框信号
         self.show_images_checkbox.stateChanged.connect(self.toggle_image_display)
