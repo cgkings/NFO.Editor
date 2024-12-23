@@ -102,6 +102,7 @@ jobs:
           --hidden-import win32com.client.gencache `
           --hidden-import pythoncom `
           --hidden-import pywintypes `
+          -y `
           "NFO.Editor.Qt5.py"
         
         Move-Item -Path "dist/shared/NFO.Editor.Qt5/NFO.Editor.Qt5.exe" -Destination "dist/NFOTools/" -Force
@@ -119,6 +120,7 @@ jobs:
           --hidden-import win32com.client.gencache `
           --hidden-import pythoncom `
           --hidden-import pywintypes `
+          -y `
           "cg_rename.py"
         
         Move-Item -Path "dist/shared/cg_rename/cg_rename.exe" -Destination "dist/NFOTools/" -Force
@@ -135,6 +137,7 @@ jobs:
           --hidden-import win32com.client.gencache `
           --hidden-import pythoncom `
           --hidden-import pywintypes `
+          -y `
           "cg_dedupe.py"
         
         Move-Item -Path "dist/shared/cg_dedupe/cg_dedupe.exe" -Destination "dist/NFOTools/" -Force
