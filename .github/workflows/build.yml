@@ -27,7 +27,7 @@ jobs:
       with:
         python-version: '3.9.13'
         cache: 'pip'
-        check-latest: false # 加快启动速度
+        check-latest: false
 
     - name: 缓存PyInstaller工作目录
       uses: actions/cache@v4
@@ -60,11 +60,17 @@ jobs:
     - name: 构建应用
       shell: pwsh
       run: |
-        # 创建目录
+        # 构建前清理
+        Remove-Item -Path "dist" -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "build" -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "shared_libs" -Recurse -Force -ErrorAction SilentlyContinue
+        
+        # 创建必要目录
         New-Item -Path "dist/NFOTools" -ItemType Directory -Force
         New-Item -Path "shared_libs" -ItemType Directory -Force
         
         # 构建 cg_crop
+        Write-Host "开始构建 cg_crop..."
         pyinstaller --name "cg_crop" `
           --distpath "./dist/shared" `
           --workpath "./build/shared" `
@@ -77,18 +83,23 @@ jobs:
           --hidden-import win32com.client.gencache `
           --hidden-import pythoncom `
           --hidden-import pywintypes `
+          -y `
           "cg_crop.py"
           
-        # 首次构建后，移动共享依赖
+        # 移动共享依赖
         if (Test-Path "dist/shared/cg_crop/PyQt5") {
-          Move-Item -Path "dist/shared/cg_crop/PyQt5" -Destination "shared_libs/" -Force
+          Write-Host "移动 PyQt5 到共享库..."
+          Move-Item -Path "dist/shared/cg_crop/PyQt5" -Destination "shared_libs/" -Force -ErrorAction SilentlyContinue
         }
         if (Test-Path "dist/shared/cg_crop/_internal") {
-          Move-Item -Path "dist/shared/cg_crop/_internal" -Destination "shared_libs/" -Force
+          Write-Host "移动 _internal 到共享库..."
+          Move-Item -Path "dist/shared/cg_crop/_internal" -Destination "shared_libs/" -Force -ErrorAction SilentlyContinue
         }
-        Move-Item -Path "dist/shared/cg_crop/cg_crop.exe" -Destination "dist/NFOTools/" -Force
+        Move-Item -Path "dist/shared/cg_crop/cg_crop.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "dist/shared/cg_crop" -Recurse -Force -ErrorAction SilentlyContinue
         
         # 构建 NFO.Editor.Qt5
+        Write-Host "开始构建 NFO.Editor.Qt5..."
         pyinstaller --name "NFO.Editor.Qt5" `
           --distpath "./dist/shared" `
           --workpath "./build/shared" `
@@ -105,9 +116,11 @@ jobs:
           -y `
           "NFO.Editor.Qt5.py"
         
-        Move-Item -Path "dist/shared/NFO.Editor.Qt5/NFO.Editor.Qt5.exe" -Destination "dist/NFOTools/" -Force
-
+        Move-Item -Path "dist/shared/NFO.Editor.Qt5/NFO.Editor.Qt5.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "dist/shared/NFO.Editor.Qt5" -Recurse -Force -ErrorAction SilentlyContinue
+        
         # 构建 cg_rename
+        Write-Host "开始构建 cg_rename..."
         pyinstaller --name "cg_rename" `
           --distpath "./dist/shared" `
           --workpath "./build/shared" `
@@ -123,9 +136,11 @@ jobs:
           -y `
           "cg_rename.py"
         
-        Move-Item -Path "dist/shared/cg_rename/cg_rename.exe" -Destination "dist/NFOTools/" -Force
-
+        Move-Item -Path "dist/shared/cg_rename/cg_rename.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "dist/shared/cg_rename" -Recurse -Force -ErrorAction SilentlyContinue
+        
         # 构建 cg_dedupe
+        Write-Host "开始构建 cg_dedupe..."
         pyinstaller --name "cg_dedupe" `
           --distpath "./dist/shared" `
           --workpath "./build/shared" `
@@ -140,12 +155,15 @@ jobs:
           -y `
           "cg_dedupe.py"
         
-        Move-Item -Path "dist/shared/cg_dedupe/cg_dedupe.exe" -Destination "dist/NFOTools/" -Force
-
+        Move-Item -Path "dist/shared/cg_dedupe/cg_dedupe.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "dist/shared/cg_dedupe" -Recurse -Force -ErrorAction SilentlyContinue
+        
         # 移动共享依赖到最终目录
+        Write-Host "移动共享依赖..."
         Copy-Item -Path "shared_libs/*" -Destination "dist/NFOTools/" -Recurse -Force
         
         # 移动额外资源文件
+        Write-Host "移动资源文件..."
         Copy-Item -Path "Img" -Destination "dist/NFOTools/" -Recurse -Force
         Copy-Item -Path "mapping_actor.xml" -Destination "dist/NFOTools/" -Force
         Copy-Item -Path "chuizi.ico" -Destination "dist/NFOTools/" -Force
@@ -209,7 +227,7 @@ jobs:
 
     - name: 安装 NSIS
       run: |
-        choco install nsis -y --no-progress # 添加 --no-progress 加快安装
+        choco install nsis -y --no-progress
 
     - name: 构建安装程序
       run: |
