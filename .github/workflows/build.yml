@@ -177,11 +177,23 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     permissions:
       contents: write
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        if: github.event_name == 'workflow_dispatch'
+
+      - name: Create Tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git tag ${{ env.build_name }}
+          git push origin ${{ env.build_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: 下载安装程序
         uses: actions/download-artifact@v4
         with:
