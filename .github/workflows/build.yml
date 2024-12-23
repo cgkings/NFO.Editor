@@ -13,28 +13,6 @@ env:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        app: [
-          {
-            name: "cg_crop",
-            extra_data: "--add-data 'Img;Img'"
-          },
-          {
-            name: "NFO.Editor.Qt5",
-            extra_data: "--add-data 'mapping_actor.xml;.' --add-data 'Img;Img'"
-          },
-          {
-            name: "cg_rename",
-            extra_data: "--add-data 'mapping_actor.xml;.'"
-          },
-          {
-            name: "cg_dedupe",
-            extra_data: ""
-          }
-        ]
-      fail-fast: false
-
     runs-on: windows-latest
     timeout-minutes: 15
 
@@ -49,18 +27,6 @@ jobs:
       with:
         python-version: '3.9.13'
         cache: 'pip'
-
-    - name: 缓存 PyInstaller
-      uses: actions/cache@v3
-      with:
-        path: |
-          build
-          dist
-          *.spec
-        key: ${{ runner.os }}-pyinstaller-${{ hashFiles('**/*.py') }}-${{ matrix.app.name }}
-        restore-keys: |
-          ${{ runner.os }}-pyinstaller-${{ hashFiles('**/*.py') }}-
-          ${{ runner.os }}-pyinstaller-
 
     - name: 安装依赖
       run: |
@@ -85,47 +51,135 @@ jobs:
         }
         echo "build_name=$BUILD_NAME" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-    - name: 构建应用
+    - name: 构建所有应用
       shell: pwsh
       run: |
-        pyinstaller --name "${{ matrix.app.name }}" `
-          --onefile `
-          --noconsole `
-          --icon="chuizi.ico" `
-          --add-data "chuizi.ico;." `
-          ${{ matrix.app.extra_data }} `
-          --runtime-tmpdir "." `
-          --clean `
-          "${{ matrix.app.name }}.py"
+        $apps = @(
+          @{
+            name = "cg_crop"
+            extra_data = "--add-data 'Img;Img'"
+          },
+          @{
+            name = "NFO.Editor.Qt5"
+            extra_data = "--add-data 'mapping_actor.xml;.' --add-data 'Img;Img'"
+          },
+          @{
+            name = "cg_rename"
+            extra_data = "--add-data 'mapping_actor.xml;.'"
+          },
+          @{
+            name = "cg_dedupe"
+            extra_data = ""
+          }
+        )
         
-        Move-Item -Path "dist/${{ matrix.app.name }}.exe" `
-          -Destination "dist/${{ matrix.app.name }}.${{ env.build_name }}.exe" -Force
+        foreach ($app in $apps) {
+          pyinstaller --name "$($app.name)" `
+            --onefile `
+            --noconsole `
+            --icon="chuizi.ico" `
+            --add-data "chuizi.ico;." `
+            $($app.extra_data) `
+            --runtime-tmpdir "%TEMP%" `
+            --clean `
+            "$($app.name).py"
+        }
+
+    - name: 创建 NSIS 安装脚本
+      shell: pwsh
+      run: |
+        @'
+        !include "MUI2.nsh"
+        !define PRODUCT_NAME "NFO Tools"
+        !define PRODUCT_VERSION "${{ env.build_name }}"
+        !define PRODUCT_PUBLISHER "NFO Tools"
+
+        Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
+        OutFile "NFOTools.Setup.${{ env.build_name }}.exe"
+        InstallDir "$PROGRAMFILES\NFO Tools"
+        
+        !insertmacro MUI_PAGE_WELCOME
+        !insertmacro MUI_PAGE_DIRECTORY
+        !insertmacro MUI_PAGE_INSTFILES
+        !insertmacro MUI_PAGE_FINISH
+        !insertmacro MUI_UNPAGE_CONFIRM
+        !insertmacro MUI_UNPAGE_INSTFILES
+        
+        !insertmacro MUI_LANGUAGE "SimpChinese"
+        
+        Section "MainSection" SEC01
+          SetOutPath "$INSTDIR"
+          SetOverwrite ifnewer
+          
+          File "dist\cg_crop.exe"
+          File "dist\NFO.Editor.Qt5.exe"
+          File "dist\cg_rename.exe"
+          File "dist\cg_dedupe.exe"
+          File "chuizi.ico"
+          
+          CreateDirectory "$SMPROGRAMS\NFO Tools"
+          CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Editor.lnk" "$INSTDIR\NFO.Editor.Qt5.exe"
+          CreateShortCut "$SMPROGRAMS\NFO Tools\CG Crop.lnk" "$INSTDIR\cg_crop.exe"
+          CreateShortCut "$SMPROGRAMS\NFO Tools\CG Rename.lnk" "$INSTDIR\cg_rename.exe"
+          CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Dedupe.lnk" "$INSTDIR\cg_dedupe.exe"
+          
+          WriteUninstaller "$INSTDIR\uninstall.exe"
+          
+          CreateShortCut "$SMPROGRAMS\NFO Tools\Uninstall.lnk" "$INSTDIR\uninstall.exe"
+        SectionEnd
+        
+        Section "Uninstall"
+          Delete "$INSTDIR\uninstall.exe"
+          Delete "$INSTDIR\cg_crop.exe"
+          Delete "$INSTDIR\NFO.Editor.Qt5.exe"
+          Delete "$INSTDIR\cg_rename.exe"
+          Delete "$INSTDIR\cg_dedupe.exe"
+          Delete "$INSTDIR\chuizi.ico"
+          
+          Delete "$SMPROGRAMS\NFO Tools\NFO Editor.lnk"
+          Delete "$SMPROGRAMS\NFO Tools\CG Crop.lnk"
+          Delete "$SMPROGRAMS\NFO Tools\CG Rename.lnk"
+          Delete "$SMPROGRAMS\NFO Tools\NFO Dedupe.lnk"
+          Delete "$SMPROGRAMS\NFO Tools\Uninstall.lnk"
+          
+          RMDir "$SMPROGRAMS\NFO Tools"
+          RMDir "$INSTDIR"
+        SectionEnd
+        '@ | Out-File -FilePath "installer.nsi" -Encoding utf8
+
+    - name: 安装 NSIS
+      run: |
+        choco install nsis -y
+
+    - name: 构建安装程序
+      run: |
+        makensis installer.nsi
 
     - name: 上传构建工件
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ matrix.app.name }}-build
-        path: dist/${{ matrix.app.name }}.${{ env.build_name }}.exe
+        name: nfo-tools-installer
+        path: NFOTools.Setup.${{ env.build_name }}.exe
         retention-days: 7
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     permissions:
       contents: write
     steps:
-      - name: 下载所有构建工件
+      - name: 下载安装程序
         uses: actions/download-artifact@v4
         with:
+          name: nfo-tools-installer
           path: dist
-          merge-multiple: true
 
       - name: 创建 Release
         uses: softprops/action-gh-release@v1
         with:
-          name: Release ${{ github.ref_name }}
-          tag_name: ${{ github.ref_name }}
+          name: Release ${{ env.build_name }}
+          tag_name: ${{ env.build_name }}
           draft: false
           prerelease: false
           files: dist/*.exe
