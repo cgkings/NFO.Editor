@@ -47,7 +47,7 @@ jobs:
     - name: 设置 Python 版本
       uses: actions/setup-python@v5
       with:
-        python-version: '3.9.13'  # 降级到更稳定的Python版本
+        python-version: '3.9.13'
         cache: 'pip'
 
     - name: 缓存 PyInstaller
@@ -66,7 +66,7 @@ jobs:
       run: |
         python -m pip install --upgrade pip wheel setuptools
         pip install -r requirements.txt --no-cache-dir
-        pip install pyinstaller==6.3.0  # 固定PyInstaller版本
+        pip install pyinstaller==6.3.0
 
     - name: 设置构建名称
       id: set_build_name
@@ -83,7 +83,7 @@ jobs:
           }
           $BUILD_NAME = $latestTag
         }
-        echo "BUILD_NAME=$BUILD_NAME" >> $env:GITHUB_ENV
+        echo "build_name=$BUILD_NAME" | Out-File -FilePath $env:GITHUB_ENV -Append
 
     - name: 构建应用
       shell: pwsh
@@ -99,41 +99,35 @@ jobs:
           "${{ matrix.app.name }}.py"
         
         Move-Item -Path "dist/${{ matrix.app.name }}.exe" `
-          -Destination "dist/${{ matrix.app.name }}.${{ env.BUILD_NAME }}.exe" -Force
+          -Destination "dist/${{ matrix.app.name }}.${{ env.build_name }}.exe" -Force
 
     - name: 上传构建工件
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.app.name }}-build
-        path: dist/${{ matrix.app.name }}.${{ env.BUILD_NAME }}.exe
+        path: dist/${{ matrix.app.name }}.${{ env.build_name }}.exe
         retention-days: 7
 
   release:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - name: 下载所有构建工件
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: dist
-
-      - name: 移动文件到正确位置
-        shell: pwsh
-        run: |
-          Get-ChildItem -Path dist -Recurse -Filter "*.exe" | 
-          ForEach-Object {
-            Move-Item $_.FullName "dist/$($_.Name)" -Force
-          }
+          merge-multiple: true
 
       - name: 创建 Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ env.BUILD_NAME }}
-          release_name: Release ${{ env.BUILD_NAME }}
+          name: Release ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
           draft: false
           prerelease: false
-          generate_release_notes: true
-          files: |
-            dist/*.exe
+          files: dist/*.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
