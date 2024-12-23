@@ -73,6 +73,10 @@ jobs:
           --icon="chuizi.ico" `
           --add-data "chuizi.ico;." `
           --add-data "Img;Img" `
+          --hidden-import win32com.client `
+          --hidden-import win32com.client.gencache `
+          --hidden-import pythoncom `
+          --hidden-import pywintypes `
           "cg_crop.py"
           
         # 首次构建后，移动共享依赖
@@ -94,6 +98,10 @@ jobs:
           --add-data "chuizi.ico;." `
           --add-data "mapping_actor.xml;." `
           --add-data "Img;Img" `
+          --hidden-import win32com.client `
+          --hidden-import win32com.client.gencache `
+          --hidden-import pythoncom `
+          --hidden-import pywintypes `
           "NFO.Editor.Qt5.py"
         
         Move-Item -Path "dist/shared/NFO.Editor.Qt5/NFO.Editor.Qt5.exe" -Destination "dist/NFOTools/" -Force
@@ -107,6 +115,10 @@ jobs:
           --icon="chuizi.ico" `
           --add-data "chuizi.ico;." `
           --add-data "mapping_actor.xml;." `
+          --hidden-import win32com.client `
+          --hidden-import win32com.client.gencache `
+          --hidden-import pythoncom `
+          --hidden-import pywintypes `
           "cg_rename.py"
         
         Move-Item -Path "dist/shared/cg_rename/cg_rename.exe" -Destination "dist/NFOTools/" -Force
@@ -119,6 +131,10 @@ jobs:
           --noconsole `
           --icon="chuizi.ico" `
           --add-data "chuizi.ico;." `
+          --hidden-import win32com.client `
+          --hidden-import win32com.client.gencache `
+          --hidden-import pythoncom `
+          --hidden-import pywintypes `
           "cg_dedupe.py"
         
         Move-Item -Path "dist/shared/cg_dedupe/cg_dedupe.exe" -Destination "dist/NFOTools/" -Force
@@ -209,6 +225,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: 设置构建名称
         id: set_build_name
         shell: pwsh
