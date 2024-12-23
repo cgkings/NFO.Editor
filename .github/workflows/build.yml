@@ -3,8 +3,8 @@ name: Build NFO Tools
 on:
   push:
     tags:
-      - 'v*.*.*'  # 仅在创建符合格式 v*.*.* 的标签时触发
-  workflow_dispatch:  # 允许手动触发构建
+      - 'v*.*.*'
+  workflow_dispatch:
 
 env:
   PYTHONUNBUFFERED: 1
@@ -33,22 +33,22 @@ jobs:
             extra_data: ""
           }
         ]
-      fail-fast: false  # 某个应用构建失败不影响其他应用
+      fail-fast: false
 
     runs-on: windows-latest
-    timeout-minutes: 15  # 考虑到原构建时间约4分钟，设置15分钟超时
+    timeout-minutes: 15
 
     steps:
     - name: 检出代码
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # 获取完整历史用于版本号生成
+        fetch-depth: 0
 
     - name: 设置 Python 版本
       uses: actions/setup-python@v5
       with:
-        python-version: '3.12.7'  # 使用您的开发环境版本
-        cache: 'pip'  # 启用 pip 缓存
+        python-version: '3.9.13'  # 降级到更稳定的Python版本
+        cache: 'pip'
 
     - name: 缓存 PyInstaller
       uses: actions/cache@v3
@@ -61,12 +61,12 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-pyinstaller-${{ hashFiles('**/*.py') }}-
           ${{ runner.os }}-pyinstaller-
-        # 使用默认的7天缓存时间
 
     - name: 安装依赖
       run: |
         python -m pip install --upgrade pip wheel setuptools
         pip install -r requirements.txt --no-cache-dir
+        pip install pyinstaller==6.3.0  # 固定PyInstaller版本
 
     - name: 设置构建名称
       id: set_build_name
@@ -94,8 +94,7 @@ jobs:
           --icon="chuizi.ico" `
           --add-data "chuizi.ico;." `
           ${{ matrix.app.extra_data }} `
-          --noupx `
-          --strip `
+          --runtime-tmpdir "." `
           --clean `
           "${{ matrix.app.name }}.py"
         
@@ -107,7 +106,7 @@ jobs:
       with:
         name: ${{ matrix.app.name }}-build
         path: dist/${{ matrix.app.name }}.${{ env.BUILD_NAME }}.exe
-        retention-days: 7  # 设置为7天，与GitHub缓存默认时间一致
+        retention-days: 7
 
   release:
     needs: build
@@ -132,8 +131,8 @@ jobs:
           tag_name: ${{ env.BUILD_NAME }}
           release_name: Release ${{ env.BUILD_NAME }}
           draft: false
-          prerelease: false  # 正式发布
-          generate_release_notes: true  # 自动生成发布说明
+          prerelease: false
+          generate_release_notes: true
           files: |
             dist/*.exe
         env:
