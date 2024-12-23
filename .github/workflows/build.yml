@@ -55,12 +55,13 @@ jobs:
       shell: pwsh
       run: |
         # 创建共享依赖目录
-        mkdir shared_libs
+        New-Item -Path "dist/NFOTools" -ItemType Directory -Force
+        New-Item -Path "shared_libs" -ItemType Directory -Force
         
         # 构建 cg_crop
         pyinstaller --name "cg_crop" `
-          --distpath "dist/NFOTools" `
-          --workpath "build/shared" `
+          --distpath "./dist/shared" `
+          --workpath "./build/shared" `
           --onedir `
           --noconsole `
           --icon="chuizi.ico" `
@@ -68,15 +69,19 @@ jobs:
           --add-data "Img;Img" `
           "cg_crop.py"
           
-        # 移动共享依赖
-        Move-Item -Path "dist/NFOTools/cg_crop/PyQt5" -Destination "shared_libs/" -Force
-        Move-Item -Path "dist/NFOTools/cg_crop/_internal" -Destination "shared_libs/" -Force
-        Remove-Item -Path "dist/NFOTools/cg_crop" -Recurse
-
+        # 首次构建后，移动共享依赖
+        if (Test-Path "dist/shared/cg_crop/PyQt5") {
+          Move-Item -Path "dist/shared/cg_crop/PyQt5" -Destination "shared_libs/" -Force
+        }
+        if (Test-Path "dist/shared/cg_crop/_internal") {
+          Move-Item -Path "dist/shared/cg_crop/_internal" -Destination "shared_libs/" -Force
+        }
+        Move-Item -Path "dist/shared/cg_crop/cg_crop.exe" -Destination "dist/NFOTools/" -Force
+        
         # 构建 NFO.Editor.Qt5
         pyinstaller --name "NFO.Editor.Qt5" `
-          --distpath "dist/NFOTools" `
-          --workpath "build/shared" `
+          --distpath "./dist/shared" `
+          --workpath "./build/shared" `
           --onedir `
           --noconsole `
           --icon="chuizi.ico" `
@@ -84,42 +89,41 @@ jobs:
           --add-data "mapping_actor.xml;." `
           --add-data "Img;Img" `
           "NFO.Editor.Qt5.py"
-          
-        Remove-Item -Path "dist/NFOTools/NFO.Editor.Qt5/PyQt5" -Recurse -ErrorAction SilentlyContinue
-        Remove-Item -Path "dist/NFOTools/NFO.Editor.Qt5/_internal" -Recurse -ErrorAction SilentlyContinue
-        Remove-Item -Path "dist/NFOTools/NFO.Editor.Qt5" -Recurse
+        
+        Move-Item -Path "dist/shared/NFO.Editor.Qt5/NFO.Editor.Qt5.exe" -Destination "dist/NFOTools/" -Force
 
         # 构建 cg_rename
         pyinstaller --name "cg_rename" `
-          --distpath "dist/NFOTools" `
-          --workpath "build/shared" `
+          --distpath "./dist/shared" `
+          --workpath "./build/shared" `
           --onedir `
           --noconsole `
           --icon="chuizi.ico" `
           --add-data "chuizi.ico;." `
           --add-data "mapping_actor.xml;." `
           "cg_rename.py"
-          
-        Remove-Item -Path "dist/NFOTools/cg_rename/PyQt5" -Recurse -ErrorAction SilentlyContinue
-        Remove-Item -Path "dist/NFOTools/cg_rename/_internal" -Recurse -ErrorAction SilentlyContinue
-        Remove-Item -Path "dist/NFOTools/cg_rename" -Recurse
+        
+        Move-Item -Path "dist/shared/cg_rename/cg_rename.exe" -Destination "dist/NFOTools/" -Force
 
         # 构建 cg_dedupe
         pyinstaller --name "cg_dedupe" `
-          --distpath "dist/NFOTools" `
-          --workpath "build/shared" `
+          --distpath "./dist/shared" `
+          --workpath "./build/shared" `
           --onedir `
           --noconsole `
           --icon="chuizi.ico" `
           --add-data "chuizi.ico;." `
           "cg_dedupe.py"
-          
-        Remove-Item -Path "dist/NFOTools/cg_dedupe/PyQt5" -Recurse -ErrorAction SilentlyContinue
-        Remove-Item -Path "dist/NFOTools/cg_dedupe/_internal" -Recurse -ErrorAction SilentlyContinue
-        Remove-Item -Path "dist/NFOTools/cg_dedupe" -Recurse
+        
+        Move-Item -Path "dist/shared/cg_dedupe/cg_dedupe.exe" -Destination "dist/NFOTools/" -Force
 
         # 移动共享依赖到最终目录
-        Move-Item -Path "shared_libs/*" -Destination "dist/NFOTools/" -Force
+        Copy-Item -Path "shared_libs/*" -Destination "dist/NFOTools/" -Recurse -Force
+        
+        # 移动额外资源文件
+        Copy-Item -Path "Img" -Destination "dist/NFOTools/" -Recurse -Force
+        Copy-Item -Path "mapping_actor.xml" -Destination "dist/NFOTools/" -Force
+        Copy-Item -Path "chuizi.ico" -Destination "dist/NFOTools/" -Force
 
     - name: 创建 NSIS 安装脚本
       shell: pwsh
