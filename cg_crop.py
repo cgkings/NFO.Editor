@@ -343,7 +343,7 @@ class EmbyPosterCrop(QDialog):
     def __init__(self, parent=None, nfo_base_name=None):
         super().__init__(parent)
         self.nfo_base_name = nfo_base_name
-        self.setWindowTitle("大锤 EMBY海报裁剪工具 v9.5.1")
+        self.setWindowTitle("大锤 EMBY海报裁剪工具 v9.5.2")
         self.setMinimumSize(1200, 640)
 
         # 设置窗口图标

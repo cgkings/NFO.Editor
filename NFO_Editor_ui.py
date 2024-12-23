@@ -46,8 +46,12 @@ class NFOEditorQt(QMainWindow):
         self.screen_dpi = self.screen().logicalDotsPerInch()
         self.scale_factor = self.screen_dpi / 96.0
 
-        self.setWindowTitle("大锤 NFO Editor Qt v9.5.1")
+        self.setWindowTitle("大锤 NFO Editor Qt v9.5.2")
         self.resize(1280, 800)
+
+        # 初始化状态栏
+        self.status_bar = self.statusBar()
+        self.status_bar.showMessage("就绪")  # 设置默认状态信息
 
         try:
             icon_path = os.path.join(
@@ -311,7 +315,6 @@ class NFOEditorQt(QMainWindow):
 
         self.condition_combo = QComboBox()
         self.condition_combo.setFixedWidth(int(65 * self.scale_factor))
-        self.condition_combo.addItem("包含")
         grid.addWidget(self.condition_combo, 0, len(sort_options) + 2)
 
         self.filter_entry = QLineEdit()
@@ -320,18 +323,19 @@ class NFOEditorQt(QMainWindow):
 
         def on_field_changed(index):
             self.condition_combo.clear()
-            # 清空输入框
             self.filter_entry.clear()
             if self.field_combo.currentText() == "评分":
                 self.condition_combo.addItems(["大于", "小于"])
             else:
-                self.condition_combo.addItems(["包含"])
+                self.condition_combo.addItems(["包含", "不包含"])
 
         self.field_combo.currentIndexChanged.connect(on_field_changed)
-        # 条件变化时只清空输入框，用一个简单的 lambda 函数就搞定了
         self.condition_combo.currentIndexChanged.connect(
             lambda x: self.filter_entry.clear()
         )
+
+        # Initialize default conditions
+        on_field_changed(0)
 
         filter_button = QPushButton("筛选")
         filter_button.setFixedSize(

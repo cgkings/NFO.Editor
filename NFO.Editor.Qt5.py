@@ -290,7 +290,7 @@ class NFOEditorQt5(NFOEditorQt):
             key_text = event.text()
 
             # 打印调试信息，帮助排查问题
-            print(f"当前文本: {current_text}, 输入字符: {key_text}")
+            # print(f"当前文本: {current_text}, 输入字符: {key_text}")
 
             # 如果输入的是数字
             if key_text.isdigit():
@@ -381,7 +381,7 @@ class NFOEditorQt5(NFOEditorQt):
             # 更新状态栏信息
             total_folders = len(set(os.path.dirname(f) for f in self.nfo_files))
             status_msg = f"目录: {self.folder_path} (共加载 {total_folders} 个文件夹)"
-            self.statusBar().showMessage(status_msg)
+            self.status_bar.showMessage(status_msg)  # 使用 self.status_bar
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载文件失败: {str(e)}")
@@ -516,7 +516,7 @@ class NFOEditorQt5(NFOEditorQt):
                 folder_count -= 1  # 不计算返回上级目录项
 
             status_text = f"目标目录: {target_path} (共{folder_count}个文件夹)"
-            self.statusBar().showMessage(status_text)
+            self.status_bar.showMessage(status_text)  # 使用 self.status_bar
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载目标目录失败: {str(e)}")
@@ -995,6 +995,7 @@ class NFOEditorQt5(NFOEditorQt):
                 return
 
             # 遍历 NFO 文件
+            matches = []
             for nfo_file in self.nfo_files:
                 try:
                     tree = ET.parse(nfo_file)
@@ -1046,26 +1047,14 @@ class NFOEditorQt5(NFOEditorQt):
                         except ValueError:
                             continue
                     else:
-                        match = filter_text.lower() in value.lower()
+                        if condition == "包含":
+                            match = filter_text.lower() in value.lower()
+                        elif condition == "不包含":
+                            match = filter_text.lower() not in value.lower()
 
-                    # 如果匹配，添加到树中
+                    # 如果匹配，添加到匹配列表
                     if match:
-                        relative_path = os.path.relpath(nfo_file, self.folder_path)
-                        parts = relative_path.split(os.sep)
-
-                        if len(parts) > 1:
-                            first_level = (
-                                os.sep.join(parts[:-2]) if len(parts) > 2 else ""
-                            )
-                            second_level = parts[-2]
-                            nfo_name = parts[-1]
-                        else:
-                            first_level = ""
-                            second_level = ""
-                            nfo_name = parts[-1]
-
-                        item = QTreeWidgetItem([first_level, second_level, nfo_name])
-                        self.file_tree.addTopLevelItem(item)
+                        matches.append(nfo_file)
 
                 except ET.ParseError:
                     print(f"解析文件失败: {nfo_file}")
@@ -1074,12 +1063,29 @@ class NFOEditorQt5(NFOEditorQt):
                     print(f"处理文件出错 {nfo_file}: {str(e)}")
                     continue
 
+            # 添加匹配的文件到树中
+            for nfo_file in matches:
+                relative_path = os.path.relpath(nfo_file, self.folder_path)
+                parts = relative_path.split(os.sep)
+
+                if len(parts) > 1:
+                    first_level = os.sep.join(parts[:-2]) if len(parts) > 2 else ""
+                    second_level = parts[-2]
+                    nfo_name = parts[-1]
+                else:
+                    first_level = ""
+                    second_level = ""
+                    nfo_name = parts[-1]
+
+                item = QTreeWidgetItem([first_level, second_level, nfo_name])
+                self.file_tree.addTopLevelItem(item)
+
             # 更新状态栏信息
-            matched_count = self.file_tree.topLevelItemCount()
+            matched_count = len(matches)
             total_count = len(self.nfo_files)
-            self.statusBar().showMessage(
+            self.status_bar.showMessage(
                 f"筛选结果: 匹配 {matched_count} / 总计 {total_count}"
-            )
+            )  # 使用 self.status_bar
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"筛选过程出错: {str(e)}")
@@ -1316,46 +1322,46 @@ class NFOEditorQt5(NFOEditorQt):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"启动重命名工具时出错: {str(e)}")
 
-    def on_file_select(self):
-        """文件选择回调"""
-        selected_items = self.file_tree.selectedItems()
-        if not selected_items:
-            return
+    # def on_file_select(self):
+    #     """文件选择回调"""
+    #     selected_items = self.file_tree.selectedItems()
+    #     if not selected_items:
+    #         return
 
-        # 检查是否有未保存的更改
-        if self.current_file_path and self.has_unsaved_changes():
-            reply = QMessageBox.question(
-                self,
-                "保存更改",
-                "当前有未保存的更改，是否保存?",
-                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-            )
+    #     # 检查是否有未保存的更改
+    #     if self.current_file_path and self.has_unsaved_changes():
+    #         reply = QMessageBox.question(
+    #             self,
+    #             "保存更改",
+    #             "当前有未保存的更改，是否保存?",
+    #             QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+    #         )
 
-            if reply == QMessageBox.Cancel:
-                return
-            elif reply == QMessageBox.Yes:
-                self.save_changes()
+    #         if reply == QMessageBox.Cancel:
+    #             return
+    #         elif reply == QMessageBox.Yes:
+    #             self.save_changes()
 
-        # 处理新选中的文件
-        item = selected_items[0]
-        values = [item.text(i) for i in range(3)]
+    #     # 处理新选中的文件
+    #     item = selected_items[0]
+    #     values = [item.text(i) for i in range(3)]
 
-        if values[2]:  # 如果有NFO文件名
-            self.current_file_path = (
-                os.path.join(self.folder_path, values[0], values[1], values[2])
-                if values[1]
-                else os.path.join(self.folder_path, values[0], values[2])
-            )
+    #     if values[2]:  # 如果有NFO文件名
+    #         self.current_file_path = (
+    #             os.path.join(self.folder_path, values[0], values[1], values[2])
+    #             if values[1]
+    #             else os.path.join(self.folder_path, values[0], values[2])
+    #         )
 
-            if not os.path.exists(self.current_file_path):
-                self.file_tree.takeTopLevelItem(
-                    self.file_tree.indexOfTopLevelItem(item)
-                )
-                return
+    #         if not os.path.exists(self.current_file_path):
+    #             self.file_tree.takeTopLevelItem(
+    #                 self.file_tree.indexOfTopLevelItem(item)
+    #             )
+    #             return
 
-            self.load_nfo_fields()
-            if self.show_images_checkbox.isChecked():
-                self.display_image()
+    #         self.load_nfo_fields()
+    #         if self.show_images_checkbox.isChecked():
+    #             self.display_image()
 
     def on_file_double_click(self, item, column):
         """双击文件列表项处理"""
@@ -1527,9 +1533,11 @@ class NFOEditorQt5(NFOEditorQt):
 
 
 def main():
-    # 设置高DPI支持
-    QApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
-    QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
+    # 在创建 QApplication 之前设置高DPI属性
+    if hasattr(Qt, "AA_EnableHighDpiScaling"):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
+    if hasattr(Qt, "AA_UseHighDpiPixmaps"):
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
