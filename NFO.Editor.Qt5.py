@@ -122,6 +122,10 @@ class FileOperationThread(QThread):
 class NFOEditorQt5(NFOEditorQt):
     def __init__(self):
         super().__init__()
+        # 设置合理的窗口大小和限制
+        self.setMinimumSize(953, 782)  # 设置最小尺寸
+        self.resize(1280, 900)  # 设置初始大小
+
         # 成员变量初始化
         self.current_file_path = None
         self.folder_path = None
@@ -1089,6 +1093,7 @@ class NFOEditorQt5(NFOEditorQt):
             QLineEdit,
             QPushButton,
             QTextEdit,
+            QLabel,  # 添加 QLabel 导入
         )
 
         dialog = QDialog(self)
@@ -1096,15 +1101,16 @@ class NFOEditorQt5(NFOEditorQt):
         dialog.resize(400, 600)
 
         layout = QVBoxLayout()
+        dialog.setLayout(layout)  # 将layout设置为dialog的布局
 
         # 字段选择
         layout.addWidget(QLabel("选择填充替换字段:"))
-        field_var = None
+        field_buttons = []  # 创建一个列表来存储单选按钮
         for field in ["series", "rating"]:
             rb = QRadioButton(field)
-            if field_var is None:
-                field_var = rb
+            if not field_buttons:  # 如果是第一个按钮
                 rb.setChecked(True)
+            field_buttons.append(rb)
             layout.addWidget(rb)
 
         # 填充值输入
@@ -1117,17 +1123,23 @@ class NFOEditorQt5(NFOEditorQt):
         layout.addWidget(log_text)
 
         def apply_fill():
-            field = [rb for rb in dialog.findChildren(QRadioButton) if rb.isChecked()][
-                0
-            ].text()
-            fill_value = value_entry.text().strip()
+            # 获取选中的字段
+            field = None
+            for rb in field_buttons:
+                if rb.isChecked():
+                    field = rb.text()
+                    break
 
+            if not field:
+                return
+
+            fill_value = value_entry.text().strip()
             if not fill_value:
                 return
 
             selected_items = self.file_tree.selectedItems()
             if not selected_items:
-                QMessageBox.warning(self, "警告", "请先选择要填充的文件")
+                QMessageBox.warning(dialog, "警告", "请先选择要填充的文件")
                 return
 
             operation_log = []
@@ -1152,7 +1164,6 @@ class NFOEditorQt5(NFOEditorQt):
                     xml_str = ET.tostring(root, encoding="utf-8")
                     parsed_str = minidom.parseString(xml_str)
                     pretty_str = parsed_str.toprettyxml(indent="  ", encoding="utf-8")
-
                     pretty_str = "\n".join(
                         line
                         for line in pretty_str.decode("utf-8").split("\n")
@@ -1168,12 +1179,14 @@ class NFOEditorQt5(NFOEditorQt):
                     operation_log.append(f"{nfo_path}: {field}字段填充失败 - {str(e)}")
 
             log_text.setText("\n".join(operation_log))
+            # 刷新显示
+            if self.current_file_path:
+                self.load_nfo_fields()
 
         apply_button = QPushButton("应用填充")
         apply_button.clicked.connect(apply_fill)
         layout.addWidget(apply_button)
 
-        dialog.setLayout(layout)
         dialog.exec_()
 
     def batch_add(self):
@@ -1185,6 +1198,7 @@ class NFOEditorQt5(NFOEditorQt):
             QLineEdit,
             QPushButton,
             QTextEdit,
+            QLabel,  # 添加 QLabel 导入
         )
 
         dialog = QDialog(self)
@@ -1192,15 +1206,16 @@ class NFOEditorQt5(NFOEditorQt):
         dialog.resize(400, 600)
 
         layout = QVBoxLayout()
+        dialog.setLayout(layout)  # 将layout设置为dialog的布局
 
         # 字段选择
         layout.addWidget(QLabel("选择字段新增一个值:"))
-        field_var = None
+        field_buttons = []  # 创建一个列表来存储单选按钮
         for field in ["tag", "genre"]:
             rb = QRadioButton(field)
-            if field_var is None:
-                field_var = rb
+            if not field_buttons:  # 如果是第一个按钮
                 rb.setChecked(True)
+            field_buttons.append(rb)
             layout.addWidget(rb)
 
         # 新增值输入
@@ -1213,17 +1228,23 @@ class NFOEditorQt5(NFOEditorQt):
         layout.addWidget(log_text)
 
         def apply_add():
-            field = [rb for rb in dialog.findChildren(QRadioButton) if rb.isChecked()][
-                0
-            ].text()
-            add_value = value_entry.text().strip()
+            # 获取选中的字段
+            field = None
+            for rb in field_buttons:
+                if rb.isChecked():
+                    field = rb.text()
+                    break
 
+            if not field:
+                return
+
+            add_value = value_entry.text().strip()
             if not add_value:
                 return
 
             selected_items = self.file_tree.selectedItems()
             if not selected_items:
-                QMessageBox.warning(self, "警告", "请先选择要新增的文件")
+                QMessageBox.warning(dialog, "警告", "请先选择要新增的文件")
                 return
 
             operation_log = []
@@ -1246,7 +1267,6 @@ class NFOEditorQt5(NFOEditorQt):
                     xml_str = ET.tostring(root, encoding="utf-8")
                     parsed_str = minidom.parseString(xml_str)
                     pretty_str = parsed_str.toprettyxml(indent="  ", encoding="utf-8")
-
                     pretty_str = "\n".join(
                         line
                         for line in pretty_str.decode("utf-8").split("\n")
@@ -1262,12 +1282,14 @@ class NFOEditorQt5(NFOEditorQt):
                     operation_log.append(f"{nfo_path}: {field}字段新增失败 - {str(e)}")
 
             log_text.setText("\n".join(operation_log))
+            # 刷新显示
+            if self.current_file_path:
+                self.load_nfo_fields()
 
         apply_button = QPushButton("应用新增")
         apply_button.clicked.connect(apply_add)
         layout.addWidget(apply_button)
 
-        dialog.setLayout(layout)
         dialog.exec_()
 
     def open_batch_rename_tool(self):
