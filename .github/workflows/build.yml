@@ -13,7 +13,7 @@ env:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
@@ -21,6 +21,18 @@ jobs:
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
+
+    - name: 安装系统依赖
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y wine64 nsis
+        sudo apt-get install -y mingw-w64 gcc-mingw-w64
+
+    - name: 设置 Wine 环境
+      run: |
+        export WINEARCH=win64
+        export WINEPREFIX=$HOME/.wine
+        winecfg
 
     - name: 设置 Python 版本
       uses: actions/setup-python@v5
@@ -36,99 +48,96 @@ jobs:
 
     - name: 设置构建名称
       id: set_build_name
-      shell: pwsh
+      shell: bash
       run: |
-        if ($env:GITHUB_EVENT_NAME -eq "push" -and $env:GITHUB_REF -match '^refs/tags/v.*') {
-          $BUILD_NAME = $env:GITHUB_REF.Substring(10)
-        } else {
-          git fetch --tags
-          $latestTag = git describe --tags $(git rev-list --tags --max-count=1)
-          if ($null -eq $latestTag) {
-            Write-Error "未找到任何标签，无法继续。"
-            exit 1
-          }
-          $BUILD_NAME = $latestTag
-        }
-        echo "build_name=$BUILD_NAME" | Out-File -FilePath $env:GITHUB_ENV -Append
+        if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" =~ ^refs/tags/v.*$ ]]; then
+          BUILD_NAME=${GITHUB_REF#refs/tags/}
+        else
+          BUILD_NAME=$(git describe --tags $(git rev-list --tags --max-count=1))
+        fi
+        echo "build_name=$BUILD_NAME" >> $GITHUB_ENV
 
     - name: 构建应用
-      shell: pwsh
+      shell: bash
       run: |
-        # 创建共享依赖目录
-        New-Item -Path "dist/NFOTools" -ItemType Directory -Force
-        New-Item -Path "shared_libs" -ItemType Directory -Force
+        # 创建目录
+        mkdir -p dist/NFOTools dist/shared shared_libs
+        
+        # Windows Python 路径设置
+        export PYTHON_EMBED_ROOT=/usr/lib/python3.9
         
         # 构建 cg_crop
-        pyinstaller --name "cg_crop" `
-          --distpath "./dist/shared" `
-          --workpath "./build/shared" `
-          --onedir `
-          --noconsole `
-          --icon="chuizi.ico" `
-          --add-data "chuizi.ico;." `
-          --add-data "Img;Img" `
+        pyinstaller --name "cg_crop" \
+          --distpath "./dist/shared" \
+          --workpath "./build/shared" \
+          --onedir \
+          --noconsole \
+          --icon="chuizi.ico" \
+          --add-data "chuizi.ico:." \
+          --add-data "Img:Img" \
+          --target-arch win64 \
           "cg_crop.py"
-          
-        # 首次构建后，移动共享依赖
-        if (Test-Path "dist/shared/cg_crop/PyQt5") {
-          Move-Item -Path "dist/shared/cg_crop/PyQt5" -Destination "shared_libs/" -Force
-        }
-        if (Test-Path "dist/shared/cg_crop/_internal") {
-          Move-Item -Path "dist/shared/cg_crop/_internal" -Destination "shared_libs/" -Force
-        }
-        Move-Item -Path "dist/shared/cg_crop/cg_crop.exe" -Destination "dist/NFOTools/" -Force
+        
+        # 第一次构建后保存共享依赖
+        if [ -d "dist/shared/cg_crop/PyQt5" ]; then
+          cp -r dist/shared/cg_crop/PyQt5 shared_libs/
+        fi
+        if [ -d "dist/shared/cg_crop/_internal" ]; then
+          cp -r dist/shared/cg_crop/_internal shared_libs/
+        fi
+        cp dist/shared/cg_crop/cg_crop.exe dist/NFOTools/
         
         # 构建 NFO.Editor.Qt5
-        pyinstaller --name "NFO.Editor.Qt5" `
-          --distpath "./dist/shared" `
-          --workpath "./build/shared" `
-          --onedir `
-          --noconsole `
-          --icon="chuizi.ico" `
-          --add-data "chuizi.ico;." `
-          --add-data "mapping_actor.xml;." `
-          --add-data "Img;Img" `
+        pyinstaller --name "NFO.Editor.Qt5" \
+          --distpath "./dist/shared" \
+          --workpath "./build/shared" \
+          --onedir \
+          --noconsole \
+          --icon="chuizi.ico" \
+          --add-data "chuizi.ico:." \
+          --add-data "mapping_actor.xml:." \
+          --add-data "Img:Img" \
+          --target-arch win64 \
           "NFO.Editor.Qt5.py"
         
-        Move-Item -Path "dist/shared/NFO.Editor.Qt5/NFO.Editor.Qt5.exe" -Destination "dist/NFOTools/" -Force
-
+        cp dist/shared/NFO.Editor.Qt5/NFO.Editor.Qt5.exe dist/NFOTools/
+        
         # 构建 cg_rename
-        pyinstaller --name "cg_rename" `
-          --distpath "./dist/shared" `
-          --workpath "./build/shared" `
-          --onedir `
-          --noconsole `
-          --icon="chuizi.ico" `
-          --add-data "chuizi.ico;." `
-          --add-data "mapping_actor.xml;." `
+        pyinstaller --name "cg_rename" \
+          --distpath "./dist/shared" \
+          --workpath "./build/shared" \
+          --onedir \
+          --noconsole \
+          --icon="chuizi.ico" \
+          --add-data "chuizi.ico:." \
+          --add-data "mapping_actor.xml:." \
+          --target-arch win64 \
           "cg_rename.py"
         
-        Move-Item -Path "dist/shared/cg_rename/cg_rename.exe" -Destination "dist/NFOTools/" -Force
-
+        cp dist/shared/cg_rename/cg_rename.exe dist/NFOTools/
+        
         # 构建 cg_dedupe
-        pyinstaller --name "cg_dedupe" `
-          --distpath "./dist/shared" `
-          --workpath "./build/shared" `
-          --onedir `
-          --noconsole `
-          --icon="chuizi.ico" `
-          --add-data "chuizi.ico;." `
+        pyinstaller --name "cg_dedupe" \
+          --distpath "./dist/shared" \
+          --workpath "./build/shared" \
+          --onedir \
+          --noconsole \
+          --icon="chuizi.ico" \
+          --add-data "chuizi.ico:." \
+          --target-arch win64 \
           "cg_dedupe.py"
         
-        Move-Item -Path "dist/shared/cg_dedupe/cg_dedupe.exe" -Destination "dist/NFOTools/" -Force
-
-        # 移动共享依赖到最终目录
-        Copy-Item -Path "shared_libs/*" -Destination "dist/NFOTools/" -Recurse -Force
+        cp dist/shared/cg_dedupe/cg_dedupe.exe dist/NFOTools/
         
-        # 移动额外资源文件
-        Copy-Item -Path "Img" -Destination "dist/NFOTools/" -Recurse -Force
-        Copy-Item -Path "mapping_actor.xml" -Destination "dist/NFOTools/" -Force
-        Copy-Item -Path "chuizi.ico" -Destination "dist/NFOTools/" -Force
+        # 复制共享依赖和资源到最终目录
+        cp -r shared_libs/* dist/NFOTools/
+        cp -r Img dist/NFOTools/
+        cp mapping_actor.xml dist/NFOTools/
+        cp chuizi.ico dist/NFOTools/
 
     - name: 创建 NSIS 安装脚本
-      shell: pwsh
       run: |
-        @'
+        cat > installer.nsi << 'EOL'
         !include "MUI2.nsh"
         !define PRODUCT_NAME "NFO Tools"
         !define PRODUCT_VERSION "${{ env.build_name }}"
@@ -151,7 +160,6 @@ jobs:
           SetOutPath "$INSTDIR"
           SetOverwrite ifnewer
           
-          ; 复制所有文件和文件夹
           File /r "dist\NFOTools\*.*"
           
           CreateDirectory "$SMPROGRAMS\NFO Tools"
@@ -181,15 +189,10 @@ jobs:
           RMDir /r "$INSTDIR"
           RMDir "$SMPROGRAMS\NFO Tools"
         SectionEnd
-        '@ | Out-File -FilePath "installer.nsi" -Encoding utf8
-
-    - name: 安装 NSIS
-      run: |
-        choco install nsis -y
+        EOL
 
     - name: 构建安装程序
-      run: |
-        makensis installer.nsi
+      run: makensis installer.nsi
 
     - name: 上传构建工件
       uses: actions/upload-artifact@v4
@@ -200,7 +203,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
