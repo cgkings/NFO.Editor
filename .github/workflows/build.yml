@@ -51,52 +51,75 @@ jobs:
         }
         echo "build_name=$BUILD_NAME" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-    - name: 构建所有应用
+    - name: 构建应用
       shell: pwsh
       run: |
-        # cg_crop
+        # 创建共享依赖目录
+        mkdir shared_libs
+        
+        # 构建 cg_crop
         pyinstaller --name "cg_crop" `
-          --onefile `
+          --distpath "dist/NFOTools" `
+          --workpath "build/shared" `
+          --onedir `
           --noconsole `
           --icon="chuizi.ico" `
           --add-data "chuizi.ico;." `
           --add-data "Img;Img" `
-          --runtime-tmpdir "%TEMP%" `
-          --clean `
           "cg_crop.py"
+          
+        # 移动共享依赖
+        Move-Item -Path "dist/NFOTools/cg_crop/PyQt5" -Destination "shared_libs/" -Force
+        Move-Item -Path "dist/NFOTools/cg_crop/_internal" -Destination "shared_libs/" -Force
+        Remove-Item -Path "dist/NFOTools/cg_crop" -Recurse
 
-        # NFO.Editor.Qt5
+        # 构建 NFO.Editor.Qt5
         pyinstaller --name "NFO.Editor.Qt5" `
-          --onefile `
+          --distpath "dist/NFOTools" `
+          --workpath "build/shared" `
+          --onedir `
           --noconsole `
           --icon="chuizi.ico" `
           --add-data "chuizi.ico;." `
           --add-data "mapping_actor.xml;." `
           --add-data "Img;Img" `
-          --runtime-tmpdir "%TEMP%" `
-          --clean `
           "NFO.Editor.Qt5.py"
+          
+        Remove-Item -Path "dist/NFOTools/NFO.Editor.Qt5/PyQt5" -Recurse -ErrorAction SilentlyContinue
+        Remove-Item -Path "dist/NFOTools/NFO.Editor.Qt5/_internal" -Recurse -ErrorAction SilentlyContinue
+        Remove-Item -Path "dist/NFOTools/NFO.Editor.Qt5" -Recurse
 
-        # cg_rename
+        # 构建 cg_rename
         pyinstaller --name "cg_rename" `
-          --onefile `
+          --distpath "dist/NFOTools" `
+          --workpath "build/shared" `
+          --onedir `
           --noconsole `
           --icon="chuizi.ico" `
           --add-data "chuizi.ico;." `
           --add-data "mapping_actor.xml;." `
-          --runtime-tmpdir "%TEMP%" `
-          --clean `
           "cg_rename.py"
+          
+        Remove-Item -Path "dist/NFOTools/cg_rename/PyQt5" -Recurse -ErrorAction SilentlyContinue
+        Remove-Item -Path "dist/NFOTools/cg_rename/_internal" -Recurse -ErrorAction SilentlyContinue
+        Remove-Item -Path "dist/NFOTools/cg_rename" -Recurse
 
-        # cg_dedupe
+        # 构建 cg_dedupe
         pyinstaller --name "cg_dedupe" `
-          --onefile `
+          --distpath "dist/NFOTools" `
+          --workpath "build/shared" `
+          --onedir `
           --noconsole `
           --icon="chuizi.ico" `
           --add-data "chuizi.ico;." `
-          --runtime-tmpdir "%TEMP%" `
-          --clean `
           "cg_dedupe.py"
+          
+        Remove-Item -Path "dist/NFOTools/cg_dedupe/PyQt5" -Recurse -ErrorAction SilentlyContinue
+        Remove-Item -Path "dist/NFOTools/cg_dedupe/_internal" -Recurse -ErrorAction SilentlyContinue
+        Remove-Item -Path "dist/NFOTools/cg_dedupe" -Recurse
+
+        # 移动共享依赖到最终目录
+        Move-Item -Path "shared_libs/*" -Destination "dist/NFOTools/" -Force
 
     - name: 创建 NSIS 安装脚本
       shell: pwsh
@@ -124,11 +147,8 @@ jobs:
           SetOutPath "$INSTDIR"
           SetOverwrite ifnewer
           
-          File "dist\cg_crop.exe"
-          File "dist\NFO.Editor.Qt5.exe"
-          File "dist\cg_rename.exe"
-          File "dist\cg_dedupe.exe"
-          File "chuizi.ico"
+          ; 复制所有文件和文件夹
+          File /r "dist\NFOTools\*.*"
           
           CreateDirectory "$SMPROGRAMS\NFO Tools"
           CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Editor.lnk" "$INSTDIR\NFO.Editor.Qt5.exe"
@@ -137,7 +157,6 @@ jobs:
           CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Dedupe.lnk" "$INSTDIR\cg_dedupe.exe"
           
           WriteUninstaller "$INSTDIR\uninstall.exe"
-          
           CreateShortCut "$SMPROGRAMS\NFO Tools\Uninstall.lnk" "$INSTDIR\uninstall.exe"
         SectionEnd
         
@@ -155,8 +174,8 @@ jobs:
           Delete "$SMPROGRAMS\NFO Tools\NFO Dedupe.lnk"
           Delete "$SMPROGRAMS\NFO Tools\Uninstall.lnk"
           
+          RMDir /r "$INSTDIR"
           RMDir "$SMPROGRAMS\NFO Tools"
-          RMDir "$INSTDIR"
         SectionEnd
         '@ | Out-File -FilePath "installer.nsi" -Encoding utf8
 
@@ -194,6 +213,7 @@ jobs:
           git push origin ${{ env.build_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: 下载安装程序
         uses: actions/download-artifact@v4
         with:
