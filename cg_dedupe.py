@@ -533,16 +533,39 @@ class NfoDuplicateOperations:
 
     def display_duplicates(self, duplicates):
         self.ui.result_list.setRowCount(0)
+        first_directory = (
+            self.ui.selected_directories[0] if self.ui.selected_directories else None
+        )
+
         for field_value, paths in duplicates.items():
-            for path in paths:
+            # 对路径进行排序，优先显示第一个文件夹内的文件
+            sorted_paths = sorted(
+                paths,
+                key=lambda x: (
+                    0 if first_directory and x.startswith(first_directory) else 1,
+                    x,
+                ),
+            )
+
+            for path in sorted_paths:
                 row_position = self.ui.result_list.rowCount()
                 self.ui.result_list.insertRow(row_position)
-                self.ui.result_list.setItem(
-                    row_position, 0, QtWidgets.QTableWidgetItem(field_value)
-                )
-                self.ui.result_list.setItem(
-                    row_position, 1, QtWidgets.QTableWidgetItem(path)
-                )
+
+                # 添加字段值
+                field_item = QtWidgets.QTableWidgetItem(field_value)
+
+                # 如果是第一个文件夹的文件，设置背景色以突出显示
+                if first_directory and path.startswith(first_directory):
+                    field_item.setBackground(QtGui.QColor("#e6f3ff"))  # 浅蓝色背景
+
+                self.ui.result_list.setItem(row_position, 0, field_item)
+
+                # 添加路径
+                path_item = QtWidgets.QTableWidgetItem(path)
+                if first_directory and path.startswith(first_directory):
+                    path_item.setBackground(QtGui.QColor("#e6f3ff"))
+
+                self.ui.result_list.setItem(row_position, 1, path_item)
 
         if self.ui.result_list.rowCount() == 0:
             QtWidgets.QMessageBox.information(self.ui, "结果", "未找到重复项。")
