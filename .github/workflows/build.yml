@@ -13,7 +13,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     timeout-minutes: 15
 
     steps:
@@ -22,23 +22,22 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: 安装系统依赖
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y wine64 nsis
-        sudo apt-get install -y mingw-w64 gcc-mingw-w64
-
-    - name: 设置 Wine 环境
-      run: |
-        export WINEARCH=win64
-        export WINEPREFIX=$HOME/.wine
-        winecfg
-
     - name: 设置 Python 版本
       uses: actions/setup-python@v5
       with:
         python-version: '3.9.13'
         cache: 'pip'
+        check-latest: false # 加快启动速度
+
+    - name: 缓存PyInstaller工作目录
+      uses: actions/cache@v4
+      with:
+        path: |
+          build
+          dist/shared
+        key: ${{ runner.os }}-pyinstaller-${{ hashFiles('*.py', 'requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pyinstaller-
 
     - name: 安装依赖
       run: |
@@ -48,96 +47,94 @@ jobs:
 
     - name: 设置构建名称
       id: set_build_name
-      shell: bash
+      shell: pwsh
       run: |
-        if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" =~ ^refs/tags/v.*$ ]]; then
-          BUILD_NAME=${GITHUB_REF#refs/tags/}
-        else
-          BUILD_NAME=$(git describe --tags $(git rev-list --tags --max-count=1))
-        fi
-        echo "build_name=$BUILD_NAME" >> $GITHUB_ENV
+        git fetch --tags
+        $latestTag = git describe --tags $(git rev-list --tags --max-count=1)
+        if ($null -eq $latestTag) {
+          Write-Error "未找到任何标签，无法继续。"
+          exit 1
+        }
+        echo "build_name=$latestTag" | Out-File -FilePath $env:GITHUB_ENV -Append
 
     - name: 构建应用
-      shell: bash
+      shell: pwsh
       run: |
         # 创建目录
-        mkdir -p dist/NFOTools dist/shared shared_libs
-        
-        # Windows Python 路径设置
-        export PYTHON_EMBED_ROOT=/usr/lib/python3.9
+        New-Item -Path "dist/NFOTools" -ItemType Directory -Force
+        New-Item -Path "shared_libs" -ItemType Directory -Force
         
         # 构建 cg_crop
-        pyinstaller --name "cg_crop" \
-          --distpath "./dist/shared" \
-          --workpath "./build/shared" \
-          --onedir \
-          --noconsole \
-          --icon="chuizi.ico" \
-          --add-data "chuizi.ico:." \
-          --add-data "Img:Img" \
-          --target-arch win64 \
+        pyinstaller --name "cg_crop" `
+          --distpath "./dist/shared" `
+          --workpath "./build/shared" `
+          --onedir `
+          --noconsole `
+          --icon="chuizi.ico" `
+          --add-data "chuizi.ico;." `
+          --add-data "Img;Img" `
           "cg_crop.py"
-        
-        # 第一次构建后保存共享依赖
-        if [ -d "dist/shared/cg_crop/PyQt5" ]; then
-          cp -r dist/shared/cg_crop/PyQt5 shared_libs/
-        fi
-        if [ -d "dist/shared/cg_crop/_internal" ]; then
-          cp -r dist/shared/cg_crop/_internal shared_libs/
-        fi
-        cp dist/shared/cg_crop/cg_crop.exe dist/NFOTools/
+          
+        # 首次构建后，移动共享依赖
+        if (Test-Path "dist/shared/cg_crop/PyQt5") {
+          Move-Item -Path "dist/shared/cg_crop/PyQt5" -Destination "shared_libs/" -Force
+        }
+        if (Test-Path "dist/shared/cg_crop/_internal") {
+          Move-Item -Path "dist/shared/cg_crop/_internal" -Destination "shared_libs/" -Force
+        }
+        Move-Item -Path "dist/shared/cg_crop/cg_crop.exe" -Destination "dist/NFOTools/" -Force
         
         # 构建 NFO.Editor.Qt5
-        pyinstaller --name "NFO.Editor.Qt5" \
-          --distpath "./dist/shared" \
-          --workpath "./build/shared" \
-          --onedir \
-          --noconsole \
-          --icon="chuizi.ico" \
-          --add-data "chuizi.ico:." \
-          --add-data "mapping_actor.xml:." \
-          --add-data "Img:Img" \
-          --target-arch win64 \
+        pyinstaller --name "NFO.Editor.Qt5" `
+          --distpath "./dist/shared" `
+          --workpath "./build/shared" `
+          --onedir `
+          --noconsole `
+          --icon="chuizi.ico" `
+          --add-data "chuizi.ico;." `
+          --add-data "mapping_actor.xml;." `
+          --add-data "Img;Img" `
           "NFO.Editor.Qt5.py"
         
-        cp dist/shared/NFO.Editor.Qt5/NFO.Editor.Qt5.exe dist/NFOTools/
-        
+        Move-Item -Path "dist/shared/NFO.Editor.Qt5/NFO.Editor.Qt5.exe" -Destination "dist/NFOTools/" -Force
+
         # 构建 cg_rename
-        pyinstaller --name "cg_rename" \
-          --distpath "./dist/shared" \
-          --workpath "./build/shared" \
-          --onedir \
-          --noconsole \
-          --icon="chuizi.ico" \
-          --add-data "chuizi.ico:." \
-          --add-data "mapping_actor.xml:." \
-          --target-arch win64 \
+        pyinstaller --name "cg_rename" `
+          --distpath "./dist/shared" `
+          --workpath "./build/shared" `
+          --onedir `
+          --noconsole `
+          --icon="chuizi.ico" `
+          --add-data "chuizi.ico;." `
+          --add-data "mapping_actor.xml;." `
           "cg_rename.py"
         
-        cp dist/shared/cg_rename/cg_rename.exe dist/NFOTools/
-        
+        Move-Item -Path "dist/shared/cg_rename/cg_rename.exe" -Destination "dist/NFOTools/" -Force
+
         # 构建 cg_dedupe
-        pyinstaller --name "cg_dedupe" \
-          --distpath "./dist/shared" \
-          --workpath "./build/shared" \
-          --onedir \
-          --noconsole \
-          --icon="chuizi.ico" \
-          --add-data "chuizi.ico:." \
-          --target-arch win64 \
+        pyinstaller --name "cg_dedupe" `
+          --distpath "./dist/shared" `
+          --workpath "./build/shared" `
+          --onedir `
+          --noconsole `
+          --icon="chuizi.ico" `
+          --add-data "chuizi.ico;." `
           "cg_dedupe.py"
         
-        cp dist/shared/cg_dedupe/cg_dedupe.exe dist/NFOTools/
+        Move-Item -Path "dist/shared/cg_dedupe/cg_dedupe.exe" -Destination "dist/NFOTools/" -Force
+
+        # 移动共享依赖到最终目录
+        Copy-Item -Path "shared_libs/*" -Destination "dist/NFOTools/" -Recurse -Force
         
-        # 复制共享依赖和资源到最终目录
-        cp -r shared_libs/* dist/NFOTools/
-        cp -r Img dist/NFOTools/
-        cp mapping_actor.xml dist/NFOTools/
-        cp chuizi.ico dist/NFOTools/
+        # 移动额外资源文件
+        Copy-Item -Path "Img" -Destination "dist/NFOTools/" -Recurse -Force
+        Copy-Item -Path "mapping_actor.xml" -Destination "dist/NFOTools/" -Force
+        Copy-Item -Path "chuizi.ico" -Destination "dist/NFOTools/" -Force
 
     - name: 创建 NSIS 安装脚本
+      shell: pwsh
       run: |
-        cat > installer.nsi << 'EOL'
+        @'
         !include "MUI2.nsh"
         !define PRODUCT_NAME "NFO Tools"
         !define PRODUCT_VERSION "${{ env.build_name }}"
@@ -189,10 +186,15 @@ jobs:
           RMDir /r "$INSTDIR"
           RMDir "$SMPROGRAMS\NFO Tools"
         SectionEnd
-        EOL
+        '@ | Out-File -FilePath "installer.nsi" -Encoding utf8
+
+    - name: 安装 NSIS
+      run: |
+        choco install nsis -y --no-progress # 添加 --no-progress 加快安装
 
     - name: 构建安装程序
-      run: makensis installer.nsi
+      run: |
+        makensis installer.nsi
 
     - name: 上传构建工件
       uses: actions/upload-artifact@v4
@@ -203,23 +205,21 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        if: github.event_name == 'workflow_dispatch'
-
-      - name: Create Tag
-        if: github.event_name == 'workflow_dispatch'
+      - name: 设置构建名称
+        id: set_build_name
+        shell: pwsh
         run: |
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-          git tag ${{ env.build_name }}
-          git push origin ${{ env.build_name }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          git fetch --tags
+          $latestTag = git describe --tags $(git rev-list --tags --max-count=1)
+          if ($null -eq $latestTag) {
+            Write-Error "未找到任何标签，无法继续。"
+            exit 1
+          }
+          echo "build_name=$latestTag" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: 下载安装程序
         uses: actions/download-artifact@v4
