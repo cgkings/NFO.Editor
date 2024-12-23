@@ -1,337 +1,776 @@
+- name: 构建应用
+shell: pwsh
+run: |
+  # ... (前面的清理和创建目录代码保持不变)
+  
+  # 构建 cg_crop
+  Write-Host "开始构建 cg_crop..."
+  pyinstaller --name "cg_crop" `
+    --distpath "./dist/shared" `
+    --workpath "./build/shared" `
+    --onedir `
+    --noconsole `
+    --icon="chuizi.ico" `
+    --add-data "chuizi.ico;." `
+    --add-data "Img;Img" `
+    --hidden-import win32com.client `
+    --hidden-import win32com.client.gencache `
+    --hidden-import pythoncom `
+    --hidden-import pywintypes `
+    --hidden-import PIL._imaging `
+    -y `
+    "cg_crop.py"
+  
+  # ... (中间的移动文件代码保持不变)
+  
+  # 构建 NFO.Editor.Qt5
+  Write-Host "开始构建 NFO.Editor.Qt5..."
+  pyinstaller --name "NFO.Editor.Qt5" `
+    --distpath "./dist/shared" `
+    --workpath "./build/shared" `
+    --onedir `
+    --noconsole `
+    --icon="chuizi.ico" `
+    --add-data "chuizi.ico;." `
+    --add-data "mapping_actor.xml;." `
+    --add-data "Img;Img" `
+    --hidden-import win32com.client `
+    --hidden-import win32com.client.gencache `
+    --hidden-import pythoncom `
+    --hidden-import pywintypes `
+    --hidden-import PIL._imaging `
+    --hidden-import PIL._imagingft `
+    --hidden-import PIL._imagingmath `
+    --hidden-import PIL._imagingtk `
+    --hidden-import PIL._webp `
+    --hidden-import PIL.ImageQt `
+    -y `
+    "NFO.Editor.Qt5.py"
+  
+  # ... (其他构建命令也需要添加相同的 PIL 相关隐藏导入)
+另外，可以在安装依赖时确保正确安装 Pillow：
+
+- name: 安装依赖
+run: |
+  python -m pip install --upgrade pip wheel setuptools
+  pip install pillow --no-cache-dir  # 确保安装最新版本的 Pillow
+  pip install -r requirements.txt --no-cache-dir
+  pip install pyinstaller==6.3.0
+如果还遇到问题，可以尝试以下方法：
+
+创建一个专门的 .spec 文件：
+# NFO.Editor.Qt5.spec
+block_cipher = None
+
+a = Analysis(['NFO.Editor.Qt5.py'],
+       pathex=[],
+       binaries=[],
+       datas=[('chuizi.ico', '.'), ('mapping_actor.xml', '.'), ('Img', 'Img')],
+       hiddenimports=['PIL._imaging', 'PIL._imagingft', 'PIL._imagingmath', 
+                     'PIL._imagingtk', 'PIL._webp', 'PIL.ImageQt',
+                     'win32com.client', 'win32com.client.gencache',
+                     'pythoncom', 'pywintypes'],
+       hookspath=[],
+       hooksconfig={},
+       runtime_hooks=[],
+       excludes=[],
+       win_no_prefer_redirects=False,
+       win_private_assemblies=False,
+       cipher=block_cipher,
+       noarchive=False)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='NFO.Editor.Qt5',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,
+    disable_windowed_traceback=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon='chuizi.ico')
+
+coll = COLLECT(exe,
+         a.binaries,
+         a.zipfiles,
+         a.datas,
+         strip=False,
+         upx=True,
+         upx_exclude=[],
+         name='NFO.Editor.Qt5')
+然后在构建命令中使用 .spec 文件：
+
+pyinstaller NFO.Editor.Qt5.spec -y
+如果还有问题，可以尝试在代码中显式导入 PIL 组件：
+# 在 NFO.Editor.Qt5.py 的开头添加
+import PIL._imaging
+import PIL.Image
+这些修改应该能解决 PIL 相关的导入错误。如果还有其他错误，请告诉我具体的错误信息。
+
+输出github完整的构建文件
+以下是完整的 GitHub Actions 构建文件 (build.yml)：
+
 name: Build NFO Tools
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
-  workflow_dispatch:
+push:
+tags:
+- 'v*.*.*'
+workflow_dispatch:
 
 env:
-  PYTHONUNBUFFERED: 1
-  PYTHONUTF8: 1
-  PYTHONDONTWRITEBYTECODE: 1
+PYTHONUNBUFFERED: 1
+PYTHONUTF8: 1
+PYTHONDONTWRITEBYTECODE: 1
 
 jobs:
-  build:
-    runs-on: windows-latest
-    timeout-minutes: 15
+build:
+runs-on: windows-latest
+timeout-minutes: 15
 
-    steps:
-    - name: 检出代码
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+steps:
+- name: 检出代码
+uses: actions/checkout@v4
+with:
+  fetch-depth: 0
 
-    - name: 设置 Python 版本
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.9.13'
-        cache: 'pip'
-        check-latest: false
+- name: 设置 Python 版本
+uses: actions/setup-python@v5
+with:
+  python-version: '3.9.13'
+  cache: 'pip'
+  check-latest: false
 
-    - name: 缓存PyInstaller工作目录
-      uses: actions/cache@v4
-      with:
-        path: |
-          build
-          dist/shared
-        key: ${{ runner.os }}-pyinstaller-${{ hashFiles('*.py', 'requirements.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pyinstaller-
+- name: 缓存PyInstaller工作目录
+uses: actions/cache@v4
+with:
+  path: |
+    build
+    dist/shared
+  key: ${{ runner.os }}-pyinstaller-${{ hashFiles('*.py', 'requirements.txt') }}
+  restore-keys: |
+    ${{ runner.os }}-pyinstaller-
 
-    - name: 安装依赖
-      run: |
-        python -m pip install --upgrade pip wheel setuptools
-        pip install pillow --no-cache-dir
-        pip install -r requirements.txt --no-cache-dir
-        pip install pyinstaller==6.3.0
+- name: 安装依赖
+run: |
+  python -m pip install --upgrade pip wheel setuptools
+  pip install pillow --no-cache-dir
+  pip install -r requirements.txt --no-cache-dir
+  pip install pyinstaller==6.3.0
 
-    - name: 设置构建名称
-      id: set_build_name
-      shell: pwsh
-      run: |
-        git fetch --tags
-        $latestTag = git describe --tags $(git rev-list --tags --max-count=1)
-        if ($null -eq $latestTag) {
-          Write-Error "未找到任何标签，无法继续。"
-          exit 1
-        }
-        echo "build_name=$latestTag" | Out-File -FilePath $env:GITHUB_ENV -Append
+- name: 设置构建名称
+id: set_build_name
+shell: pwsh
+run: |
+  git fetch --tags
+  $latestTag = git describe --tags $(git rev-list --tags --max-count=1)
+  if ($null -eq $latestTag) {
+    Write-Error "未找到任何标签，无法继续。"
+    exit 1
+  }
+  echo "build_name=$latestTag" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-    - name: 创建 spec 文件
-      shell: pwsh
-      run: |
-        @'
-        # NFO.Editor.Qt5.spec
-        block_cipher = None
+- name: 创建 spec 文件
+shell: pwsh
+run: |
+  @'
+  # NFO.Editor.Qt5.spec
+  block_cipher = None
 
-        a = Analysis(['NFO.Editor.Qt5.py'],
-                    pathex=[],
-                    binaries=[],
-                    datas=[('chuizi.ico', '.'), ('mapping_actor.xml', '.'), ('Img', 'Img')],
-                    hiddenimports=['PIL._imaging', 'PIL._imagingft', 'PIL._imagingmath', 
-                                'PIL._imagingtk', 'PIL._webp', 'PIL.ImageQt',
-                                'win32com.client', 'win32com.client.gencache',
-                                'pythoncom', 'pywintypes'],
-                    hookspath=[],
-                    hooksconfig={},
-                    runtime_hooks=[],
-                    excludes=[],
-                    win_no_prefer_redirects=False,
-                    win_private_assemblies=False,
-                    cipher=block_cipher,
-                    noarchive=False)
+  a = Analysis(['NFO.Editor.Qt5.py'],
+              pathex=[],
+              binaries=[],
+              datas=[('chuizi.ico', '.'), ('mapping_actor.xml', '.'), ('Img', 'Img')],
+              hiddenimports=['PIL._imaging', 'PIL._imagingft', 'PIL._imagingmath', 
+                          'PIL._imagingtk', 'PIL._webp', 'PIL.ImageQt',
+                          'win32com.client', 'win32com.client.gencache',
+                          'pythoncom', 'pywintypes'],
+              hookspath=[],
+              hooksconfig={},
+              runtime_hooks=[],
+              excludes=[],
+              win_no_prefer_redirects=False,
+              win_private_assemblies=False,
+              cipher=block_cipher,
+              noarchive=False)
 
-        pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+  pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-        exe = EXE(pyz,
-                a.scripts,
-                [],
-                exclude_binaries=True,
-                name='NFO.Editor.Qt5',
-                debug=False,
-                bootloader_ignore_signals=False,
-                strip=False,
-                upx=True,
-                console=False,
-                disable_windowed_traceback=False,
-                target_arch=None,
-                codesign_identity=None,
-                entitlements_file=None,
-                icon='chuizi.ico')
+  exe = EXE(pyz,
+          a.scripts,
+          [],
+          exclude_binaries=True,
+          name='NFO.Editor.Qt5',
+          debug=False,
+          bootloader_ignore_signals=False,
+          strip=False,
+          upx=True,
+          console=False,
+          disable_windowed_traceback=False,
+          target_arch=None,
+          codesign_identity=None,
+          entitlements_file=None,
+          icon='chuizi.ico')
 
-        coll = COLLECT(exe,
-                    a.binaries,
-                    a.zipfiles,
-                    a.datas,
-                    strip=False,
-                    upx=True,
-                    upx_exclude=[],
-                    name='NFO.Editor.Qt5')
-        '@ | Out-File -FilePath "NFO.Editor.Qt5.spec" -Encoding utf8
+  coll = COLLECT(exe,
+              a.binaries,
+              a.zipfiles,
+              a.datas,
+              strip=False,
+              upx=True,
+              upx_exclude=[],
+              name='NFO.Editor.Qt5')
+  '@ | Out-File -FilePath "NFO.Editor.Qt5.spec" -Encoding utf8
 
-    - name: 构建应用
-      shell: pwsh
-      run: |
-        # 构建前清理
-        Remove-Item -Path "dist" -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "build" -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "shared_libs" -Recurse -Force -ErrorAction SilentlyContinue
-        
-        # 创建必要目录
-        New-Item -Path "dist/NFOTools" -ItemType Directory -Force
-        New-Item -Path "shared_libs" -ItemType Directory -Force
-        
-        # 构建 cg_crop
-        Write-Host "开始构建 cg_crop..."
-        pyinstaller --name "cg_crop" `
-          --distpath "./dist/shared" `
-          --workpath "./build/shared" `
-          --onedir `
-          --noconsole `
-          --icon="chuizi.ico" `
-          --add-data "chuizi.ico;." `
-          --add-data "Img;Img" `
-          --hidden-import win32com.client `
-          --hidden-import win32com.client.gencache `
-          --hidden-import pythoncom `
-          --hidden-import pywintypes `
-          --hidden-import PIL._imaging `
-          --hidden-import PIL._imagingft `
-          --hidden-import PIL._imagingmath `
-          --hidden-import PIL._imagingtk `
-          --hidden-import PIL._webp `
-          --hidden-import PIL.ImageQt `
-          -y `
-          "cg_crop.py"
-          
-        # 移动共享依赖
-        if (Test-Path "dist/shared/cg_crop/PyQt5") {
-          Write-Host "移动 PyQt5 到共享库..."
-          Move-Item -Path "dist/shared/cg_crop/PyQt5" -Destination "shared_libs/" -Force -ErrorAction SilentlyContinue
-        }
-        if (Test-Path "dist/shared/cg_crop/_internal") {
-          Write-Host "移动 _internal 到共享库..."
-          Move-Item -Path "dist/shared/cg_crop/_internal" -Destination "shared_libs/" -Force -ErrorAction SilentlyContinue
-        }
-        Move-Item -Path "dist/shared/cg_crop/cg_crop.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "dist/shared/cg_crop" -Recurse -Force -ErrorAction SilentlyContinue
-        
-        # 使用 spec 文件构建 NFO.Editor.Qt5
-        Write-Host "开始构建 NFO.Editor.Qt5..."
-        pyinstaller NFO.Editor.Qt5.spec -y
-        Move-Item -Path "dist/NFO.Editor.Qt5/NFO.Editor.Qt5.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "dist/NFO.Editor.Qt5" -Recurse -Force -ErrorAction SilentlyContinue
-        
-        # 构建 cg_rename
-        Write-Host "开始构建 cg_rename..."
-        pyinstaller --name "cg_rename" `
-          --distpath "./dist/shared" `
-          --workpath "./build/shared" `
-          --onedir `
-          --noconsole `
-          --icon="chuizi.ico" `
-          --add-data "chuizi.ico;." `
-          --add-data "mapping_actor.xml;." `
-          --hidden-import win32com.client `
-          --hidden-import win32com.client.gencache `
-          --hidden-import pythoncom `
-          --hidden-import pywintypes `
-          --hidden-import PIL._imaging `
-          --hidden-import PIL._imagingft `
-          --hidden-import PIL._imagingmath `
-          --hidden-import PIL._imagingtk `
-          --hidden-import PIL._webp `
-          --hidden-import PIL.ImageQt `
-          -y `
-          "cg_rename.py"
-        
-        Move-Item -Path "dist/shared/cg_rename/cg_rename.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "dist/shared/cg_rename" -Recurse -Force -ErrorAction SilentlyContinue
-        
-        # 构建 cg_dedupe
-        Write-Host "开始构建 cg_dedupe..."
-        pyinstaller --name "cg_dedupe" `
-          --distpath "./dist/shared" `
-          --workpath "./build/shared" `
-          --onedir `
-          --noconsole `
-          --icon="chuizi.ico" `
-          --add-data "chuizi.ico;." `
-          --hidden-import win32com.client `
-          --hidden-import win32com.client.gencache `
-          --hidden-import pythoncom `
-          --hidden-import pywintypes `
-          --hidden-import PIL._imaging `
-          --hidden-import PIL._imagingft `
-          --hidden-import PIL._imagingmath `
-          --hidden-import PIL._imagingtk `
-          --hidden-import PIL._webp `
-          --hidden-import PIL.ImageQt `
-          -y `
-          "cg_dedupe.py"
-        
-        Move-Item -Path "dist/shared/cg_dedupe/cg_dedupe.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "dist/shared/cg_dedupe" -Recurse -Force -ErrorAction SilentlyContinue
-        
-        # 移动共享依赖到最终目录
-        Write-Host "移动共享依赖..."
-        Copy-Item -Path "shared_libs/*" -Destination "dist/NFOTools/" -Recurse -Force
-        
-        # 移动额外资源文件
-        Write-Host "移动资源文件..."
-        Copy-Item -Path "Img" -Destination "dist/NFOTools/" -Recurse -Force
-        Copy-Item -Path "mapping_actor.xml" -Destination "dist/NFOTools/" -Force
-        Copy-Item -Path "chuizi.ico" -Destination "dist/NFOTools/" -Force
+- name: 构建应用
+shell: pwsh
+run: |
+  # 构建前清理
+  Remove-Item -Path "dist" -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -Path "build" -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -Path "shared_libs" -Recurse -Force -ErrorAction SilentlyContinue
+  
+  # 创建必要目录
+  New-Item -Path "dist/NFOTools" -ItemType Directory -Force
+  New-Item -Path "shared_libs" -ItemType Directory -Force
+  
+  # 构建 cg_crop
+  Write-Host "开始构建 cg_crop..."
+  pyinstaller --name "cg_crop" `
+    --distpath "./dist/shared" `
+    --workpath "./build/shared" `
+    --onedir `
+    --noconsole `
+    --icon="chuizi.ico" `
+    --add-data "chuizi.ico;." `
+    --add-data "Img;Img" `
+    --hidden-import win32com.client `
+    --hidden-import win32com.client.gencache `
+    --hidden-import pythoncom `
+    --hidden-import pywintypes `
+    --hidden-import PIL._imaging `
+    --hidden-import PIL._imagingft `
+    --hidden-import PIL._imagingmath `
+    --hidden-import PIL._imagingtk `
+    --hidden-import PIL._webp `
+    --hidden-import PIL.ImageQt `
+    -y `
+    "cg_crop.py"
+    
+  # 移动共享依赖
+  if (Test-Path "dist/shared/cg_crop/PyQt5") {
+    Write-Host "移动 PyQt5 到共享库..."
+    Move-Item -Path "dist/shared/cg_crop/PyQt5" -Destination "shared_libs/" -Force -ErrorAction SilentlyContinue
+  }
+  if (Test-Path "dist/shared/cg_crop/_internal") {
+    Write-Host "移动 _internal 到共享库..."
+    Move-Item -Path "dist/shared/cg_crop/_internal" -Destination "shared_libs/" -Force -ErrorAction SilentlyContinue
+  }
+  Move-Item -Path "dist/shared/cg_crop/cg_crop.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
+  Remove-Item -Path "dist/shared/cg_crop" -Recurse -Force -ErrorAction SilentlyContinue
+  
+  # 使用 spec 文件构建 NFO.Editor.Qt5
+  Write-Host "开始构建 NFO.Editor.Qt5..."
+  pyinstaller NFO.Editor.Qt5.spec -y
+  Move-Item -Path "dist/NFO.Editor.Qt5/NFO.Editor.Qt5.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
+  Remove-Item -Path "dist/NFO.Editor.Qt5" -Recurse -Force -ErrorAction SilentlyContinue
+  
+  # 构建 cg_rename
+  Write-Host "开始构建 cg_rename..."
+  pyinstaller --name "cg_rename" `
+    --distpath "./dist/shared" `
+    --workpath "./build/shared" `
+    --onedir `
+    --noconsole `
+    --icon="chuizi.ico" `
+    --add-data "chuizi.ico;." `
+    --add-data "mapping_actor.xml;." `
+    --hidden-import win32com.client `
+    --hidden-import win32com.client.gencache `
+    --hidden-import pythoncom `
+    --hidden-import pywintypes `
+    --hidden-import PIL._imaging `
+    --hidden-import PIL._imagingft `
+    --hidden-import PIL._imagingmath `
+    --hidden-import PIL._imagingtk `
+    --hidden-import PIL._webp `
+    --hidden-import PIL.ImageQt `
+    -y `
+    "cg_rename.py"
+  
+  Move-Item -Path "dist/shared/cg_rename/cg_rename.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
+  Remove-Item -Path "dist/shared/cg_rename" -Recurse -Force -ErrorAction SilentlyContinue
+  
+  # 构建 cg_dedupe
+  Write-Host "开始构建 cg_dedupe..."
+  pyinstaller --name "cg_dedupe" `
+    --distpath "./dist/shared" `
+    --workpath "./build/shared" `
+    --onedir `
+    --noconsole `
+    --icon="chuizi.ico" `
+    --add-data "chuizi.ico;." `
+    --hidden-import win32com.client `
+    --hidden-import win32com.client.gencache `
+    --hidden-import pythoncom `
+    --hidden-import pywintypes `
+    --hidden-import PIL._imaging `
+    --hidden-import PIL._imagingft `
+    --hidden-import PIL._imagingmath `
+    --hidden-import PIL._imagingtk `
+    --hidden-import PIL._webp `
+    --hidden-import PIL.ImageQt `
+    -y `
+    "cg_dedupe.py"
+  
+  Move-Item -Path "dist/shared/cg_dedupe/cg_dedupe.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
+  Remove-Item -Path "dist/shared/cg_dedupe" -Recurse -Force -ErrorAction SilentlyContinue
+  
+  # 移动共享依赖到最终目录
+  Write-Host "移动共享依赖..."
+  Copy-Item -Path "shared_libs/*" -Destination "dist/NFOTools/" -Recurse -Force
+  
+  # 移动额外资源文件
+  Write-Host "移动资源文件..."
+  Copy-Item -Path "Img" -Destination "dist/NFOTools/" -Recurse -Force
+  Copy-Item -Path "mapping_actor.xml" -Destination "dist/NFOTools/" -Force
+  Copy-Item -Path "chuizi.ico" -Destination "dist/NFOTools/" -Force
 
-    - name: 创建 NSIS 安装脚本
-      shell: pwsh
-      run: |
-        @'
-        !include "MUI2.nsh"
-        !define PRODUCT_NAME "NFO Tools"
-        !define PRODUCT_VERSION "${{ env.build_name }}"
-        !define PRODUCT_PUBLISHER "NFO Tools"
+- name: 创建 NSIS 安装脚本
+shell: pwsh
+run: |
+  @'
+  !include "MUI2.nsh"
+  !define PRODUCT_NAME "NFO Tools"
+  !define PRODUCT_VERSION "${{ env.build_name }}"
+  !define PRODUCT_PUBLISHER "NFO Tools"
 
-        Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
-        OutFile "NFOTools.Setup.${{ env.build_name }}.exe"
-        InstallDir "$PROGRAMFILES\NFO Tools"
-        
-        !insertmacro MUI_PAGE_WELCOME
-        !insertmacro MUI_PAGE_DIRECTORY
-        !insertmacro MUI_PAGE_INSTFILES
-        !insertmacro MUI_PAGE_FINISH
-        !insertmacro MUI_UNPAGE_CONFIRM
-        !insertmacro MUI_UNPAGE_INSTFILES
-        
-        !insertmacro MUI_LANGUAGE "SimpChinese"
-        
-        Section "MainSection" SEC01
-          SetOutPath "$INSTDIR"
-          SetOverwrite ifnewer
-          
-          File /r "dist\NFOTools\*.*"
-          
-          CreateDirectory "$SMPROGRAMS\NFO Tools"
-          CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Editor.lnk" "$INSTDIR\NFO.Editor.Qt5.exe"
-          CreateShortCut "$SMPROGRAMS\NFO Tools\CG Crop.lnk" "$INSTDIR\cg_crop.exe"
-          CreateShortCut "$SMPROGRAMS\NFO Tools\CG Rename.lnk" "$INSTDIR\cg_rename.exe"
-          CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Dedupe.lnk" "$INSTDIR\cg_dedupe.exe"
-          
-          WriteUninstaller "$INSTDIR\uninstall.exe"
-          CreateShortCut "$SMPROGRAMS\NFO Tools\Uninstall.lnk" "$INSTDIR\uninstall.exe"
-        SectionEnd
-        
-        Section "Uninstall"
-          Delete "$INSTDIR\uninstall.exe"
-          Delete "$INSTDIR\cg_crop.exe"
-          Delete "$INSTDIR\NFO.Editor.Qt5.exe"
-          Delete "$INSTDIR\cg_rename.exe"
-          Delete "$INSTDIR\cg_dedupe.exe"
-          Delete "$INSTDIR\chuizi.ico"
-          
-          Delete "$SMPROGRAMS\NFO Tools\NFO Editor.lnk"
-          Delete "$SMPROGRAMS\NFO Tools\CG Crop.lnk"
-          Delete "$SMPROGRAMS\NFO Tools\CG Rename.lnk"
-          Delete "$SMPROGRAMS\NFO Tools\NFO Dedupe.lnk"
-          Delete "$SMPROGRAMS\NFO Tools\Uninstall.lnk"
-          
-          RMDir /r "$INSTDIR"
-          RMDir "$SMPROGRAMS\NFO Tools"
-        SectionEnd
-        '@ | Out-File -FilePath "installer.nsi" -Encoding utf8
+  Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
+  OutFile "NFOTools.Setup.${{ env.build_name }}.exe"
+  InstallDir "$PROGRAMFILES\NFO Tools"
+  
+  !insertmacro MUI_PAGE_WELCOME
+  !insertmacro MUI_PAGE_DIRECTORY
+  !insertmacro MUI_PAGE_INSTFILES
+  !insertmacro MUI_PAGE_FINISH
+  !insertmacro MUI_UNPAGE_CONFIRM
+  !insertmacro MUI_UNPAGE_INSTFILES
+  
+  !insertmacro MUI_LANGUAGE "SimpChinese"
+  
+  Section "MainSection" SEC01
+    SetOutPath "$INSTDIR"
+    SetOverwrite ifnewer
+    
+    File /r "dist\NFOTools\*.*"
+    
+    CreateDirectory "$SMPROGRAMS\NFO Tools"
+    CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Editor.lnk" "$INSTDIR\NFO.Editor.Qt5.exe"
+    CreateShortCut "$SMPROGRAMS\NFO Tools\CG Crop.lnk" "$INSTDIR\cg_crop.exe"
+    CreateShortCut "$SMPROGRAMS\NFO Tools\CG Rename.lnk" "$INSTDIR\cg_rename.exe"
+    CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Dedupe.lnk" "$INSTDIR\cg_dedupe.exe"
+    
+    WriteUninstaller "$INSTDIR\uninstall.exe"
+    CreateShortCut "$SMPROGRAMS\NFO Tools\Uninstall.lnk" "$INSTDIR\uninstall.exe"
+  SectionEnd
+  
+  Section "Uninstall"
+    Delete "$INSTDIR\uninstall.exe"
+    Delete "$INSTDIR\cg_crop.exe"
+    Delete "$INSTDIR\NFO.Editor.Qt5.exe"
+    Delete "$INSTDIR\cg_rename.exe"
+    Delete "$INSTDIR\cg_dedupe.exe"
+    Delete "$INSTDIR\chuizi.ico"
+    
+    Delete "$SMPROGRAMS\NFO Tools\NFO Editor.lnk"
+    Delete "$SMPROGRAMS\NFO Tools\CG Crop.lnk"
+    Delete "$SMPROGRAMS\NFO Tools\CG Rename.lnk"
+    Delete "$SMPROGRAMS\NFO Tools\NFO Dedupe.lnk"
+    Delete "$SMPROGRAMS\NFO Tools\Uninstall.lnk"
+    
+    RMDir /r "$INSTDIR"
+    RMDir "$SMPROGRAMS\NFO Tools"
+  SectionEnd
+  '@ | Out-File -FilePath "installer.nsi" -Encoding utf8
 
-    - name: 安装 NSIS
-      run: |
-        choco install nsis -y --no-progress
+- name: 安装 NSIS
+run: |
+  choco install nsis -y --no-progress
 
-    - name: 构建安装程序
-      run: |
-        makensis installer.nsi
+- name: 构建安装程序
+run: |
+  makensis installer.nsi
 
-    - name: 上传构建工件
-      uses: actions/upload-artifact@v4
-      with:
-        name: nfo-tools-installer
-        path: NFOTools.Setup.${{ env.build_name }}.exe
-        retention-days: 7
+- name: 上传构建工件
+uses: actions/upload-artifact@v4
+with:
+  name: nfo-tools-installer
+  path: NFOTools.Setup.${{ env.build_name }}.exe
+  retention-days: 7
 
-  release:
-    needs: build
-    runs-on: windows-latest
-    permissions:
-      contents: write
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+release:
+needs: build
+runs-on: windows-latest
+permissions:
+contents: write
+steps:
+- name: 检出代码
+  uses: actions/checkout@v4
+  with:
+    fetch-depth: 0
 
-      - name: 设置构建名称
-        id: set_build_name
-        shell: pwsh
-        run: |
-          git fetch --tags
-          $latestTag = git describe --tags $(git rev-list --tags --max-count=1)
-          if ($null -eq $latestTag) {
-            Write-Error "未找到任何标签，无法继续。"
-            exit 1
-          }
-          echo "build_name=$latestTag" | Out-File -FilePath $env:GITHUB_ENV -Append
+- name: 设置构建名称
+  id: set_build_name
+  shell: pwsh
+  run: |
+    git fetch --tags
+    $latestTag = git describe --tags $(git rev-list --tags --max-count=1)
+    if ($null -eq $latestTag) {
+      Write-Error "未找到任何标签，无法继续。"
+      exit 1
+    }
+    echo "build_name=$latestTag" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: 下载安装程序
-        uses: actions/download-artifact@v4
-        with:
-          name: nfo-tools-installer
-          path: dist
+- name: 下载安装程序
+  uses: actions/download-artifact@v4
+  with:
+    name: nfo-tools-installer
+    path: dist
 
-      - name: 创建 Release
-        uses: softprops/action-gh-release@v1
-        with:
-          name: Release ${{ env.build_name }}
-          tag_name: ${{ env.build_name }}
-          draft: false
-          prerelease: false
-          files: dist/*.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+- name: 创建 Release
+  uses: softprops/action-gh-release@v1
+  with:
+    name: Release ${{ env.build_name }}
+    tag_name: ${{ env.build_name }}
+    draft: false
+    prerelease: false
+    files: dist/*.exe
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+主要改动：
+
+添加了专门的 spec 文件创建步骤
+修改了依赖安装，确保安装 Pillow
+为所有 PyInstaller 命令添加了 PIL 相关的隐藏导入
+使用 spec 文件构建 NFO.Editor.Qt5
+优化了错误处理和日志输出
+这个版本应该能解决 PIL 相关的导入错误。如果还有其他问题，请告诉我具体的错误信息。
+
+NFO.Editor.Qt5.py
+57.48 KB
+NFO_Editor_ui.py
+21.20 KB
+cg_crop.py
+25.16 KB
+cg_dedupe.py
+22.68 KB
+cg_rename.py
+21.14 KB
+Traceback (most recent call last): File "NFO.Editor.Qt5.py", line 32, in <module> File "PyInstaller\loader\pyimod02_importers.py", line 419, in exec_module File "winshell.py", line 32, in <module> ImportError: cannot import name 'shell' from 'win32com.shell' (C:\Program Files (x86)\NFO Tools\_internal\win32com\shell\__init__.pyc) 我把我要构建的Py脚本都上传给你，帮我写一个无措的github构建文件吧
+根据您提供的错误信息和源代码，主要问题是 winshell 模块的导入问题。我来帮您重写一个完整的 GitHub Actions 构建文件，添加必要的依赖和隐藏导入：
+
+name: Build NFO Tools
+
+on:
+push:
+tags:
+- 'v*.*.*'
+workflow_dispatch:
+
+env:
+PYTHONUNBUFFERED: 1
+PYTHONUTF8: 1
+PYTHONDONTWRITEBYTECODE: 1
+
+jobs:
+build:
+runs-on: windows-latest
+timeout-minutes: 15
+
+steps:
+- name: 检出代码
+uses: actions/checkout@v4
+with:
+  fetch-depth: 0
+
+- name: 设置 Python 版本
+uses: actions/setup-python@v5
+with:
+  python-version: '3.9.13'
+  cache: 'pip'
+  check-latest: false
+
+- name: 缓存PyInstaller工作目录
+uses: actions/cache@v4
+with:
+  path: |
+    build
+    dist/shared
+  key: ${{ runner.os }}-pyinstaller-${{ hashFiles('*.py', 'requirements.txt') }}
+  restore-keys: |
+    ${{ runner.os }}-pyinstaller-
+
+- name: 安装依赖
+run: |
+  python -m pip install --upgrade pip wheel setuptools
+  pip install pillow --no-cache-dir
+  pip install pywin32 --no-cache-dir
+  pip install winshell --no-cache-dir
+  pip install -r requirements.txt --no-cache-dir
+  pip install pyinstaller==6.3.0
+
+- name: 设置构建名称
+id: set_build_name
+shell: pwsh
+run: |
+  git fetch --tags
+  $latestTag = git describe --tags $(git rev-list --tags --max-count=1)
+  if ($null -eq $latestTag) {
+    Write-Error "未找到任何标签，无法继续。"
+    exit 1
+  }
+  echo "build_name=$latestTag" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+- name: 构建应用
+shell: pwsh
+run: |
+  # 构建前清理
+  Remove-Item -Path "dist" -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -Path "build" -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -Path "shared_libs" -Recurse -Force -ErrorAction SilentlyContinue
+  
+  # 创建必要目录
+  New-Item -Path "dist/NFOTools" -ItemType Directory -Force
+  New-Item -Path "shared_libs" -ItemType Directory -Force
+  
+  # 构建 NFO.Editor.Qt5
+  pyinstaller --name "NFO.Editor.Qt5" `
+    --distpath "./dist/shared" `
+    --workpath "./build/shared" `
+    --onedir `
+    --noconsole `
+    --icon="chuizi.ico" `
+    --add-data "chuizi.ico;." `
+    --add-data "mapping_actor.xml;." `
+    --add-data "Img;Img" `
+    --hidden-import win32com `
+    --hidden-import win32com.client `
+    --hidden-import win32com.client.gencache `
+    --hidden-import win32com.shell `
+    --hidden-import win32com.shell.shell `
+    --hidden-import win32com.shell.shellcon `
+    --hidden-import win32wnet `
+    --hidden-import pythoncom `
+    --hidden-import pywintypes `
+    --hidden-import winshell `
+    --hidden-import PIL `
+    --hidden-import PIL._imaging `
+    --hidden-import PIL.Image `
+    -y `
+    "NFO.Editor.Qt5.py"
+  
+  Move-Item -Path "dist/shared/NFO.Editor.Qt5/NFO.Editor.Qt5.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
+  
+  if (Test-Path "dist/shared/NFO.Editor.Qt5/PyQt5") {
+    Move-Item -Path "dist/shared/NFO.Editor.Qt5/PyQt5" -Destination "shared_libs/" -Force -ErrorAction SilentlyContinue
+  }
+  if (Test-Path "dist/shared/NFO.Editor.Qt5/_internal") {
+    Move-Item -Path "dist/shared/NFO.Editor.Qt5/_internal" -Destination "shared_libs/" -Force -ErrorAction SilentlyContinue
+  }
+  Remove-Item -Path "dist/shared/NFO.Editor.Qt5" -Recurse -Force -ErrorAction SilentlyContinue
+  
+  # 构建其他工具...
+  # cg_crop
+  pyinstaller --name "cg_crop" `
+    --distpath "./dist/shared" `
+    --workpath "./build/shared" `
+    --onedir `
+    --noconsole `
+    --icon="chuizi.ico" `
+    --add-data "chuizi.ico;." `
+    --add-data "Img;Img" `
+    --hidden-import win32com `
+    --hidden-import win32com.client `
+    --hidden-import win32com.shell `
+    --hidden-import pythoncom `
+    --hidden-import pywintypes `
+    --hidden-import PIL `
+    --hidden-import PIL._imaging `
+    --hidden-import PIL.Image `
+    -y `
+    "cg_crop.py"
+  
+  Move-Item -Path "dist/shared/cg_crop/cg_crop.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
+  Remove-Item -Path "dist/shared/cg_crop" -Recurse -Force -ErrorAction SilentlyContinue
+  
+  # cg_rename
+  pyinstaller --name "cg_rename" `
+    --distpath "./dist/shared" `
+    --workpath "./build/shared" `
+    --onedir `
+    --noconsole `
+    --icon="chuizi.ico" `
+    --add-data "chuizi.ico;." `
+    --add-data "mapping_actor.xml;." `
+    --hidden-import win32com `
+    --hidden-import win32com.client `
+    --hidden-import win32com.shell `
+    --hidden-import pythoncom `
+    --hidden-import pywintypes `
+    --hidden-import PIL `
+    --hidden-import PIL._imaging `
+    --hidden-import PIL.Image `
+    -y `
+    "cg_rename.py"
+  
+  Move-Item -Path "dist/shared/cg_rename/cg_rename.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
+  Remove-Item -Path "dist/shared/cg_rename" -Recurse -Force -ErrorAction SilentlyContinue
+  
+  # cg_dedupe
+  pyinstaller --name "cg_dedupe" `
+    --distpath "./dist/shared" `
+    --workpath "./build/shared" `
+    --onedir `
+    --noconsole `
+    --icon="chuizi.ico" `
+    --add-data "chuizi.ico;." `
+    --hidden-import win32com `
+    --hidden-import win32com.client `
+    --hidden-import win32com.shell `
+    --hidden-import pythoncom `
+    --hidden-import pywintypes `
+    --hidden-import PIL `
+    --hidden-import PIL._imaging `
+    --hidden-import PIL.Image `
+    -y `
+    "cg_dedupe.py"
+  
+  Move-Item -Path "dist/shared/cg_dedupe/cg_dedupe.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
+  Remove-Item -Path "dist/shared/cg_dedupe" -Recurse -Force -ErrorAction SilentlyContinue
+  
+  # 移动共享依赖到最终目录
+  Copy-Item -Path "shared_libs/*" -Destination "dist/NFOTools/" -Recurse -Force
+  
+  # 移动额外资源文件
+  Copy-Item -Path "Img" -Destination "dist/NFOTools/" -Recurse -Force
+  Copy-Item -Path "mapping_actor.xml" -Destination "dist/NFOTools/" -Force
+  Copy-Item -Path "chuizi.ico" -Destination "dist/NFOTools/" -Force
+
+- name: 创建 NSIS 安装脚本
+shell: pwsh
+run: |
+  @'
+  !include "MUI2.nsh"
+  !define PRODUCT_NAME "NFO Tools"
+  !define PRODUCT_VERSION "${{ env.build_name }}"
+  !define PRODUCT_PUBLISHER "NFO Tools"
+
+  Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
+  OutFile "NFOTools.Setup.${{ env.build_name }}.exe"
+  InstallDir "$PROGRAMFILES\NFO Tools"
+  
+  !insertmacro MUI_PAGE_WELCOME
+  !insertmacro MUI_PAGE_DIRECTORY
+  !insertmacro MUI_PAGE_INSTFILES
+  !insertmacro MUI_PAGE_FINISH
+  !insertmacro MUI_UNPAGE_CONFIRM
+  !insertmacro MUI_UNPAGE_INSTFILES
+  
+  !insertmacro MUI_LANGUAGE "SimpChinese"
+  
+  Section "MainSection" SEC01
+    SetOutPath "$INSTDIR"
+    SetOverwrite ifnewer
+    
+    File /r "dist\NFOTools\*.*"
+    
+    CreateDirectory "$SMPROGRAMS\NFO Tools"
+    CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Editor.lnk" "$INSTDIR\NFO.Editor.Qt5.exe"
+    CreateShortCut "$SMPROGRAMS\NFO Tools\CG Crop.lnk" "$INSTDIR\cg_crop.exe"
+    CreateShortCut "$SMPROGRAMS\NFO Tools\CG Rename.lnk" "$INSTDIR\cg_rename.exe"
+    CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Dedupe.lnk" "$INSTDIR\cg_dedupe.exe"
+    
+    WriteUninstaller "$INSTDIR\uninstall.exe"
+    CreateShortCut "$SMPROGRAMS\NFO Tools\Uninstall.lnk" "$INSTDIR\uninstall.exe"
+  SectionEnd
+  
+  Section "Uninstall"
+    Delete "$INSTDIR\uninstall.exe"
+    Delete "$INSTDIR\cg_crop.exe"
+    Delete "$INSTDIR\NFO.Editor.Qt5.exe"
+    Delete "$INSTDIR\cg_rename.exe"
+    Delete "$INSTDIR\cg_dedupe.exe"
+    Delete "$INSTDIR\chuizi.ico"
+    
+    Delete "$SMPROGRAMS\NFO Tools\NFO Editor.lnk"
+    Delete "$SMPROGRAMS\NFO Tools\CG Crop.lnk"
+    Delete "$SMPROGRAMS\NFO Tools\CG Rename.lnk"
+    Delete "$SMPROGRAMS\NFO Tools\NFO Dedupe.lnk"
+    Delete "$SMPROGRAMS\NFO Tools\Uninstall.lnk"
+    
+    RMDir /r "$INSTDIR"
+    RMDir "$SMPROGRAMS\NFO Tools"
+  SectionEnd
+  '@ | Out-File -FilePath "installer.nsi" -Encoding utf8
+
+- name: 安装 NSIS
+run: |
+  choco install nsis -y --no-progress
+
+- name: 构建安装程序
+run: |
+  makensis installer.nsi
+
+- name: 上传构建工件
+uses: actions/upload-artifact@v4
+with:
+  name: nfo-tools-installer
+  path: NFOTools.Setup.${{ env.build_name }}.exe
+  retention-days: 7
+
+release:
+needs: build
+runs-on: windows-latest
+permissions:
+contents: write
+steps:
+- name: 检出代码
+  uses: actions/checkout@v4
+  with:
+    fetch-depth: 0
+
+- name: 设置构建名称
+  id: set_build_name
+  shell: pwsh
+  run: |
+    git fetch --tags
+    $latestTag = git describe --tags $(git rev-list --tags --max-count=1)
+    if ($null -eq $latestTag) {
+      Write-Error "未找到任何标签，无法继续。"
+      exit 1
+    }
+    echo "build_name=$latestTag" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+- name: 下载安装程序
+  uses: actions/download-artifact@v4
+  with:
+    name: nfo-tools-installer
+    path: dist
+
+- name: 创建 Release
+  uses: softprops/action-gh-release@v1
+  with:
+    name: Release ${{ env.build_name }}
+    tag_name: ${{ env.build_name }}
+    draft: false
+    prerelease: false
+    files: dist/*.exe
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
