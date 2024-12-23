@@ -54,36 +54,49 @@ jobs:
     - name: 构建所有应用
       shell: pwsh
       run: |
-        $apps = @(
-          @{
-            name = "cg_crop"
-            extra_data = "--add-data 'Img;Img'"
-          },
-          @{
-            name = "NFO.Editor.Qt5"
-            extra_data = "--add-data 'mapping_actor.xml;.' --add-data 'Img;Img'"
-          },
-          @{
-            name = "cg_rename"
-            extra_data = "--add-data 'mapping_actor.xml;.'"
-          },
-          @{
-            name = "cg_dedupe"
-            extra_data = ""
-          }
-        )
-        
-        foreach ($app in $apps) {
-          pyinstaller --name "$($app.name)" `
-            --onefile `
-            --noconsole `
-            --icon="chuizi.ico" `
-            --add-data "chuizi.ico;." `
-            $($app.extra_data) `
-            --runtime-tmpdir "%TEMP%" `
-            --clean `
-            "$($app.name).py"
-        }
+        # cg_crop
+        pyinstaller --name "cg_crop" `
+          --onefile `
+          --noconsole `
+          --icon="chuizi.ico" `
+          --add-data "chuizi.ico;." `
+          --add-data "Img;Img" `
+          --runtime-tmpdir "%TEMP%" `
+          --clean `
+          "cg_crop.py"
+
+        # NFO.Editor.Qt5
+        pyinstaller --name "NFO.Editor.Qt5" `
+          --onefile `
+          --noconsole `
+          --icon="chuizi.ico" `
+          --add-data "chuizi.ico;." `
+          --add-data "mapping_actor.xml;." `
+          --add-data "Img;Img" `
+          --runtime-tmpdir "%TEMP%" `
+          --clean `
+          "NFO.Editor.Qt5.py"
+
+        # cg_rename
+        pyinstaller --name "cg_rename" `
+          --onefile `
+          --noconsole `
+          --icon="chuizi.ico" `
+          --add-data "chuizi.ico;." `
+          --add-data "mapping_actor.xml;." `
+          --runtime-tmpdir "%TEMP%" `
+          --clean `
+          "cg_rename.py"
+
+        # cg_dedupe
+        pyinstaller --name "cg_dedupe" `
+          --onefile `
+          --noconsole `
+          --icon="chuizi.ico" `
+          --add-data "chuizi.ico;." `
+          --runtime-tmpdir "%TEMP%" `
+          --clean `
+          "cg_dedupe.py"
 
     - name: 创建 NSIS 安装脚本
       shell: pwsh
