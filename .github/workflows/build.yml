@@ -81,8 +81,7 @@ jobs:
           "--icon=chuizi.ico",
           "--strip",
           "--noupx",
-          "--clean",
-          "--opt-level=2"
+          "--clean"
         )
         
         # 基础排除模块
@@ -121,6 +120,11 @@ jobs:
           --add-data "Img;Img" `
           "NFO.Editor.Qt5.py"
         
+        if (-not $?) {
+            Write-Error "构建 NFO.Editor.Qt5 失败"
+            exit 1
+        }
+        
         Write-Host "移动 NFO.Editor.Qt5 文件..."
         Move-Item -Path "dist/shared/NFO.Editor.Qt5/NFO.Editor.Qt5.exe" -Destination "dist/NFOTools/" -Force
         
@@ -130,7 +134,7 @@ jobs:
         if (Test-Path "dist/shared/NFO.Editor.Qt5/_internal") {
           Move-Item -Path "dist/shared/NFO.Editor.Qt5/_internal" -Destination "shared_libs/" -Force
         }
-        Remove-Item -Path "dist/shared/NFO.Editor.Qt5" -Recurse -Force
+        Remove-Item -Path "dist/shared/NFO.Editor.Qt5" -Recurse -Force -ErrorAction SilentlyContinue
         
         # 构建其他工具
         $otherTools = @("cg_crop", "cg_rename", "cg_dedupe")
@@ -143,10 +147,15 @@ jobs:
             --add-data "chuizi.ico;." `
             --add-data "Img;Img" `
             "${tool}.py"
+          
+          if (-not $?) {
+              Write-Error "构建 $tool 失败"
+              exit 1
+          }
             
           Write-Host "移动 $tool 文件..."
           Move-Item -Path "dist/shared/$tool/$tool.exe" -Destination "dist/NFOTools/" -Force
-          Remove-Item -Path "dist/shared/$tool" -Recurse -Force
+          Remove-Item -Path "dist/shared/$tool" -Recurse -Force -ErrorAction SilentlyContinue
         }
         
         Write-Host "移动共享依赖..."
@@ -220,6 +229,11 @@ jobs:
         
         Write-Host "开始构建安装包..."
         makensis installer.nsi
+        
+        if (-not $?) {
+            Write-Error "构建安装包失败"
+            exit 1
+        }
 
     - name: 上传构建工件
       uses: actions/upload-artifact@v4
@@ -227,42 +241,3 @@ jobs:
         name: nfo-tools-installer
         path: NFOTools.Setup.${{ env.build_name }}.exe
         retention-days: 7
-
-  release:
-    needs: build
-    runs-on: windows-latest
-    permissions:
-      contents: write
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: 设置构建名称
-        shell: pwsh
-        run: |
-          git fetch --tags
-          $latestTag = git describe --tags $(git rev-list --tags --max-count=1)
-          if ($null -eq $latestTag) {
-            Write-Error "未找到任何标签，无法继续。"
-            exit 1
-          }
-          echo "build_name=$latestTag" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: 下载安装程序
-        uses: actions/download-artifact@v4
-        with:
-          name: nfo-tools-installer
-          path: dist
-
-      - name: 创建 Release
-        uses: softprops/action-gh-release@v1
-        with:
-          name: Release ${{ env.build_name }}
-          tag_name: ${{ env.build_name }}
-          draft: false
-          prerelease: false
-          files: dist/*.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
