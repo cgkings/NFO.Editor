@@ -243,8 +243,9 @@ class NFOEditorQt(QMainWindow):
             ("⏯", None, "播放选中的视频文件", int(40 * self.scale_factor)),
             ("🔗", None, "统一演员名并重命名文件夹", int(40 * self.scale_factor)),
             ("🔁", None, "刷新文件列表,快捷键F5", int(40 * self.scale_factor)),
+            ("🖼", None, "打开海报照片墙", int(40 * self.scale_factor)),
             (
-                "=>",
+                "🔜",
                 None,
                 "移动nfo所在文件夹到目标目录,快捷键方向键→",
                 int(40 * self.scale_factor),

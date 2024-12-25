@@ -19,6 +19,12 @@ from PyQt5.QtWidgets import (
     QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
+    QDialog,  # Added for PhotoWallDialog
+    QScrollArea,  # Added for PhotoWallDialog
+    QWidget,
+    QVBoxLayout,
+    QGridLayout,
+    QHBoxLayout,
 )
 from PyQt5.QtCore import (
     Qt,
@@ -32,6 +38,129 @@ import subprocess
 import winshell
 
 from NFO_Editor_ui import NFOEditorQt
+
+
+class PhotoWallDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent = parent
+        self.setWindowTitle("海报照片墙")
+        self.setModal(True)
+        self.resize(800, 600)
+
+        # 创建主布局
+        main_layout = QVBoxLayout(self)
+
+        # 创建滚动区域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        # 创建容器widget
+        content = QWidget()
+        self.grid = QGridLayout(content)
+        self.grid.setSpacing(10)
+        scroll.setWidget(content)
+
+        # 添加滚动区域到主布局
+        main_layout.addWidget(scroll)
+
+    def load_posters(self, folder_path: str) -> None:
+        """加载所有海报"""
+        if not folder_path or not os.path.exists(folder_path):
+            return
+
+        # 清除现有内容
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        row = 0
+        col = 0
+        max_cols = 4  # 每行显示的最大海报数
+
+        # 遍历文件夹
+        for root, _, files in os.walk(folder_path):
+            for file in files:
+                if file.lower().endswith(".jpg") and "poster" in file.lower():
+                    try:
+                        # 创建图片标签
+                        label = QLabel()
+                        pixmap = QPixmap(os.path.join(root, file))
+                        scaled_pixmap = pixmap.scaled(
+                            180,
+                            270,  # 固定大小
+                            Qt.KeepAspectRatio,
+                            Qt.SmoothTransformation,
+                        )
+                        label.setPixmap(scaled_pixmap)
+                        label.setToolTip(os.path.basename(root))  # 显示文件夹名称
+
+                        # 使标签可点击
+                        label.setCursor(Qt.PointingHandCursor)
+
+                        # 创建闭包以保存正确的folder路径
+                        def create_click_handler(folder_path):
+                            def click_handler(event):
+                                self.play_video(folder_path)
+
+                            return click_handler
+
+                        label.mousePressEvent = create_click_handler(root)
+
+                        self.grid.addWidget(label, row, col)
+
+                        # 更新行列位置
+                        col += 1
+                        if col >= max_cols:
+                            col = 0
+                            row += 1
+
+                    except Exception as e:
+                        QMessageBox.warning(
+                            self, "警告", f"加载海报失败 {file}: {str(e)}"
+                        )
+
+    def play_video(self, folder_path: str) -> None:
+        """播放对应文件夹中的视频"""
+        if not folder_path or not os.path.exists(folder_path):
+            return
+
+        video_extensions = [
+            ".mp4",
+            ".mkv",
+            ".avi",
+            ".mov",
+            ".rm",
+            ".mpeg",
+            ".ts",
+            ".strm",
+        ]
+
+        for ext in video_extensions:
+            for file in os.listdir(folder_path):
+                if file.lower().endswith(ext):
+                    video_path = os.path.join(folder_path, file)
+                    try:
+                        if ext == ".strm":
+                            with open(video_path, "r", encoding="utf-8") as f:
+                                strm_url = f.readline().strip()
+                            if strm_url:
+                                subprocess.Popen(["mpvnet", strm_url])
+                            else:
+                                QMessageBox.critical(
+                                    self, "错误", "STRM文件内容为空或无效"
+                                )
+                        else:
+                            subprocess.Popen(["mpvnet", video_path])
+                        return
+                    except Exception as e:
+                        QMessageBox.critical(self, "错误", f"播放视频失败: {str(e)}")
+                        return
+
+        QMessageBox.warning(self, "警告", "未找到匹配的视频文件")
 
 
 class FileOperationThread(QThread):
@@ -161,7 +290,9 @@ class NFOEditorQt5(NFOEditorQt):
                 btn.clicked.connect(self.open_batch_rename_tool)
             elif text == "🔁":
                 btn.clicked.connect(self.load_files_in_folder)
-            elif text == "=>":
+            elif text == "🖼":
+                btn.clicked.connect(self.show_photo_wall)
+            elif text == "🔜":
                 btn.clicked.connect(self.start_move_thread)
             elif text == "批量填充 (Batch Filling)":
                 btn.clicked.connect(self.batch_filling)
@@ -1530,6 +1661,19 @@ class NFOEditorQt5(NFOEditorQt):
                 self.folder_path = path
                 self.folder_path_label.setText(path)
                 self.load_files_in_folder()
+
+    def show_photo_wall(self):
+        """显示照片墙对话框"""
+        try:
+            if not self.folder_path:
+                QMessageBox.warning(self, "警告", "请先选择NFO目录")
+                return
+
+            dialog = PhotoWallDialog(self)
+            dialog.load_posters(self.folder_path)
+            dialog.exec_()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"打开照片墙失败: {str(e)}")
 
 
 def main():
