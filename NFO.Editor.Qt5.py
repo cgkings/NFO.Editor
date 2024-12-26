@@ -8,13 +8,18 @@ from datetime import datetime
 from PIL import Image
 from PyQt5.QtWidgets import (
     QApplication,
+    QButtonGroup,
+    QComboBox,
+    QFrame,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QFileDialog,
     QMenu,
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QRadioButton,
     QShortcut,
     QTextEdit,
     QTreeWidget,
@@ -42,14 +47,61 @@ from NFO_Editor_ui import NFOEditorQt
 
 class PhotoWallDialog(QDialog):
     def __init__(self, parent=None):
-        super().__init__(parent)
-        self.parent = parent
+        # 首先调用父类构造函数，但不传递parent参数，使其成为顶层窗口
+        super().__init__(None)  # 这里传入None而不是parent
+        self.parent_window = parent  # 保存对父窗口的引用，但不建立窗口层级关系
         self.setWindowTitle("海报照片墙")
-        self.setModal(True)
         self.resize(800, 600)
+
+        # 初始化存储所有海报信息的列表
+        self.all_posters = []  # [(path, folder_name, nfo_data), ...]
+
+        # 设置与主窗口相同的图标
+        if parent and parent.windowIcon():
+            self.setWindowIcon(parent.windowIcon())
+        else:
+            # 如果主窗口没有图标，尝试加载默认图标
+            try:
+                icon_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "chuizi.ico"
+                )
+                if os.path.exists(icon_path):
+                    self.setWindowIcon(QIcon(icon_path))
+            except Exception:
+                pass
+
+        # 设置为独立窗口，并添加所需的窗口功能
+        self.setWindowFlags(
+            Qt.Window  # 独立窗口
+            | Qt.WindowSystemMenuHint  # 系统菜单
+            | Qt.WindowMinMaxButtonsHint  # 最小化最大化按钮
+            | Qt.WindowCloseButtonHint  # 关闭按钮
+        )
+
+        # 添加窗口属性以获得正确的窗口行为
+        self.setAttribute(Qt.WA_DeleteOnClose, True)  # 关闭时自动删除
+        self.setModal(False)  # 设置为非模态对话框
 
         # 创建主布局
         main_layout = QVBoxLayout(self)
+
+        # 添加排序和筛选面板
+        filter_panel = self.create_filter_panel()
+        main_layout.addWidget(filter_panel)
+
+        # 添加状态栏显示影片数量
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet(
+            """
+            QLabel {
+                color: rgb(200, 200, 200);
+                font-size: 12px;
+                padding: 5px;
+                background-color: rgb(30, 30, 30);
+            }
+        """
+        )
+        main_layout.addWidget(self.status_label)
 
         # 创建滚动区域
         scroll = QScrollArea()
@@ -66,11 +118,163 @@ class PhotoWallDialog(QDialog):
         # 添加滚动区域到主布局
         main_layout.addWidget(scroll)
 
+    def update_status(self, count, total=None):
+        """更新状态栏信息"""
+        if total is None:
+            # 正常显示模式
+            self.status_label.setText(f"共加载 {count} 个影片")
+        else:
+            # 筛选模式
+            self.status_label.setText(f"筛选结果: {count} / 总计 {total} 个影片")
+
+    def create_filter_panel(self):
+        """创建排序和筛选面板"""
+        frame = QFrame()
+        grid = QGridLayout(frame)
+        grid.setContentsMargins(1, 1, 1, 1)
+        grid.setSpacing(2)
+
+        # 排序选项
+        sort_label = QLabel("排序 (Sort by):")
+        grid.addWidget(sort_label, 0, 0)
+
+        self.sorting_group = QButtonGroup(self)
+        sort_options = [
+            "文件名 (Filename)",
+            "演员 (Actors)",
+            "系列 (Series)",
+            "评分 (Rating)",
+        ]
+        for col, text in enumerate(sort_options, 1):
+            radio = QRadioButton(text)
+            self.sorting_group.addButton(radio)
+            grid.addWidget(radio, 0, col)
+
+        # 连接排序按钮组的信号
+        self.sorting_group.buttonClicked.connect(self.sort_posters)
+
+        # 筛选选项
+        self.field_combo = QComboBox()
+        self.field_combo.setFixedWidth(65)
+        self.field_combo.addItems(["标题", "标签", "演员", "系列", "评分"])
+        grid.addWidget(self.field_combo, 0, len(sort_options) + 1)
+
+        self.condition_combo = QComboBox()
+        self.condition_combo.setFixedWidth(65)
+        grid.addWidget(self.condition_combo, 0, len(sort_options) + 2)
+
+        self.filter_entry = QLineEdit()
+        self.filter_entry.setFixedWidth(100)
+        grid.addWidget(self.filter_entry, 0, len(sort_options) + 3)
+
+        filter_button = QPushButton("筛选")
+        filter_button.setFixedSize(45, 30)
+        filter_button.setToolTip("根据条件筛选海报")
+        filter_button.clicked.connect(self.apply_filter)
+        grid.addWidget(filter_button, 0, len(sort_options) + 4)
+
+        # 连接字段改变信号
+        self.field_combo.currentIndexChanged.connect(self.on_field_changed)
+        self.condition_combo.currentIndexChanged.connect(
+            lambda x: self.filter_entry.clear()
+        )
+
+        # 设置默认条件
+        self.on_field_changed(0)
+
+        return frame
+
+    def on_field_changed(self, index):
+        """字段改变时更新条件选项"""
+        self.condition_combo.clear()
+        self.filter_entry.clear()
+        if self.field_combo.currentText() == "评分":
+            self.condition_combo.addItems(["大于", "小于"])
+        else:
+            self.condition_combo.addItems(["包含", "不包含"])
+
     def load_posters(self, folder_path: str) -> None:
-        """加载所有海报"""
+        """加载所有海报并存储相关信息"""
         if not folder_path or not os.path.exists(folder_path):
             return
 
+        self.all_posters.clear()
+
+        # 遍历文件夹
+        for root, _, files in os.walk(folder_path):
+            poster_file = None
+            nfo_file = None
+
+            # 查找poster和nfo文件
+            for file in files:
+                if file.lower().endswith(".jpg") and "poster" in file.lower():
+                    poster_file = os.path.join(root, file)
+                elif file.lower().endswith(".nfo"):
+                    nfo_file = os.path.join(root, file)
+
+            # 如果找到了poster和nfo
+            if poster_file and nfo_file:
+                try:
+                    # 解析NFO文件获取信息
+                    nfo_data = self.parse_nfo(nfo_file)
+                    folder_name = os.path.basename(root)
+                    self.all_posters.append((poster_file, folder_name, nfo_data))
+                except Exception as e:
+                    print(f"处理文件失败 {poster_file}: {str(e)}")
+
+        # 显示海报
+        self.display_posters(self.all_posters)
+        self.update_status(len(self.all_posters))
+
+    def parse_nfo(self, nfo_path):
+        """解析NFO文件获取信息"""
+        try:
+            tree = ET.parse(nfo_path)
+            root = tree.getroot()
+
+            # 获取基本信息
+            title = root.find("title")
+            title = title.text if title is not None else ""
+
+            # 获取年份
+            year = ""
+            release = root.find("release")
+            if release is not None and release.text:
+                try:
+                    year = release.text.split("-")[0]
+                except:
+                    year = ""
+
+            series = root.find("series")
+            series = series.text if series is not None else ""
+
+            rating = root.find("rating")
+            rating = float(rating.text) if rating is not None else 0
+
+            # 获取演员列表
+            actors = [
+                actor.find("name").text
+                for actor in root.findall("actor")
+                if actor.find("name") is not None
+            ]
+
+            # 获取标签
+            tags = [tag.text for tag in root.findall("tag") if tag is not None]
+
+            return {
+                "title": title,
+                "year": year,
+                "series": series,
+                "rating": rating,
+                "actors": actors,
+                "tags": tags,
+            }
+        except Exception as e:
+            print(f"解析NFO文件失败 {nfo_path}: {str(e)}")
+            return {}
+
+    def display_posters(self, posters):
+        """显示海报墙"""
         # 清除现有内容
         while self.grid.count():
             item = self.grid.takeAt(0)
@@ -79,49 +283,204 @@ class PhotoWallDialog(QDialog):
 
         row = 0
         col = 0
-        max_cols = 4  # 每行显示的最大海报数
+        max_cols = 6  # 每行显示6个
+        spacing = 10  # 间距
 
-        # 遍历文件夹
-        for root, _, files in os.walk(folder_path):
-            for file in files:
-                if file.lower().endswith(".jpg") and "poster" in file.lower():
+        # 固定尺寸
+        POSTER_WIDTH = 180  # 固定宽度
+        POSTER_HEIGHT = 270  # 固定高度
+        TITLE_HEIGHT = 40  # 固定标题区域高度
+
+        for poster_file, folder_name, nfo_data in posters:
+            try:
+                # 创建容器
+                container = QFrame()
+                container.setFixedSize(POSTER_WIDTH, POSTER_HEIGHT + TITLE_HEIGHT)
+                container.setStyleSheet(
+                    """
+                    QFrame {
+                        background-color: rgb(20, 20, 20);
+                        border-radius: 3px;
+                    }
+                    QFrame:hover {
+                        background-color: rgb(40, 40, 40);
+                    }
+                """
+                )
+
+                # 创建布局
+                container_layout = QVBoxLayout(container)
+                container_layout.setSpacing(0)
+                container_layout.setContentsMargins(0, 0, 0, 0)
+
+                # 海报图片区域
+                poster_widget = QWidget()
+                poster_widget.setFixedSize(POSTER_WIDTH, POSTER_HEIGHT)
+                poster_widget.setCursor(Qt.PointingHandCursor)
+
+                # 加载并显示图片
+                poster_label = QLabel(poster_widget)
+                poster_label.setAlignment(Qt.AlignCenter)
+                pixmap = QPixmap(poster_file)
+                scaled_pixmap = pixmap.scaled(
+                    POSTER_WIDTH,
+                    POSTER_HEIGHT,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+                poster_label.setPixmap(scaled_pixmap)
+
+                # 添加点击事件
+                poster_widget.mousePressEvent = lambda e, path=os.path.dirname(
+                    poster_file
+                ): self.play_video(path)
+
+                # 标题区域
+                title_widget = QWidget()
+                title_widget.setFixedSize(POSTER_WIDTH, TITLE_HEIGHT)
+                title_widget.setCursor(Qt.PointingHandCursor)
+                title_widget.mousePressEvent = lambda e, path=os.path.dirname(
+                    poster_file
+                ): self.select_in_main_window(path)
+
+                title_layout = QVBoxLayout(title_widget)
+                title_layout.setSpacing(2)
+                title_layout.setContentsMargins(5, 2, 5, 2)
+
+                # 标题标签
+                title_label = QLabel(nfo_data.get("title", ""))
+                title_label.setStyleSheet(
+                    """
+                    QLabel {
+                        color: rgb(200, 200, 200);
+                        font-size: 12px;
+                    }
+                """
+                )
+                title_label.setAlignment(Qt.AlignCenter)
+                title_label.setWordWrap(True)
+                title_label.setFixedHeight(int(TITLE_HEIGHT * 0.6))
+
+                # 年份和评分信息
+                info_text = []
+                if year := nfo_data.get("year"):
+                    info_text.append(str(year))
+                if rating := nfo_data.get("rating"):
                     try:
-                        # 创建图片标签
-                        label = QLabel()
-                        pixmap = QPixmap(os.path.join(root, file))
-                        scaled_pixmap = pixmap.scaled(
-                            180,
-                            270,  # 固定大小
-                            Qt.KeepAspectRatio,
-                            Qt.SmoothTransformation,
-                        )
-                        label.setPixmap(scaled_pixmap)
-                        label.setToolTip(os.path.basename(root))  # 显示文件夹名称
+                        rating_num = float(rating)
+                        if rating_num > 0:
+                            info_text.append(f"★{rating_num:.1f}")
+                    except (ValueError, TypeError):
+                        pass
 
-                        # 使标签可点击
-                        label.setCursor(Qt.PointingHandCursor)
+                info_label = QLabel(" · ".join(info_text))
+                info_label.setStyleSheet(
+                    """
+                    QLabel {
+                        color: rgb(140, 140, 140);
+                        font-size: 10px;
+                    }
+                """
+                )
+                info_label.setAlignment(Qt.AlignCenter)
 
-                        # 创建闭包以保存正确的folder路径
-                        def create_click_handler(folder_path):
-                            def click_handler(event):
-                                self.play_video(folder_path)
+                # 组装布局
+                title_layout.addWidget(title_label)
+                title_layout.addWidget(info_label)
 
-                            return click_handler
+                container_layout.addWidget(poster_widget)
+                container_layout.addWidget(title_widget)
 
-                        label.mousePressEvent = create_click_handler(root)
+                self.grid.addWidget(container, row, col)
 
-                        self.grid.addWidget(label, row, col)
+                # 更新位置
+                col += 1
+                if col >= max_cols:
+                    col = 0
+                    row += 1
 
-                        # 更新行列位置
-                        col += 1
-                        if col >= max_cols:
-                            col = 0
-                            row += 1
+            except Exception as e:
+                print(f"加载海报失败 {poster_file}: {str(e)}")
 
-                    except Exception as e:
-                        QMessageBox.warning(
-                            self, "警告", f"加载海报失败 {file}: {str(e)}"
-                        )
+        # 设置网格间距和行拉伸
+        self.grid.setSpacing(spacing)
+        self.grid.setRowStretch(row + 1, 1)
+
+    def select_in_main_window(self, folder_path):
+        """在主窗口中选中对应的文件夹"""
+        try:
+            # 获取相对路径
+            rel_path = os.path.relpath(folder_path, self.parent_window.folder_path)
+            parts = rel_path.split(os.sep)
+
+            # 激活主窗口
+            self.parent_window.show()
+            self.parent_window.activateWindow()
+            self.parent_window.raise_()
+
+            # 在文件树中查找
+            found = False
+            for i in range(self.parent_window.file_tree.topLevelItemCount()):
+                item = self.parent_window.file_tree.topLevelItem(i)
+                first_level = item.text(0)
+                second_level = item.text(1)
+
+                # 构建当前项的完整路径
+                if second_level:
+                    item_path = os.path.join(
+                        self.parent_window.folder_path, first_level, second_level
+                    )
+                else:
+                    item_path = os.path.join(
+                        self.parent_window.folder_path, first_level
+                    )
+
+                # 比较标准化后的路径
+                if os.path.normpath(item_path) == os.path.normpath(folder_path):
+                    self.parent_window.file_tree.setCurrentItem(item)
+                    self.parent_window.file_tree.scrollToItem(item)  # 确保选中项可见
+                    found = True
+                    break
+
+            if found:
+                # 触发选择变更事件
+                self.parent_window.file_tree.itemSelectionChanged.emit()
+                self.parent_window.on_file_select()  # 直接调用选择处理函数
+
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"选择文件失败: {str(e)}")
+
+    def sort_posters(self, button=None):
+        """排序海报"""
+        if not self.sorting_group.checkedButton():
+            return
+
+        sort_by = self.sorting_group.checkedButton().text()
+
+        def get_sort_key(poster_info):
+            _, _, nfo_data = poster_info
+
+            if "演员" in sort_by:
+                return ", ".join(sorted(nfo_data.get("actors", [])))
+            elif "系列" in sort_by:
+                return nfo_data.get("series", "").lower()
+            elif "评分" in sort_by:
+                try:
+                    return float(nfo_data.get("rating", 0))
+                except (ValueError, TypeError):
+                    return 0
+            else:  # 文件名
+                return nfo_data.get("title", "").lower()
+
+        # 排序海报列表
+        sorted_posters = sorted(self.all_posters, key=get_sort_key)
+
+        # 如果是评分排序，倒序显示
+        if "评分" in sort_by:
+            sorted_posters.reverse()
+
+        # 重新显示排序后的海报
+        self.display_posters(sorted_posters)
 
     def play_video(self, folder_path: str) -> None:
         """播放对应文件夹中的视频"""
@@ -161,6 +520,59 @@ class PhotoWallDialog(QDialog):
                         return
 
         QMessageBox.warning(self, "警告", "未找到匹配的视频文件")
+
+    def apply_filter(self):
+        """应用筛选"""
+        field = self.field_combo.currentText()
+        condition = self.condition_combo.currentText()
+        filter_text = self.filter_entry.text().strip()
+
+        filtered_posters = []
+        for poster_info in self.all_posters:
+            _, _, nfo_data = poster_info
+
+            # 获取对应字段的值
+            value = ""
+            if field == "标题":
+                value = nfo_data.get("title", "")
+            elif field == "标签":
+                value = ", ".join(nfo_data.get("tags", []))
+            elif field == "演员":
+                value = ", ".join(nfo_data.get("actors", []))
+            elif field == "系列":
+                value = nfo_data.get("series", "")
+            elif field == "评分":
+                value = str(nfo_data.get("rating", 0))
+
+            # 判断是否匹配
+            match = False
+            if field == "评分":
+                try:
+                    current_value = float(value)
+                    filter_value = float(filter_text)
+                    if condition == "大于":
+                        match = current_value > filter_value
+                    elif condition == "小于":
+                        match = current_value < filter_value
+                except ValueError:
+                    continue
+            else:
+                if condition == "包含":
+                    match = filter_text.lower() in value.lower()
+                elif condition == "不包含":
+                    match = filter_text.lower() not in value.lower()
+
+            if match:
+                filtered_posters.append(poster_info)
+
+        # 显示筛选后的海报并更新状态信息
+        self.display_posters(filtered_posters)
+        total = len(self.all_posters)
+        filtered = len(filtered_posters)
+        if filter_text:
+            self.update_status(filtered, total)
+        else:
+            self.update_status(total)  # 如果没有筛选条件，显示总数
 
 
 class FileOperationThread(QThread):
@@ -1671,7 +2083,8 @@ class NFOEditorQt5(NFOEditorQt):
 
             dialog = PhotoWallDialog(self)
             dialog.load_posters(self.folder_path)
-            dialog.exec_()
+            dialog.show()  # 使用 show() 而不是 exec_()
+
         except Exception as e:
             QMessageBox.critical(self, "错误", f"打开照片墙失败: {str(e)}")
 
