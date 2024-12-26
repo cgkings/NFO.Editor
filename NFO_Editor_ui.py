@@ -46,7 +46,7 @@ class NFOEditorQt(QMainWindow):
         self.screen_dpi = self.screen().logicalDotsPerInch()
         self.scale_factor = self.screen_dpi / 96.0
 
-        self.setWindowTitle("大锤 NFO Editor Qt v9.5.3")
+        self.setWindowTitle("大锤 NFO Editor Qt v9.5.4")
         self.resize(1280, 800)
 
         # 初始化状态栏
@@ -208,8 +208,8 @@ class NFOEditorQt(QMainWindow):
         main_grid.addWidget(editor_frame, 2, 2)
 
         # Set column stretches
-        main_grid.setColumnStretch(0, 2)  # File tree
-        main_grid.setColumnStretch(1, 1)  # Target tree
+        main_grid.setColumnStretch(0, 3)  # File tree
+        main_grid.setColumnStretch(1, 2)  # Target tree
         main_grid.setColumnStretch(2, 3)  # Editor panel
 
         # Set row stretches - 让包含树和编辑器的行获得更多空间
@@ -484,14 +484,17 @@ class NFOEditorQt(QMainWindow):
         layout.setSpacing(int(2 * self.scale_factor))
 
         fields = {
-            "num": ("番号", 1),
-            "title": ("标题", 2),
+            "num": ("番号", 2),
+            "title": ("标题", 2.5),
             "plot": ("简介", 3),
             "tags": ("标签", 2.5),
             "actors": ("演员", 1.5),
             "series": ("系列", 1.5),
             "rating": ("评分", 1.5),
         }
+
+        # 设置文本框宽度
+        text_width = int(590 * self.scale_factor)
 
         for field, (label_text, height) in fields.items():
             field_frame = QFrame()
@@ -506,49 +509,46 @@ class NFOEditorQt(QMainWindow):
             field_layout.addWidget(label)
 
             if field == "num":
-                # 创建番号和年份容器
                 container = QFrame()
                 container_layout = QHBoxLayout(container)
                 container_layout.setContentsMargins(0, 0, 0, 0)
                 container_layout.setSpacing(int(5 * self.scale_factor))
 
-                # 左侧番号
                 num_frame = QFrame()
                 num_layout = QHBoxLayout(num_frame)
                 num_layout.setContentsMargins(0, 0, 0, 0)
-
                 entry = QLabel()
                 entry.setCursor(Qt.PointingHandCursor)
                 entry.setStyleSheet("color: blue; text-decoration: underline;")
+                entry.setFixedWidth(int(text_width * 0.6))
                 num_layout.addWidget(entry)
 
-                # 右侧年份
                 year_frame = QFrame()
                 year_layout = QHBoxLayout(year_frame)
                 year_layout.setContentsMargins(0, 0, 0, 0)
-
                 year_label = QLabel("发行日期：")
                 year_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 year_layout.addWidget(year_label)
-
                 self.release_label = QLabel()
                 self.release_label.setObjectName("release_label")
                 year_layout.addWidget(self.release_label)
 
-                container_layout.addWidget(num_frame, 1)
+                container_layout.addWidget(num_frame)
                 container_layout.addWidget(year_frame)
                 field_layout.addWidget(container)
 
                 entry.setFixedHeight(int(22 * self.scale_factor))
                 self.fields_entries[field] = entry
-
             else:
                 entry = QTextEdit()
                 entry.setFixedHeight(int(22 * self.scale_factor * height))
+                entry.setFixedWidth(text_width)
                 entry.setTabChangesFocus(True)
                 field_layout.addWidget(entry)
                 self.fields_entries[field] = entry
 
+            # 使用整数值的stretch
+            field_layout.addStretch(1)
             layout.addWidget(field_frame)
 
         return frame
@@ -557,14 +557,14 @@ class NFOEditorQt(QMainWindow):
         frame = QFrame()
         grid = QGridLayout(frame)
         grid.setContentsMargins(
-            int(15 * self.scale_factor), int(5 * self.scale_factor), 0, 0
+            int(15 * self.scale_factor), int(20 * self.scale_factor), 0, 0
         )
         grid.setSpacing(int(15 * self.scale_factor))
 
         buttons = [
-            ("保存更改 (Save Changes)", int(250 * self.scale_factor)),
-            ("批量填充 (Batch Filling)", int(250 * self.scale_factor)),
-            ("批量新增 (Batch Add)", int(250 * self.scale_factor)),
+            ("保存更改 (Save Changes)", int(205 * self.scale_factor)),
+            ("批量填充 (Batch Filling)", int(205 * self.scale_factor)),
+            ("批量新增 (Batch Add)", int(205 * self.scale_factor)),
         ]
 
         button_frame = QFrame()

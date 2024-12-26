@@ -176,7 +176,21 @@ jobs:
         
         Move-Item -Path "dist/shared/cg_dedupe/cg_dedupe.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
         Remove-Item -Path "dist/shared/cg_dedupe" -Recurse -Force -ErrorAction SilentlyContinue
+
+        # cg_photo_wall
+        pyinstaller --name "cg_photo_wall" `
+          --distpath "./dist/shared" `
+          --workpath "./build/shared" `
+          --onedir `
+          --noconsole `
+          --icon="chuizi.ico" `
+          --add-data "chuizi.ico;." `
+          -y `
+          "cg_photo_wall.py"
         
+        Move-Item -Path "dist/shared/cg_photo_wall/cg_photo_wall.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "dist/shared/cg_photo_wall" -Recurse -Force -ErrorAction SilentlyContinue
+
         # 移动共享依赖到最终目录
         Copy-Item -Path "shared_libs/*" -Destination "dist/NFOTools/" -Recurse -Force
         
@@ -215,9 +229,10 @@ jobs:
           
           CreateDirectory "$SMPROGRAMS\NFO Tools"
           CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Editor.lnk" "$INSTDIR\NFO.Editor.Qt5.exe"
-          CreateShortCut "$SMPROGRAMS\NFO Tools\CG Crop.lnk" "$INSTDIR\cg_crop.exe"
-          CreateShortCut "$SMPROGRAMS\NFO Tools\CG Rename.lnk" "$INSTDIR\cg_rename.exe"
+          CreateShortCut "$SMPROGRAMS\NFO Tools\Cg Crop.lnk" "$INSTDIR\cg_crop.exe"
+          CreateShortCut "$SMPROGRAMS\NFO Tools\Cg Rename.lnk" "$INSTDIR\cg_rename.exe"
           CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Dedupe.lnk" "$INSTDIR\cg_dedupe.exe"
+          CreateShortCut "$SMPROGRAMS\NFO Tools\Cg Photo Wall.lnk" "$INSTDIR\cg_photo_wall.exe"
           
           WriteUninstaller "$INSTDIR\uninstall.exe"
           CreateShortCut "$SMPROGRAMS\NFO Tools\Uninstall.lnk" "$INSTDIR\uninstall.exe"
@@ -229,12 +244,14 @@ jobs:
           Delete "$INSTDIR\NFO.Editor.Qt5.exe"
           Delete "$INSTDIR\cg_rename.exe"
           Delete "$INSTDIR\cg_dedupe.exe"
+          Delete "$INSTDIR\cg_photo_wall.exe"
           Delete "$INSTDIR\chuizi.ico"
           
           Delete "$SMPROGRAMS\NFO Tools\NFO Editor.lnk"
-          Delete "$SMPROGRAMS\NFO Tools\CG Crop.lnk"
-          Delete "$SMPROGRAMS\NFO Tools\CG Rename.lnk"
+          Delete "$SMPROGRAMS\NFO Tools\Cg Crop.lnk"
+          Delete "$SMPROGRAMS\NFO Tools\Cg Rename.lnk"
           Delete "$SMPROGRAMS\NFO Tools\NFO Dedupe.lnk"
+          Delete "$SMPROGRAMS\NFO Tools\Cg Photo Wall.lnk"
           Delete "$SMPROGRAMS\NFO Tools\Uninstall.lnk"
           
           RMDir /r "$INSTDIR"

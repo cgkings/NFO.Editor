@@ -676,6 +676,9 @@ class NFOEditorQt5(NFOEditorQt):
         self.move_thread = None
         self.file_watcher = QFileSystemWatcher()
 
+        # 默认勾选显示图片选项
+        self.show_images_checkbox.setChecked(True)
+
         # 连接信号槽
         self.setup_signals()
 
@@ -2077,16 +2080,63 @@ class NFOEditorQt5(NFOEditorQt):
     def show_photo_wall(self):
         """显示照片墙对话框"""
         try:
+            from cg_photo_wall import PhotoWallDialog
+
             if not self.folder_path:
                 QMessageBox.warning(self, "警告", "请先选择NFO目录")
                 return
 
-            dialog = PhotoWallDialog(self)
-            dialog.load_posters(self.folder_path)
-            dialog.show()  # 使用 show() 而不是 exec_()
+            # 创建照片墙对话框实例
+            dialog = PhotoWallDialog(self.folder_path, self)
+            dialog.show()  # 非模态显示
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"打开照片墙失败: {str(e)}")
+
+    def select_folder_in_tree(self, folder_path):
+        """在文件树中选择指定文件夹"""
+        try:
+            if not self.folder_path:
+                # 如果尚未选择基础目录，先设置它
+                base_path = os.path.dirname(folder_path)
+                self.folder_path = base_path
+                self.load_files_in_folder()
+
+            # 获取相对路径
+            rel_path = os.path.relpath(folder_path, self.folder_path)
+            parts = rel_path.split(os.sep)
+
+            # 在文件树中查找
+            found = False
+            for i in range(self.file_tree.topLevelItemCount()):
+                item = self.file_tree.topLevelItem(i)
+                first_level = item.text(0)
+                second_level = item.text(1)
+
+                # 构建当前项的完整路径
+                if second_level:
+                    item_path = os.path.join(
+                        self.folder_path, first_level, second_level
+                    )
+                else:
+                    item_path = os.path.join(self.folder_path, first_level)
+
+                # 比较标准化后的路径
+                if os.path.normpath(item_path) == os.path.normpath(folder_path):
+                    self.file_tree.setCurrentItem(item)
+                    self.file_tree.scrollToItem(item)
+                    found = True
+                    break
+
+            if found:
+                # 触发选择变更事件
+                self.file_tree.itemSelectionChanged.emit()
+                self.on_file_select()
+            else:
+                QMessageBox.warning(self, "警告", f"未找到文件夹: {folder_path}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"选择文件夹失败: {str(e)}")
 
 
 def main():
@@ -2100,8 +2150,26 @@ def main():
     app.setStyle("Fusion")
 
     window = NFOEditorQt5()
-    window.show()
 
+    # 处理命令行参数
+    import argparse
+
+    parser = argparse.ArgumentParser(description="NFO Editor")
+    parser.add_argument("--base-path", help="基础目录路径")
+    parser.add_argument("--select-folder", help="要选择的文件夹路径")
+
+    args = parser.parse_args()
+
+    # 如果指定了基础目录，打开它
+    if args.base_path and os.path.exists(args.base_path):
+        window.folder_path = args.base_path
+        window.load_files_in_folder()
+
+        # 如果还指定了要选择的文件夹，选中它
+        if args.select_folder:
+            window.select_folder_in_tree(args.select_folder)
+
+    window.show()
     sys.exit(app.exec_())
 
 
