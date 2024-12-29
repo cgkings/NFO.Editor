@@ -237,7 +237,12 @@ class NFOEditorQt(QMainWindow):
                 "选择目录以加载NFO文件",
                 int(150 * self.scale_factor),
             ),
-            ("选择整理目录", None, "选择整理目录", int(150 * self.scale_factor)),
+            (
+                "选择整理目录",
+                None,
+                "选择后方显示整理目录列表",
+                int(150 * self.scale_factor),
+            ),
             ("🖊", None, "打开选中的NFO文件", int(40 * self.scale_factor)),
             ("📁", None, "打开选中的文件夹", int(40 * self.scale_factor)),
             ("⏯", None, "播放选中的视频文件", int(40 * self.scale_factor)),
