@@ -357,9 +357,18 @@ class NFOEditorQt5(NFOEditorQt):
 
     def open_folder(self):
         """选择并打开NFO文件夹"""
-        folder_selected = QFileDialog.getExistingDirectory(self, "选择NFO文件夹")
+        # 获取上次打开的目录
+        settings = QSettings("NFOEditor", "Directories")
+        last_dir = settings.value("last_nfo_dir", "")
+
+        folder_selected = QFileDialog.getExistingDirectory(
+            self, "选择NFO文件夹", last_dir  # 使用上次的目录作为起始目录
+        )
+
         if folder_selected:
             self.folder_path = folder_selected
+            # 保存当前选择的目录
+            settings.setValue("last_nfo_dir", folder_selected)
             # 直接加载文件而不更新label
             self.load_files_in_folder()
 
@@ -370,9 +379,18 @@ class NFOEditorQt5(NFOEditorQt):
 
     def select_target_folder(self):
         """选择目标文件夹处理函数"""
-        target_folder = QFileDialog.getExistingDirectory(self, "选择目标文件夹")
+        # 获取上次打开的目标目录
+        settings = QSettings("NFOEditor", "Directories")
+        last_target_dir = settings.value("last_target_dir", "")
+
+        target_folder = QFileDialog.getExistingDirectory(
+            self, "选择目标文件夹", last_target_dir  # 使用上次的目录作为起始目录
+        )
+
         if target_folder:
             self.current_target_path = target_folder
+            # 保存当前选择的目标目录
+            settings.setValue("last_target_dir", target_folder)
             self.load_target_files(target_folder)
 
             # 显示目标文件夹树并恢复其列伸缩因子
