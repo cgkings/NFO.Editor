@@ -98,7 +98,7 @@ class PhotoWallDialog(QDialog):
 
     def init_ui(self):
         """初始化UI"""
-        self.setWindowTitle("大锤 NFO照片墙 v9.5.4")
+        self.setWindowTitle("大锤 NFO照片墙 v9.5.5")
 
         # 获取主屏幕大小
         screen = QDesktopWidget().availableGeometry()
@@ -199,7 +199,7 @@ class PhotoWallDialog(QDialog):
 
         self.sorting_group = QButtonGroup(self)
         sort_options = [
-            "文件名 (Filename)",
+            "日期 (Release Date)",
             "演员 (Actors)",
             "系列 (Series)",
             "评分 (Rating)",
@@ -529,6 +529,7 @@ class PhotoWallDialog(QDialog):
 
             year = ""
             release = root.find("release")
+            release_date = release.text if release is not None else ""
             if release is not None and release.text:
                 try:
                     year = release.text.split("-")[0]
@@ -561,6 +562,7 @@ class PhotoWallDialog(QDialog):
                 "rating": rating,
                 "actors": actors,
                 "tags": tags,
+                "release": release_date,  # 添加 release 字段
             }
         except Exception as e:
             print(f"解析NFO文件失败 {nfo_path}: {str(e)}")
@@ -588,15 +590,11 @@ class PhotoWallDialog(QDialog):
                     return float(nfo_data.get("rating", 0))
                 except (ValueError, TypeError):
                     return 0
-            else:  # 文件名
-                return (nfo_data.get("title") or "").lower()
+            else:  # 文件名改为日期
+                return nfo_data.get("release", "")
 
         # 排序
-        self.all_posters.sort(key=get_sort_key)
-
-        # 评分倒序
-        if "评分" in sort_by:
-            self.all_posters.reverse()
+        self.all_posters.sort(key=get_sort_key, reverse=True)
 
         self.display_current_page()
 

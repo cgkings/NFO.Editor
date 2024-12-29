@@ -46,7 +46,7 @@ class NFOEditorQt(QMainWindow):
         self.screen_dpi = self.screen().logicalDotsPerInch()
         self.scale_factor = self.screen_dpi / 96.0
 
-        self.setWindowTitle("大锤 NFO Editor Qt v9.5.4")
+        self.setWindowTitle("大锤 NFO Editor Qt v9.5.5")
         self.resize(1280, 800)
 
         # 初始化状态栏
@@ -298,7 +298,7 @@ class NFOEditorQt(QMainWindow):
 
         self.sorting_group = QButtonGroup(self)
         sort_options = [
-            "文件名 (Filename)",
+            "日期 (Release Date)",
             "演员 (Actors)",
             "系列 (Series)",
             "评分 (Rating)",
