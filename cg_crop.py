@@ -521,7 +521,7 @@ class EmbyPosterCrop(QDialog):
 
         # 设置窗口图标
         try:
-            icon_path = get_resource_path("chuizi.ico")
+            icon_path = get_resource_path("caijian.ico")
             if os.path.exists(icon_path):
                 self.setWindowIcon(QIcon(icon_path))
         except Exception as e:
@@ -971,7 +971,7 @@ if __name__ == "__main__":
 
         # 设置应用程序图标
         try:
-            icon_path = get_resource_path("chuizi.ico")
+            icon_path = get_resource_path("caijian.ico")
             if os.path.exists(icon_path):
                 app.setWindowIcon(QIcon(icon_path))
         except Exception as e:
