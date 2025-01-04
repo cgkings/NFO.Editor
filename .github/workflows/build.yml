@@ -115,8 +115,8 @@ jobs:
           --workpath "./build/shared" `
           --onedir `
           --noconsole `
-          --icon="chuizi.ico" `
-          --add-data "chuizi.ico;." `
+          --icon="caijian.ico" `
+          --add-data "caijian.ico;." `
           --add-data "Img;Img" `
           --hidden-import win32com `
           --hidden-import win32com.client `
