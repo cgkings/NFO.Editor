@@ -36,6 +36,13 @@ from PyQt5.QtGui import (
     QImageReader,
 )
 import concurrent.futures
+from enum import Enum
+
+
+class LoadStage(Enum):
+    SCANNING = 1  # 扫描NFO阶段
+    PREPARING = 2  # 准备UI阶段
+    LOADING = 3  # 加载图片阶段
 
 
 class BluePalette(QPalette):
@@ -197,6 +204,9 @@ class PhotoWallDialog(QDialog):
             last_dir = self.settings.value("last_directory", "")
             if last_dir and os.path.exists(last_dir):
                 self.folder_path = last_dir  # 仅保存路径，不自动加载
+
+        # 添加排序键的数据结构，用于优化排序性能
+        self._sort_keys = {}
 
     def init_ui(self):
         """初始化UI"""
@@ -455,15 +465,19 @@ class PhotoWallDialog(QDialog):
 
         return frame
 
-    def update_progress(self, current, total):
+    def update_progress(self, current, total, stage=None):
         """更新进度条"""
+        if stage:
+            if stage == LoadStage.SCANNING:
+                self.progress_bar.setFormat("扫描文件: %v/%m")
+            elif stage == LoadStage.PREPARING:
+                self.progress_bar.setFormat("准备显示: %v/%m")
+            else:
+                self.progress_bar.setFormat("加载图片: %v/%m")
+
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(current)
-        if current == total:
-            self.progress_bar.hide()
-            self.cancel_button.hide()
-            self.is_loading = False
-        self.update_status(current, total)
+        self.update_status(current, total, stage)
 
     def cancel_loading(self):
         """取消加载"""
@@ -477,15 +491,6 @@ class PhotoWallDialog(QDialog):
                 self.image_manager.total_images,
                 cancelled=True,
             )
-
-    def update_status(self, count, total=None, cancelled=False):
-        """更新状态栏"""
-        if cancelled:
-            self.status_label.setText(f"已取消加载 (完成 {count}/{total})")
-        elif total is None:
-            self.status_label.setText(f"共加载 {count} 个影片")
-        else:
-            self.status_label.setText(f"正在加载: {count}/{total}")
 
     def on_resize(self, event):
         """窗口大小改变事件处理"""
@@ -521,6 +526,10 @@ class PhotoWallDialog(QDialog):
             if item.widget():
                 item.widget().deleteLater()
 
+        # 更新进度条状态
+        self.progress_bar.setFormat("创建界面元素: %v/%m")
+        total_posters = len(self.all_posters)
+
         # 计算网格尺寸
         max_cols, poster_width, poster_height, title_height = (
             self.calculate_grid_dimensions()
@@ -535,9 +544,14 @@ class PhotoWallDialog(QDialog):
         # 保存所有的引用
         self.current_posters = []
 
-        # 显示所有海报，移除18个限制
-        for poster_file, folder_name, nfo_data in self.all_posters:
+        # 显示所有海报
+        for index, (poster_file, folder_name, nfo_data) in enumerate(self.all_posters):
             try:
+                # 更新创建进度
+                self.progress_bar.setValue(index + 1)
+                self.progress_bar.setMaximum(total_posters)
+                self.update_status(index + 1, total_posters, "创建界面元素")
+                QApplication.processEvents()
                 # 创建容器
                 container = PosterContainer(
                     poster_width, poster_height, title_height, self.dpi_scale
@@ -644,9 +658,7 @@ class PhotoWallDialog(QDialog):
 
         # 开始加载图片
         if image_paths_and_labels:
-            self.is_loading = True
-            self.progress_bar.show()
-            self.cancel_button.show()
+            self.progress_bar.setFormat("加载图片: %v/%m")
             self.image_manager.add_images(image_paths_and_labels)
 
     def update_image_label(self, path, label, pixmap):
@@ -729,17 +741,32 @@ class PhotoWallDialog(QDialog):
             return {}
 
     def load_posters(self, folder_path):
-        """加载海报"""
+        """加载海报并预处理排序数据"""
         if not folder_path or not os.path.exists(folder_path):
             return
 
         self.all_posters.clear()
+        self._sort_keys.clear()
 
-        # 遍历文件夹
-        for root, _, files in os.walk(folder_path):
+        # 显示进度条
+        self.progress_bar.show()
+        self.cancel_button.show()
+        self.is_loading = True
+
+        # 第一阶段: 扫描文件
+        poster_nfo_pairs = []
+        total_dirs = sum([len(dirs) for _, dirs, _ in os.walk(folder_path)])
+        current_dir = 0
+
+        for root, dirs, files in os.walk(folder_path):
+            if not self.is_loading:
+                return
+
+            current_dir += 1
+            self.update_progress(current_dir, total_dirs, LoadStage.SCANNING)
+
             poster_file = None
             nfo_file = None
-
             for file in files:
                 if (
                     file.lower().endswith((".jpg", ".jpeg"))
@@ -748,54 +775,98 @@ class PhotoWallDialog(QDialog):
                     poster_file = os.path.join(root, file)
                 elif file.lower().endswith(".nfo"):
                     nfo_file = os.path.join(root, file)
-
             if poster_file and nfo_file:
-                try:
-                    nfo_data = self.parse_nfo(nfo_file)
-                    folder_name = os.path.basename(root)
-                    self.all_posters.append((poster_file, folder_name, nfo_data))
-                except Exception as e:
-                    print(f"处理文件失败 {poster_file}: {str(e)}")
+                poster_nfo_pairs.append((poster_file, nfo_file, root))
 
-        # 显示海报
-        self.display_current_page()
-        self.update_status(len(self.all_posters))
+        # 第二阶段: 准备UI元素
+        total_files = len(poster_nfo_pairs)
+        for index, (poster_file, nfo_file, root) in enumerate(poster_nfo_pairs):
+            if not self.is_loading:
+                return
 
-    def update_status(self, count, total=None):
+            try:
+                nfo_data = self.parse_nfo(nfo_file)
+                folder_name = os.path.basename(root)
+                self.all_posters.append((poster_file, folder_name, nfo_data))
+                self._update_sort_keys(nfo_data, len(self.all_posters) - 1)
+
+                # 更新准备阶段进度
+                self.update_progress(index + 1, total_files, LoadStage.PREPARING)
+                QApplication.processEvents()
+
+            except Exception as e:
+                print(f"处理文件失败 {poster_file}: {str(e)}")
+
+        # 第三阶段: 显示和加载图片
+        self.display_current_page()  # 这里会开始加载图片阶段
+
+    def _update_sort_keys(self, nfo_data, index):
+        """更新排序键"""
+        # 处理演员排序键
+        actors_key = ", ".join(sorted(nfo_data.get("actors", [])))
+        if "演员" not in self._sort_keys:
+            self._sort_keys["演员"] = []
+        self._sort_keys["演员"].append((actors_key, index))
+
+        # 处理系列排序键
+        series_key = (nfo_data.get("series") or "").lower()
+        if "系列" not in self._sort_keys:
+            self._sort_keys["系列"] = []
+        self._sort_keys["系列"].append((series_key, index))
+
+        # 处理评分排序键
+        try:
+            rating_key = float(nfo_data.get("rating", 0))
+        except (ValueError, TypeError):
+            rating_key = 0
+        if "评分" not in self._sort_keys:
+            self._sort_keys["评分"] = []
+        self._sort_keys["评分"].append((rating_key, index))
+
+        # 处理日期排序键
+        date_key = nfo_data.get("release", "")
+        if "日期" not in self._sort_keys:
+            self._sort_keys["日期"] = []
+        self._sort_keys["日期"].append((date_key, index))
+
+    def update_status(self, count, total, stage=None):
         """更新状态栏"""
-        if total is None:
-            self.status_label.setText(f"共加载 {count} 个影片")
+        stage_text = ""
+        if stage == LoadStage.SCANNING:
+            stage_text = "扫描文件"
+        elif stage == LoadStage.PREPARING:
+            stage_text = "准备显示"
+        elif stage == LoadStage.LOADING:
+            stage_text = "加载图片"
+
+        if stage:
+            if total:
+                self.status_label.setText(f"{stage_text}: {count}/{total}")
+            else:
+                self.status_label.setText(f"{stage_text}: {count}")
         else:
-            self.status_label.setText(f"筛选结果: {count} / 总计 {total} 个影片")
+            self.status_label.setText(f"共加载 {count} 个影片")
 
     def sort_posters(self):
-        """排序海报"""
+        """使用预处理的排序键进行排序"""
         if not self.sorting_group.checkedButton():
             return
 
         sort_by = self.sorting_group.checkedButton().text()
 
-        def get_sort_key(poster_info):
-            _, _, nfo_data = poster_info
+        # 使用预处理的排序键进行排序
+        if sort_by in self._sort_keys:
+            # 对索引进行排序
+            sorted_pairs = sorted(
+                self._sort_keys[sort_by], key=lambda x: x[0], reverse=True
+            )
 
-            if nfo_data is None:
-                return ""
+            # 使用排序后的索引重组海报列表
+            sorted_indices = [pair[1] for pair in sorted_pairs]
+            self.all_posters = [self.all_posters[i] for i in sorted_indices]
 
-            if "演员" in sort_by:
-                return ", ".join(sorted(nfo_data.get("actors", [])))
-            elif "系列" in sort_by:
-                return (nfo_data.get("series") or "").lower()
-            elif "评分" in sort_by:
-                try:
-                    return float(nfo_data.get("rating", 0))
-                except (ValueError, TypeError):
-                    return 0
-            else:  # 日期
-                return nfo_data.get("release", "")
-
-        # 排序
-        self.all_posters.sort(key=get_sort_key, reverse=True)
-        self.display_current_page()
+            # 更新显示
+            self.display_current_page()
 
     def on_field_changed(self, index):
         """字段改变处理"""
