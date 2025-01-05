@@ -156,7 +156,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             self.add_directory(initial_directory)
 
     def init_ui(self):
-        self.setWindowTitle("大锤 NFO查重工具 v9.5.3")
+        self.setWindowTitle("大锤 NFO查重工具 v9.5.8")
         self.setGeometry(100, 100, 800, 600)
         self.setMinimumSize(600, 400)
 
@@ -167,7 +167,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             else:
                 application_path = os.path.dirname(os.path.abspath(__file__))
 
-            icon_path = os.path.join(application_path, "chuizi.ico")
+            icon_path = os.path.join(application_path, "cg_dedupe.ico")
             if os.path.exists(icon_path):
                 self.setWindowIcon(QtGui.QIcon(icon_path))
         except Exception as e:

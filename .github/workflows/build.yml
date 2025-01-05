@@ -115,8 +115,8 @@ jobs:
           --workpath "./build/shared" `
           --onedir `
           --noconsole `
-          --icon="caijian.ico" `
-          --add-data "caijian.ico;." `
+          --icon="cg_crop.ico" `
+          --add-data "cg_crop.ico;." `
           --add-data "Img;Img" `
           --hidden-import win32com `
           --hidden-import win32com.client `
@@ -161,8 +161,8 @@ jobs:
           --workpath "./build/shared" `
           --onedir `
           --noconsole `
-          --icon="chuizi.ico" `
-          --add-data "chuizi.ico;." `
+          --icon="cg_dedupe.ico" `
+          --add-data "cg_dedupe.ico;." `
           --hidden-import win32com `
           --hidden-import win32com.client `
           --hidden-import win32com.shell `
@@ -183,8 +183,8 @@ jobs:
           --workpath "./build/shared" `
           --onedir `
           --noconsole `
-          --icon="chuizi.ico" `
-          --add-data "chuizi.ico;." `
+          --icon="cg_photo_wall.ico" `
+          --add-data "cg_photo_wall.ico;." `
           -y `
           "cg_photo_wall.py"
         
@@ -197,7 +197,7 @@ jobs:
         # 移动额外资源文件
         Copy-Item -Path "Img" -Destination "dist/NFOTools/" -Recurse -Force
         Copy-Item -Path "mapping_actor.xml" -Destination "dist/NFOTools/" -Force
-        Copy-Item -Path "chuizi.ico" -Destination "dist/NFOTools/" -Force
+        # Copy-Item -Path "chuizi.ico" -Destination "dist/NFOTools/" -Force
 
     - name: 创建 NSIS 安装脚本
       shell: pwsh
@@ -245,7 +245,7 @@ jobs:
           Delete "$INSTDIR\cg_rename.exe"
           Delete "$INSTDIR\cg_dedupe.exe"
           Delete "$INSTDIR\cg_photo_wall.exe"
-          Delete "$INSTDIR\chuizi.ico"
+          # Delete "$INSTDIR\chuizi.ico"
           
           Delete "$SMPROGRAMS\NFO Tools\NFO Editor.lnk"
           Delete "$SMPROGRAMS\NFO Tools\Cg Crop.lnk"

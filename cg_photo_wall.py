@@ -8,8 +8,8 @@ from threading import Thread
 from PyQt5.QtWidgets import (
     QApplication,
     QDialog,
-    QFrame,
     QLabel,
+    QProgressBar,
     QPushButton,
     QVBoxLayout,
     QHBoxLayout,
@@ -23,42 +23,141 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QLineEdit,
     QDesktopWidget,
+    QFrame,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QSize, QTimer
-from PyQt5.QtGui import QPixmap, QIcon, QGuiApplication
+from PyQt5.QtCore import Qt, pyqtSignal, QSize, QTimer, QSettings, QThread, QObject
+from PyQt5.QtGui import (
+    QPixmap,
+    QIcon,
+    QGuiApplication,
+    QPalette,
+    QColor,
+    QFont,
+    QImageReader,
+)
+import concurrent.futures
 
 
-class ImageLoader(Thread):
-    """图片加载线程"""
+class BluePalette(QPalette):
+    """蓝色主题调色板"""
 
-    def __init__(self, queue, callback):
-        super().__init__(daemon=True)
-        self.queue = queue
-        self.callback = callback
-        self.running = True
+    def __init__(self):
+        super().__init__()
+        # 主要颜色 - 使用深蓝色渐变风格
+        self.setColor(QPalette.Window, QColor(10, 20, 45))  # 深蓝色背景
+        self.setColor(QPalette.WindowText, QColor(255, 255, 255))
+        self.setColor(QPalette.Base, QColor(15, 25, 50))
+        self.setColor(QPalette.AlternateBase, QColor(20, 30, 55))
+        self.setColor(QPalette.Text, QColor(255, 255, 255))
+        self.setColor(QPalette.Button, QColor(30, 40, 65))
+        self.setColor(QPalette.ButtonText, QColor(255, 255, 255))
+        self.setColor(QPalette.Highlight, QColor(65, 105, 225))
+        self.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+        # 禁用状态颜色
+        self.setColor(QPalette.Disabled, QPalette.WindowText, QColor(128, 128, 128))
+        self.setColor(QPalette.Disabled, QPalette.Text, QColor(128, 128, 128))
+        self.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(128, 128, 128))
 
-    def run(self):
-        while self.running:
-            try:
-                path, label, size = self.queue.get()
-                if path is None:
-                    break
 
-                pixmap = QPixmap(path)
-                if not pixmap.isNull():
-                    scaled_pixmap = pixmap.scaled(
-                        size, Qt.KeepAspectRatio, Qt.SmoothTransformation
-                    )
-                    self.callback(label, scaled_pixmap)
+class ImageLoadManager(QObject):
+    """图片加载管理器"""
 
-            except Exception as e:
-                print(f"加载图片失败 {path}: {str(e)}")
-            finally:
-                self.queue.task_done()
+    progress_updated = pyqtSignal(int, int)  # 当前进度, 总数
+    image_loaded = pyqtSignal(str, QLabel, QPixmap)  # 图片路径, 标签对象, 图片对象
+
+    def __init__(self, max_workers=None):
+        super().__init__()
+        self.max_workers = max_workers or min(8, (os.cpu_count() or 4))
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_workers
+        )
+        self.queue = Queue()
+        self.total_images = 0
+        self.loaded_images = 0
+        self.is_running = True
+
+    def load_image(self, image_path, label):
+        """加载单个图片"""
+        try:
+            if not self.is_running:
+                return False
+
+            reader = QImageReader(image_path)
+            if reader.canRead():
+                # 获取标签的实际大小
+                target_size = label.size()
+                # 获取原始图片大小
+                original_size = reader.size()
+
+                # 计算缩放比例，保持宽高比
+                width_ratio = target_size.width() / original_size.width()
+                height_ratio = target_size.height() / original_size.height()
+                # 使用较小的比例以确保图片完整显示
+                scale_ratio = min(width_ratio, height_ratio)
+
+                # 计算新的尺寸
+                new_width = int(original_size.width() * scale_ratio)
+                new_height = int(original_size.height() * scale_ratio)
+
+                # 设置缩放尺寸
+                reader.setScaledSize(QSize(new_width, new_height))
+
+                image = reader.read()
+                if not image.isNull():
+                    pixmap = QPixmap.fromImage(image)
+                    self.image_loaded.emit(image_path, label, pixmap)
+                    self.loaded_images += 1
+                    self.progress_updated.emit(self.loaded_images, self.total_images)
+                    return True
+
+        except Exception as e:
+            print(f"加载图片失败 {image_path}: {str(e)}")
+        return False
+
+    def add_images(self, image_paths_and_labels):
+        """添加要加载的图片路径和标签对列表"""
+        self.total_images = len(image_paths_and_labels)
+        self.loaded_images = 0
+        futures = []
+        for path, label in image_paths_and_labels:
+            if not self.is_running:
+                break
+            future = self.executor.submit(self.load_image, path, label)
+            futures.append(future)
+        return futures
 
     def stop(self):
-        self.running = False
-        self.queue.put((None, None, None))
+        """停止加载"""
+        self.is_running = False
+        self.executor.shutdown(wait=False)
+
+
+class PosterContainer(QFrame):
+    """海报容器组件"""
+
+    def __init__(
+        self, poster_width, poster_height, title_height, dpi_scale, parent=None
+    ):
+        super().__init__(parent)
+        self.setFixedSize(poster_width, poster_height + title_height)
+        self.setStyleSheet(
+            f"""
+            QFrame {{
+                background-color: rgb(25, 25, 25);
+                border-radius: {int(6 * dpi_scale)}px;
+                border: 1px solid rgb(40, 40, 40);
+            }}
+            QFrame:hover {{
+                background-color: rgb(35, 35, 35);
+                border: 1px solid rgb(60, 60, 60);
+            }}
+        """
+        )
+
+        # 使用垂直布局
+        self.layout = QVBoxLayout(self)
+        self.layout.setSpacing(0)
+        self.layout.setContentsMargins(0, 0, 0, 0)
 
 
 class PhotoWallDialog(QDialog):
@@ -69,7 +168,6 @@ class PhotoWallDialog(QDialog):
         self.parent_window = parent
         self.folder_path = folder_path
         self.all_posters = []
-        self.image_queue = Queue()
         self.resize_timer = QTimer()
         self.resize_timer.setSingleShot(True)
         self.resize_timer.timeout.connect(self.handle_resize)
@@ -78,31 +176,79 @@ class PhotoWallDialog(QDialog):
         screen = QGuiApplication.primaryScreen()
         self.dpi_scale = screen.logicalDotsPerInch() / 96.0
 
-        # 创建图片加载线程
-        self.update_image.connect(self.update_image_label)
-        self.image_loader = ImageLoader(
-            self.image_queue,
-            lambda label, pixmap: self.update_image.emit(label, pixmap),
-        )
-        self.image_loader.start()
+        # 替换原有的image_queue和image_loader
+        self.image_manager = ImageLoadManager()
+        self.image_manager.progress_updated.connect(self.update_progress)
+        self.image_manager.image_loaded.connect(self.update_image_label)
+
+        # 添加取消按钮状态
+        self.is_loading = False
+
+        # 加载上次使用的目录
+        self.settings = QSettings("NFOEditor", "PhotoWall")
 
         self.init_ui()
 
+        # 如果提供了目录路径，加载海报
         if folder_path:
             self.load_posters(folder_path)
-
-    def update_image_label(self, label, pixmap):
-        """在主线程中更新图片标签"""
-        if label and not label.isHidden():
-            label.setPixmap(pixmap)
+        else:
+            # 尝试加载上次的目录
+            last_dir = self.settings.value("last_directory", "")
+            if last_dir and os.path.exists(last_dir):
+                self.folder_path = last_dir  # 仅保存路径，不自动加载
 
     def init_ui(self):
         """初始化UI"""
-        self.setWindowTitle("大锤 NFO照片墙 v9.5.5")
+        self.setWindowTitle("大锤 照片墙 v9.5.8")
+        self.setStyleSheet(
+            """
+            QDialog {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                                        stop:0 rgb(10, 20, 45),
+                                        stop:1 rgb(20, 40, 80));
+            }
+            QScrollArea {
+                border: none;
+                background: transparent;
+            }
+            QPushButton {
+                background-color: rgb(50, 50, 50);
+                color: rgb(240, 240, 240);
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: rgb(60, 60, 60);
+            }
+            QComboBox {
+                background-color: rgb(35, 35, 35);
+                color: rgb(240, 240, 240);
+                border: 1px solid rgb(50, 50, 50);
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QLineEdit {
+                background-color: rgb(35, 35, 35);
+                color: rgb(240, 240, 240);
+                border: 1px solid rgb(50, 50, 50);
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QRadioButton {
+                color: rgb(240, 240, 240);
+            }
+            QLabel {
+                color: rgb(240, 240, 240);
+            }
+        """
+        )
 
         # 获取主屏幕大小
         screen = QDesktopWidget().availableGeometry()
-        self.resize(int(screen.width() * 0.4), int(screen.height() * 0.6))
+        self.resize(int(screen.width() * 0.75), int(screen.height() * 0.75))
 
         # 设置为独立窗口
         self.setWindowFlags(
@@ -116,61 +262,96 @@ class PhotoWallDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(int(10 * self.dpi_scale))
         layout.setContentsMargins(
-            int(10 * self.dpi_scale),
-            int(10 * self.dpi_scale),
-            int(10 * self.dpi_scale),
-            int(10 * self.dpi_scale),
+            int(15 * self.dpi_scale),
+            int(15 * self.dpi_scale),
+            int(15 * self.dpi_scale),
+            int(15 * self.dpi_scale),
         )
 
         # 工具栏
-        toolbar = QWidget()
-        toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setSpacing(int(10 * self.dpi_scale))
-
-        # 选择目录按钮
-        select_button = QPushButton("选择目录")
-        select_button.setMinimumHeight(int(30 * self.dpi_scale))
-        select_button.clicked.connect(self.select_folder)
-        toolbar_layout.addWidget(select_button)
-
-        # 排序和筛选面板
-        filter_frame = self.create_filter_panel()
-        toolbar_layout.addWidget(filter_frame)
-
+        toolbar = self.create_toolbar()
         layout.addWidget(toolbar)
-
-        # 状态栏
-        self.status_label = QLabel()
-        self.status_label.setStyleSheet(
-            f"""
-            QLabel {{
-                color: rgb(200, 200, 200);
-                font-size: {int(12 * self.dpi_scale)}px;
-                padding: {int(5 * self.dpi_scale)}px;
-                background-color: rgb(30, 30, 30);
-            }}
-        """
-        )
-        layout.addWidget(self.status_label)
 
         # 滚动区域
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll.setStyleSheet(
+            """
+            QScrollBar:vertical {
+                border: none;
+                background: rgb(25, 25, 25);
+                width: 10px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgb(50, 50, 50);
+                min-height: 20px;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgb(70, 70, 70);
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                border: none;
+                background: none;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: none;
+            }
+        """
+        )
 
         # 内容容器
         self.content_widget = QWidget()
         self.grid = QGridLayout(self.content_widget)
-        self.grid.setSpacing(int(10 * self.dpi_scale))
+        self.grid.setSpacing(int(15 * self.dpi_scale))
         self.scroll.setWidget(self.content_widget)
 
         layout.addWidget(self.scroll)
 
+        # 状态栏和进度条布局
+        status_layout = QHBoxLayout()
+
+        # 进度条
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("加载进度: %v/%m")
+        self.progress_bar.setMinimumWidth(200)
+        self.progress_bar.hide()  # 初始隐藏
+        status_layout.addWidget(self.progress_bar)
+
+        # 取消按钮
+        self.cancel_button = QPushButton("取消加载")
+        self.cancel_button.clicked.connect(self.cancel_loading)
+        self.cancel_button.hide()  # 初始隐藏
+        status_layout.addWidget(self.cancel_button)
+
+        # 状态标签
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet(
+            f"""
+            QLabel {{
+                color: rgb(180, 180, 180);
+                font-size: {int(12 * self.dpi_scale)}px;
+                padding: {int(8 * self.dpi_scale)}px;
+                background-color: rgb(25, 25, 25);
+                border-radius: 4px;
+            }}
+        """
+        )
+        status_layout.addWidget(self.status_label)
+
+        # 添加弹性空间
+        status_layout.addStretch()
+
+        layout.addLayout(status_layout)
+
         # 设置窗口图标
         try:
             icon_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "chuizi.ico"
+                os.path.dirname(os.path.abspath(__file__)), "cg_photo_wall.ico"
             )
             if os.path.exists(icon_path):
                 self.setWindowIcon(QIcon(icon_path))
@@ -180,30 +361,57 @@ class PhotoWallDialog(QDialog):
         # 连接重绘事件
         self.resizeEvent = self.on_resize
 
+    def create_toolbar(self):
+        """创建工具栏"""
+        toolbar = QFrame()
+        toolbar.setStyleSheet(
+            """
+            QFrame {
+                background-color: rgb(25, 25, 25);
+                border-radius: 4px;
+            }
+        """
+        )
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setSpacing(int(10 * self.dpi_scale))
+        toolbar_layout.setContentsMargins(
+            int(10 * self.dpi_scale),
+            int(10 * self.dpi_scale),
+            int(10 * self.dpi_scale),
+            int(10 * self.dpi_scale),
+        )
+
+        # 选择目录按钮
+        select_button = QPushButton("选择目录")
+        select_button.setMinimumHeight(int(32 * self.dpi_scale))
+        select_button.clicked.connect(self.select_folder)
+        toolbar_layout.addWidget(select_button)
+
+        # 排序和筛选面板
+        filter_frame = self.create_filter_panel()
+        toolbar_layout.addWidget(filter_frame)
+
+        return toolbar
+
     def create_filter_panel(self):
         """创建过滤面板"""
         frame = QFrame()
         layout = QHBoxLayout(frame)
         layout.setContentsMargins(
-            int(1 * self.dpi_scale),
-            int(1 * self.dpi_scale),
-            int(1 * self.dpi_scale),
-            int(1 * self.dpi_scale),
+            int(10 * self.dpi_scale),
+            int(5 * self.dpi_scale),
+            int(10 * self.dpi_scale),
+            int(5 * self.dpi_scale),
         )
-        layout.setSpacing(int(10 * self.dpi_scale))
+        layout.setSpacing(int(15 * self.dpi_scale))
 
         # 排序选项
-        sort_label = QLabel("排序 (Sort by):")
+        sort_label = QLabel("排序:")
         sort_label.setStyleSheet(f"font-size: {int(12 * self.dpi_scale)}px;")
         layout.addWidget(sort_label)
 
         self.sorting_group = QButtonGroup(self)
-        sort_options = [
-            "日期 (Release Date)",
-            "演员 (Actors)",
-            "系列 (Series)",
-            "评分 (Rating)",
-        ]
+        sort_options = ["日期", "演员", "系列", "评分"]
         for text in sort_options:
             radio = QRadioButton(text)
             radio.setStyleSheet(f"font-size: {int(12 * self.dpi_scale)}px;")
@@ -213,24 +421,28 @@ class PhotoWallDialog(QDialog):
         # 筛选选项
         self.field_combo = QComboBox()
         self.field_combo.addItems(["标题", "标签", "演员", "系列", "评分"])
+        self.field_combo.setFixedWidth(int(80 * self.dpi_scale))
         self.field_combo.setStyleSheet(f"font-size: {int(12 * self.dpi_scale)}px;")
         layout.addWidget(self.field_combo)
 
         self.condition_combo = QComboBox()
+        self.condition_combo.setFixedWidth(int(80 * self.dpi_scale))
         self.condition_combo.setStyleSheet(f"font-size: {int(12 * self.dpi_scale)}px;")
         layout.addWidget(self.condition_combo)
 
         self.filter_entry = QLineEdit()
-        self.filter_entry.setFixedWidth(int(100 * self.dpi_scale))
+        self.filter_entry.setFixedWidth(int(120 * self.dpi_scale))
         self.filter_entry.setStyleSheet(f"font-size: {int(12 * self.dpi_scale)}px;")
         layout.addWidget(self.filter_entry)
 
         # 筛选按钮
         filter_button = QPushButton("筛选")
-        filter_button.setFixedWidth(int(45 * self.dpi_scale))
-        filter_button.setStyleSheet(f"font-size: {int(12 * self.dpi_scale)}px;")
+        filter_button.setFixedWidth(int(60 * self.dpi_scale))
         filter_button.clicked.connect(self.apply_filter)
         layout.addWidget(filter_button)
+
+        # 添加弹性空间
+        layout.addStretch()
 
         # 连接信号
         self.field_combo.currentIndexChanged.connect(self.on_field_changed)
@@ -243,11 +455,42 @@ class PhotoWallDialog(QDialog):
 
         return frame
 
+    def update_progress(self, current, total):
+        """更新进度条"""
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current)
+        if current == total:
+            self.progress_bar.hide()
+            self.cancel_button.hide()
+            self.is_loading = False
+        self.update_status(current, total)
+
+    def cancel_loading(self):
+        """取消加载"""
+        if self.is_loading:
+            self.image_manager.stop()
+            self.is_loading = False
+            self.progress_bar.hide()
+            self.cancel_button.hide()
+            self.update_status(
+                self.image_manager.loaded_images,
+                self.image_manager.total_images,
+                cancelled=True,
+            )
+
+    def update_status(self, count, total=None, cancelled=False):
+        """更新状态栏"""
+        if cancelled:
+            self.status_label.setText(f"已取消加载 (完成 {count}/{total})")
+        elif total is None:
+            self.status_label.setText(f"共加载 {count} 个影片")
+        else:
+            self.status_label.setText(f"正在加载: {count}/{total}")
+
     def on_resize(self, event):
         """窗口大小改变事件处理"""
         super().resizeEvent(event)
-        # 使用计时器延迟处理以避免频繁重绘
-        self.resize_timer.start(150)
+        self.resize_timer.start(150)  # 延迟处理以避免频繁重绘
 
     def handle_resize(self):
         """处理窗口大小改变"""
@@ -257,16 +500,16 @@ class PhotoWallDialog(QDialog):
     def calculate_grid_dimensions(self):
         """计算网格尺寸"""
         available_width = self.scroll.viewport().width()
-        min_poster_width = int(180 * self.dpi_scale)
-        spacing = int(10 * self.dpi_scale)
+        spacing = int(15 * self.dpi_scale)
 
-        # 计算每行可以容纳的海报数量
-        columns = max(1, (available_width - spacing) // (min_poster_width + spacing))
+        # 设置为6列
+        columns = 8
 
-        # 计算实际海报宽度（均匀分布）
+        # 根据可用宽度计算海报宽度，考虑间距
         poster_width = (available_width - (columns + 1) * spacing) // columns
-        poster_height = int(poster_width * 1.5)  # 保持宽高比
-        title_height = int(60 * self.dpi_scale)
+        # 按照电影海报的标准比例 2:3 计算高度
+        poster_height = int(poster_width * 1.5)
+        title_height = int(70 * self.dpi_scale)
 
         return columns, poster_width, poster_height, title_height
 
@@ -286,37 +529,40 @@ class PhotoWallDialog(QDialog):
         row = 0
         col = 0
 
+        # 创建一个列表来保存所有的图片路径和对应的标签
+        image_paths_and_labels = []
+
+        # 保存所有的引用
+        self.current_posters = []
+
+        # 显示所有海报，移除18个限制
         for poster_file, folder_name, nfo_data in self.all_posters:
             try:
                 # 创建容器
-                container = QFrame()
-                container.setFixedSize(poster_width, poster_height + title_height)
-                container.setStyleSheet(
-                    f"""
-                    QFrame {{
-                        background-color: rgb(20, 20, 20);
-                        border-radius: {int(3 * self.dpi_scale)}px;
-                    }}
-                    QFrame:hover {{
-                        background-color: rgb(40, 40, 40);
-                    }}
-                """
+                container = PosterContainer(
+                    poster_width, poster_height, title_height, self.dpi_scale
                 )
+                container_layout = container.layout
 
-                container_layout = QVBoxLayout(container)
-                container_layout.setSpacing(0)
-                container_layout.setContentsMargins(0, 0, 0, 0)
-
-                # 海报图片
+                # 海报图片标签
                 poster_label = QLabel()
+                poster_label.setObjectName(f"poster_{row}_{col}")
                 poster_label.setAlignment(Qt.AlignCenter)
                 poster_label.setFixedSize(poster_width, poster_height)
                 poster_label.setCursor(Qt.PointingHandCursor)
-
-                # 添加至加载队列
-                self.image_queue.put(
-                    (poster_file, poster_label, QSize(poster_width, poster_height))
+                poster_label.setStyleSheet(
+                    """
+                    QLabel {
+                        background-color: rgb(18, 18, 18);
+                        border-top-left-radius: 4px;
+                        border-top-right-radius: 4px;
+                    }
+                """
                 )
+
+                # 保存标签引用和文件路径
+                self.current_posters.append((poster_label, poster_file))
+                image_paths_and_labels.append((poster_file, poster_label))
 
                 # 标题区域
                 title_widget = QWidget()
@@ -326,10 +572,10 @@ class PhotoWallDialog(QDialog):
                 title_layout = QVBoxLayout(title_widget)
                 title_layout.setSpacing(int(2 * self.dpi_scale))
                 title_layout.setContentsMargins(
+                    int(10 * self.dpi_scale),
                     int(5 * self.dpi_scale),
-                    int(2 * self.dpi_scale),
+                    int(10 * self.dpi_scale),
                     int(5 * self.dpi_scale),
-                    int(2 * self.dpi_scale),
                 )
 
                 # 标题标签
@@ -338,28 +584,31 @@ class PhotoWallDialog(QDialog):
                 title_label.setStyleSheet(
                     f"""
                     QLabel {{
-                        color: rgb(200, 200, 200);
-                        font-size: {int(16 * self.dpi_scale)}px;
+                        color: rgb(240, 240, 240);
+                        font-size: {int(13 * self.dpi_scale)}px;
+                        font-weight: bold;
                     }}
                 """
                 )
                 title_label.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
                 title_label.setWordWrap(True)
-                title_label.setFixedHeight(int(title_height * 0.7))
+                title_label.setFixedHeight(int(title_height * 0.6))
 
-                # 年份和评分
+                # 年份和评分信息
                 info_parts = []
                 if year := nfo_data.get("year"):
                     info_parts.append(year)
                 if rating := nfo_data.get("rating"):
                     info_parts.append(f"★{float(rating):.1f}")
+                if actors := nfo_data.get("actors"):
+                    info_parts.append(actors[0] if actors else "")
 
                 info_label = QLabel(" · ".join(info_parts))
                 info_label.setStyleSheet(
                     f"""
                     QLabel {{
-                        color: rgb(140, 140, 140);
-                        font-size: {int(18 * self.dpi_scale)}px;
+                        color: rgb(180, 180, 180);
+                        font-size: {int(12 * self.dpi_scale)}px;
                     }}
                 """
                 )
@@ -381,6 +630,7 @@ class PhotoWallDialog(QDialog):
                     lambda e, p=poster_path: self.select_in_editor(p)
                 )
 
+                # 添加到网格
                 self.grid.addWidget(container, row, col)
 
                 # 更新位置
@@ -392,96 +642,91 @@ class PhotoWallDialog(QDialog):
             except Exception as e:
                 print(f"显示海报失败 {poster_file}: {str(e)}")
 
-    def select_in_editor(self, folder_path):
-        """在编辑器中选择相应文件夹"""
+        # 开始加载图片
+        if image_paths_and_labels:
+            self.is_loading = True
+            self.progress_bar.show()
+            self.cancel_button.show()
+            self.image_manager.add_images(image_paths_and_labels)
+
+    def update_image_label(self, path, label, pixmap):
+        """更新图片标签"""
         try:
-            if self.parent_window:
-                # 如果是从编辑器启动的，直接调用父窗口方法
-                self.parent_window.select_folder_in_tree(folder_path)
-                self.parent_window.activateWindow()
-                self.parent_window.raise_()
-            else:
-                # 获取当前脚本所在目录
-                current_dir = os.path.dirname(os.path.abspath(__file__))
-                editor_path = os.path.join(current_dir, "NFO.Editor.Qt5.py")
-
-                if not os.path.exists(editor_path):
-                    QMessageBox.critical(
-                        self, "错误", "找不到编辑器程序NFO.Editor.Qt5.py"
-                    )
-                    return
-
-                # 构建命令行参数
-                args = [sys.executable]
-
-                # 如果是Windows系统且存在pythonw.exe，使用它来避免显示控制台窗口
-                if sys.platform == "win32":
-                    pythonw = os.path.join(
-                        os.path.dirname(sys.executable), "pythonw.exe"
-                    )
-                    if os.path.exists(pythonw):
-                        args = [pythonw]
-
-                # 添加其他参数
-                args.extend(
-                    [
-                        editor_path,
-                        "--base-path",
-                        os.path.dirname(folder_path),
-                        "--select-folder",
-                        folder_path,
-                    ]
-                )
-
-                # 启动编辑器进程
-                subprocess.Popen(args)
-
+            if label and not label.isHidden():
+                # print(f"更新标签 {label.objectName()} 的图片: {path}")
+                label.setPixmap(pixmap)
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"启动编辑器失败: {str(e)}")
+            pass
 
-    def play_video(self, folder_path):
-        """播放视频文件"""
-        if not folder_path or not os.path.exists(folder_path):
-            return
-
-        video_extensions = [
-            ".mp4",
-            ".mkv",
-            ".avi",
-            ".mov",
-            ".rm",
-            ".mpeg",
-            ".ts",
-            ".strm",
-        ]
-
-        for ext in video_extensions:
-            for file in os.listdir(folder_path):
-                if file.lower().endswith(ext):
-                    video_path = os.path.join(folder_path, file)
-                    try:
-                        if ext == ".strm":
-                            with open(video_path, "r", encoding="utf-8") as f:
-                                strm_url = f.readline().strip()
-                            if strm_url:
-                                subprocess.Popen(["mpvnet", strm_url])
-                            else:
-                                QMessageBox.critical(self, "错误", "STRM文件内容为空")
-                        else:
-                            subprocess.Popen(["mpvnet", video_path])
-                        return
-                    except Exception as e:
-                        QMessageBox.critical(self, "错误", f"播放视频失败: {str(e)}")
-                        return
-
-        QMessageBox.warning(self, "警告", "未找到匹配的视频文件")
+    def clear_current_posters(self):
+        """清理当前显示的海报"""
+        if hasattr(self, "current_posters"):
+            self.current_posters.clear()
 
     def select_folder(self):
-        """选择文件夹"""
-        folder = QFileDialog.getExistingDirectory(self, "选择NFO文件夹")
-        if folder:
-            self.folder_path = folder
-            self.load_posters(folder)
+        """选择并打开NFO文件夹"""
+        last_dir = self.settings.value("last_directory", "")
+
+        folder_selected = QFileDialog.getExistingDirectory(
+            self, "选择NFO文件夹", last_dir
+        )
+
+        if folder_selected:
+            self.folder_path = folder_selected
+            # 保存当前选择的目录
+            self.settings.setValue("last_directory", folder_selected)
+            self.load_posters(folder_selected)
+
+    @lru_cache(maxsize=100)
+    def parse_nfo(self, nfo_path):
+        """解析NFO文件（带缓存）"""
+        try:
+            tree = ET.parse(nfo_path)
+            root = tree.getroot()
+
+            # 基本信息
+            title = root.find("title")
+            title = title.text if title is not None else ""
+
+            year = ""
+            release = root.find("release")
+            if release is not None and release.text:
+                try:
+                    year = release.text.split("-")[0]
+                except:
+                    year = ""
+
+            series = root.find("series")
+            series = series.text if series is not None else ""
+
+            rating = root.find("rating")
+            rating = rating.text if rating is not None else "0"
+
+            # 演员列表
+            actors = []
+            for actor in root.findall("actor"):
+                name = actor.find("name")
+                if name is not None and name.text:
+                    actors.append(name.text.strip())
+
+            # 标签
+            tags = []
+            for tag in root.findall("tag"):
+                if tag is not None and tag.text:
+                    tags.append(tag.text.strip())
+
+            return {
+                "title": title,
+                "year": year,
+                "series": series,
+                "rating": rating,
+                "actors": actors,
+                "tags": tags,
+                "release": release.text if release is not None else "",
+            }
+        except Exception as e:
+            print(f"解析NFO文件失败 {nfo_path}: {str(e)}")
+            return {}
 
     def load_posters(self, folder_path):
         """加载海报"""
@@ -516,59 +761,14 @@ class PhotoWallDialog(QDialog):
         self.display_current_page()
         self.update_status(len(self.all_posters))
 
-    @lru_cache(maxsize=100)
-    def parse_nfo(self, nfo_path):
-        """解析NFO文件（带缓存）"""
-        try:
-            tree = ET.parse(nfo_path)
-            root = tree.getroot()
+    def update_status(self, count, total=None):
+        """更新状态栏"""
+        if total is None:
+            self.status_label.setText(f"共加载 {count} 个影片")
+        else:
+            self.status_label.setText(f"筛选结果: {count} / 总计 {total} 个影片")
 
-            # 基本信息
-            title = root.find("title")
-            title = title.text if title is not None else ""
-
-            year = ""
-            release = root.find("release")
-            release_date = release.text if release is not None else ""
-            if release is not None and release.text:
-                try:
-                    year = release.text.split("-")[0]
-                except:
-                    year = ""
-
-            series = root.find("series")
-            series = series.text if series is not None else ""
-
-            rating = root.find("rating")
-            rating = rating.text if rating is not None else "0"
-
-            # 演员列表
-            actors = []
-            for actor in root.findall("actor"):
-                name = actor.find("name")
-                if name is not None and name.text:
-                    actors.append(name.text.strip())
-
-            # 标签
-            tags = []
-            for tag in root.findall("tag"):
-                if tag is not None and tag.text:
-                    tags.append(tag.text.strip())
-
-            return {
-                "title": title,
-                "year": year,
-                "series": series,
-                "rating": rating,
-                "actors": actors,
-                "tags": tags,
-                "release": release_date,  # 添加 release 字段
-            }
-        except Exception as e:
-            print(f"解析NFO文件失败 {nfo_path}: {str(e)}")
-            return {}
-
-    def sort_posters(self, button=None):
+    def sort_posters(self):
         """排序海报"""
         if not self.sorting_group.checkedButton():
             return
@@ -590,12 +790,11 @@ class PhotoWallDialog(QDialog):
                     return float(nfo_data.get("rating", 0))
                 except (ValueError, TypeError):
                     return 0
-            else:  # 文件名改为日期
+            else:  # 日期
                 return nfo_data.get("release", "")
 
         # 排序
         self.all_posters.sort(key=get_sort_key, reverse=True)
-
         self.display_current_page()
 
     def on_field_changed(self, index):
@@ -606,13 +805,6 @@ class PhotoWallDialog(QDialog):
             self.condition_combo.addItems(["大于", "小于"])
         else:
             self.condition_combo.addItems(["包含", "不包含"])
-
-    def update_status(self, count, total=None):
-        """更新状态栏"""
-        if total is None:
-            self.status_label.setText(f"共加载 {count} 个影片")
-        else:
-            self.status_label.setText(f"筛选结果: {count} / 总计 {total} 个影片")
 
     def apply_filter(self):
         """应用筛选"""
@@ -666,16 +858,107 @@ class PhotoWallDialog(QDialog):
         self.display_current_page()
         self.update_status(len(filtered), len(self.all_posters))
 
+    def select_in_editor(self, folder_path):
+        """在编辑器中选择相应文件夹"""
+        try:
+            if self.parent_window:
+                self.parent_window.select_folder_in_tree(folder_path)
+                self.parent_window.activateWindow()
+                self.parent_window.raise_()
+            else:
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                editor_path = os.path.join(current_dir, "NFO.Editor.Qt5.py")
+
+                if not os.path.exists(editor_path):
+                    QMessageBox.critical(
+                        self, "错误", "找不到编辑器程序NFO.Editor.Qt5.py"
+                    )
+                    return
+
+                args = [sys.executable]
+                if sys.platform == "win32":
+                    pythonw = os.path.join(
+                        os.path.dirname(sys.executable), "pythonw.exe"
+                    )
+                    if os.path.exists(pythonw):
+                        args = [pythonw]
+
+                args.extend(
+                    [
+                        editor_path,
+                        "--base-path",
+                        os.path.dirname(folder_path),
+                        "--select-folder",
+                        folder_path,
+                    ]
+                )
+
+                subprocess.Popen(args)
+
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"启动编辑器失败: {str(e)}")
+
+    def play_video(self, folder_path):
+        """播放视频文件"""
+        if not folder_path or not os.path.exists(folder_path):
+            return
+
+        video_extensions = [
+            ".mp4",
+            ".mkv",
+            ".avi",
+            ".mov",
+            ".rm",
+            ".mpeg",
+            ".ts",
+            ".strm",
+        ]
+
+        for ext in video_extensions:
+            for file in os.listdir(folder_path):
+                if file.lower().endswith(ext):
+                    video_path = os.path.join(folder_path, file)
+                    try:
+                        if ext == ".strm":
+                            with open(video_path, "r", encoding="utf-8") as f:
+                                strm_url = f.readline().strip()
+                            if strm_url:
+                                subprocess.Popen(["mpvnet", strm_url])
+                            else:
+                                QMessageBox.critical(self, "错误", "STRM文件内容为空")
+                        else:
+                            subprocess.Popen(["mpvnet", video_path])
+                        return
+                    except Exception as e:
+                        QMessageBox.critical(self, "错误", f"播放视频失败: {str(e)}")
+                        return
+
+        QMessageBox.warning(self, "警告", "未找到匹配的视频文件")
+
     def closeEvent(self, event):
         """关闭窗口时清理资源"""
-        if hasattr(self, "image_loader") and self.image_loader:
-            self.image_loader.stop()
-            self.image_loader.join()
+        if hasattr(self, "image_manager"):
+            self.image_manager.stop()
         super().closeEvent(event)
 
 
 def main():
+    # 在创建 QApplication 之前设置高DPI属性
+    if hasattr(Qt, "AA_EnableHighDpiScaling"):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
+    if hasattr(Qt, "AA_UseHighDpiPixmaps"):
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
+
     app = QApplication(sys.argv)
+
+    # 设置蓝色主题
+    app.setPalette(BluePalette())
+    app.setStyle("Fusion")
+
+    # 设置全局字体
+    font = app.font()
+    font.setFamily("Microsoft YaHei UI")
+    app.setFont(font)
 
     # 解析命令行参数
     folder_path = None

@@ -516,12 +516,12 @@ class EmbyPosterCrop(QDialog):
     def __init__(self, parent=None, nfo_base_name=None):
         super().__init__(parent)
         self.nfo_base_name = nfo_base_name
-        self.setWindowTitle("大锤 EMBY海报裁剪工具 v9.5.7")
+        self.setWindowTitle("大锤 EMBY海报裁剪工具 v9.5.8")
         self.setMinimumSize(1200, 640)
 
         # 设置窗口图标
         try:
-            icon_path = get_resource_path("caijian.ico")
+            icon_path = get_resource_path("cg_crop.ico")
             if os.path.exists(icon_path):
                 self.setWindowIcon(QIcon(icon_path))
         except Exception as e:
@@ -971,7 +971,7 @@ if __name__ == "__main__":
 
         # 设置应用程序图标
         try:
-            icon_path = get_resource_path("caijian.ico")
+            icon_path = get_resource_path("cg_crop.ico")
             if os.path.exists(icon_path):
                 app.setWindowIcon(QIcon(icon_path))
         except Exception as e:
