@@ -73,13 +73,16 @@ jobs:
         New-Item -Path "shared_libs" -ItemType Directory -Force
         
         # 构建 NFO.Editor.Qt5
-        pyinstaller --name "NFO.Editor.Qt5" `
+        pyinstaller --name "NFO.Editor" `
           --distpath "./dist/shared" `
           --workpath "./build/shared" `
           --onedir `
           --noconsole `
           --icon="chuizi.ico" `
           --add-data "chuizi.ico;." `
+          --add-data "cg_crop.ico;." `
+          --add-data "cg_dedupe.ico;." `
+          --add-data "cg_photo_wall.ico;." `
           --add-data "mapping_actor.xml;." `
           --add-data "Img;Img" `
           --hidden-import win32com `
@@ -98,15 +101,15 @@ jobs:
           -y `
           "NFO.Editor.Qt5.py"
         
-        Move-Item -Path "dist/shared/NFO.Editor.Qt5/NFO.Editor.Qt5.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
+        Move-Item -Path "dist/shared/NFO.Editor/NFO.Editor.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
         
-        if (Test-Path "dist/shared/NFO.Editor.Qt5/PyQt5") {
-          Move-Item -Path "dist/shared/NFO.Editor.Qt5/PyQt5" -Destination "shared_libs/" -Force -ErrorAction SilentlyContinue
+        if (Test-Path "dist/shared/NFO.Editor/PyQt5") {
+          Move-Item -Path "dist/shared/NFO.Editor/PyQt5" -Destination "shared_libs/" -Force -ErrorAction SilentlyContinue
         }
-        if (Test-Path "dist/shared/NFO.Editor.Qt5/_internal") {
-          Move-Item -Path "dist/shared/NFO.Editor.Qt5/_internal" -Destination "shared_libs/" -Force -ErrorAction SilentlyContinue
+        if (Test-Path "dist/shared/NFO.Editor/_internal") {
+          Move-Item -Path "dist/shared/NFO.Editor/_internal" -Destination "shared_libs/" -Force -ErrorAction SilentlyContinue
         }
-        Remove-Item -Path "dist/shared/NFO.Editor.Qt5" -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "dist/shared/NFO.Editor" -Recurse -Force -ErrorAction SilentlyContinue
         
         # 构建其他工具...
         # cg_crop
@@ -228,7 +231,7 @@ jobs:
           File /r "dist\NFOTools\*.*"
           
           CreateDirectory "$SMPROGRAMS\NFO Tools"
-          CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Editor.lnk" "$INSTDIR\NFO.Editor.Qt5.exe"
+          CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Editor.lnk" "$INSTDIR\NFO.Editor.exe"
           CreateShortCut "$SMPROGRAMS\NFO Tools\Cg Crop.lnk" "$INSTDIR\cg_crop.exe"
           CreateShortCut "$SMPROGRAMS\NFO Tools\Cg Rename.lnk" "$INSTDIR\cg_rename.exe"
           CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Dedupe.lnk" "$INSTDIR\cg_dedupe.exe"
@@ -241,7 +244,7 @@ jobs:
         Section "Uninstall"
           Delete "$INSTDIR\uninstall.exe"
           Delete "$INSTDIR\cg_crop.exe"
-          Delete "$INSTDIR\NFO.Editor.Qt5.exe"
+          Delete "$INSTDIR\NFO.Editor.exe"
           Delete "$INSTDIR\cg_rename.exe"
           Delete "$INSTDIR\cg_dedupe.exe"
           Delete "$INSTDIR\cg_photo_wall.exe"
