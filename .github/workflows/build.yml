@@ -79,10 +79,7 @@ jobs:
           --onedir `
           --noconsole `
           --icon="chuizi.ico" `
-          --add-data "chuizi.ico;." `
-          --add-data "cg_crop.ico;." `
-          --add-data "cg_dedupe.ico;." `
-          --add-data "cg_photo_wall.ico;." `
+          --add-data "*.ico;." `
           --add-data "mapping_actor.xml;." `
           --add-data "Img;Img" `
           --hidden-import win32com `
@@ -98,6 +95,10 @@ jobs:
           --hidden-import PIL `
           --hidden-import PIL._imaging `
           --hidden-import PIL.Image `
+          --collect-submodules cg_photo_wall `
+          --collect-submodules cg_crop `
+          --collect-submodules cg_rename `
+          --collect-submodules cg_dedupe `
           -y `
           "NFO.Editor.Qt5.py"
         
@@ -119,13 +120,12 @@ jobs:
           --onedir `
           --noconsole `
           --icon="cg_crop.ico" `
-          --add-data "cg_crop.ico;." `
+          --add-data "*.ico;." `
           --add-data "Img;Img" `
-          --hidden-import win32com `
-          --hidden-import win32com.client `
-          --hidden-import win32com.shell `
-          --hidden-import pythoncom `
-          --hidden-import pywintypes `
+          --add-binary "dist/NFOTools/PyQt5;PyQt5" `
+          --hidden-import PyQt5.QtCore `
+          --hidden-import PyQt5.QtGui `
+          --hidden-import PyQt5.QtWidgets `
           --hidden-import PIL `
           --hidden-import PIL._imaging `
           --hidden-import PIL.Image `
@@ -187,7 +187,14 @@ jobs:
           --onedir `
           --noconsole `
           --icon="cg_photo_wall.ico" `
-          --add-data "cg_photo_wall.ico;." `
+          --add-data "*.ico;." `
+          --add-binary "dist/NFOTools/PyQt5;PyQt5" `
+          --hidden-import PyQt5.QtCore `
+          --hidden-import PyQt5.QtGui `
+          --hidden-import PyQt5.QtWidgets `
+          --hidden-import PIL `
+          --hidden-import PIL._imaging `
+          --hidden-import PIL.Image `
           -y `
           "cg_photo_wall.py"
         
