@@ -36,7 +36,7 @@ jobs:
       with:
         path: |
           build
-          dist/shared
+          dist/NFOTools
         key: ${{ runner.os }}-pyinstaller-${{ hashFiles('*.py', 'requirements.txt') }}
         restore-keys: |
           ${{ runner.os }}-pyinstaller-
@@ -68,16 +68,14 @@ jobs:
         # 构建前清理
         Remove-Item -Path "dist" -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -Path "build" -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "shared_libs" -Recurse -Force -ErrorAction SilentlyContinue
         
-        # 创建必要目录
+        # 创建输出目录
         New-Item -Path "dist/NFOTools" -ItemType Directory -Force
-        New-Item -Path "shared_libs" -ItemType Directory -Force
         
         # 构建 NFO.Editor.Qt5
-        pyinstaller --name "NFO.Editor" `
-          --distpath "./dist/shared" `
-          --workpath "./build/shared" `
+        pyinstaller --name "NFO.Editor.Qt5" `
+          --distpath "./dist/NFOTools" `
+          --workpath "./build" `
           --onedir `
           --noconsole `
           --icon="chuizi.ico" `
@@ -104,16 +102,9 @@ jobs:
           -y `
           "NFO.Editor.Qt5.py"
         
-        Move-Item -Path "dist/shared/NFO.Editor/NFO.Editor.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
-        
-        if (Test-Path "dist/shared/NFO.Editor/PyQt5") {
-          Move-Item -Path "dist/shared/NFO.Editor/PyQt5" -Destination "shared_libs/" -Force -ErrorAction SilentlyContinue
-        }
-        if (Test-Path "dist/shared/NFO.Editor/_internal") {
-          Move-Item -Path "dist/shared/NFO.Editor/_internal" -Destination "shared_libs/" -Force -ErrorAction SilentlyContinue
-        }
-        Remove-Item -Path "dist/shared/NFO.Editor" -Recurse -Force -ErrorAction SilentlyContinue
-        
+        # 重命名主程序exe
+        Rename-Item -Path "dist/NFOTools/NFO.Editor.Qt5/NFO.Editor.Qt5.exe" -NewName "NFO.Editor.exe" -Force
+
         # 构建其他工具
         $tools = @(
           @{name="cg_crop"; icon="cg_crop.ico"},
@@ -121,17 +112,16 @@ jobs:
           @{name="cg_dedupe"; icon="cg_dedupe.ico"},
           @{name="cg_photo_wall"; icon="cg_photo_wall.ico"}
         )
-
+        
         foreach ($tool in $tools) {
           pyinstaller --name $tool.name `
-            --distpath "./dist/shared" `
-            --workpath "./build/shared" `
+            --distpath "./dist/NFOTools" `
+            --workpath "./build" `
             --onedir `
             --noconsole `
             --icon=$tool.icon `
             --add-data "*.ico;." `
             --add-data "Img;Img" `
-            --add-binary "dist/NFOTools/PyQt5;PyQt5" `
             --hidden-import PyQt5.QtCore `
             --hidden-import PyQt5.QtGui `
             --hidden-import PyQt5.QtWidgets `
@@ -140,21 +130,16 @@ jobs:
             --hidden-import PIL.Image `
             -y `
             "$($tool.name).py"
-          
-          Move-Item -Path "dist/shared/$($tool.name)/$($tool.name).exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
-          Remove-Item -Path "dist/shared/$($tool.name)" -Recurse -Force -ErrorAction SilentlyContinue
         }
-
-        # 移动共享依赖到最终目录
-        Copy-Item -Path "shared_libs/*" -Destination "dist/NFOTools/" -Recurse -Force
         
         # 移动额外资源文件
         Copy-Item -Path "Img" -Destination "dist/NFOTools/" -Recurse -Force
         Copy-Item -Path "mapping_actor.xml" -Destination "dist/NFOTools/" -Force
         Copy-Item -Path "*.ico" -Destination "dist/NFOTools/" -Force
-
+        
         # 创建 ZIP 包
-        Compress-Archive -Path "dist/NFOTools/*" -DestinationPath "NFOTools.${{ env.build_name }}.zip" -Force
+        $zipPath = "NFOTools.${{ env.build_name }}.zip"
+        Compress-Archive -Path "dist/NFOTools/*" -DestinationPath $zipPath -Force
 
     - name: 上传构建工件
       uses: actions/upload-artifact@v4
