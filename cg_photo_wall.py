@@ -665,8 +665,16 @@ class PhotoWallDialog(QDialog):
         """更新图片标签"""
         try:
             if label and not label.isHidden():
-                # print(f"更新标签 {label.objectName()} 的图片: {path}")
                 label.setPixmap(pixmap)
+
+            # 检查是否所有图片都已加载完成
+            if (
+                self.image_manager.loaded_images >= self.image_manager.total_images
+                and self.is_loading
+            ):
+                self.progress_bar.hide()
+                self.cancel_button.hide()
+                self.is_loading = False
         except Exception as e:
             pass
 
@@ -802,14 +810,15 @@ class PhotoWallDialog(QDialog):
 
     def _update_sort_keys(self, nfo_data, index):
         """更新排序键"""
-        # 处理演员排序键
-        actors_key = ", ".join(sorted(nfo_data.get("actors", [])))
+        # 处理演员排序键 - 使用第一个演员名作为排序键
+        actors = nfo_data.get("actors", [])
+        actors_key = actors[0] if actors else ""
         if "演员" not in self._sort_keys:
             self._sort_keys["演员"] = []
         self._sort_keys["演员"].append((actors_key, index))
 
         # 处理系列排序键
-        series_key = (nfo_data.get("series") or "").lower()
+        series_key = nfo_data.get("series") or ""
         if "系列" not in self._sort_keys:
             self._sort_keys["系列"] = []
         self._sort_keys["系列"].append((series_key, index))
@@ -824,7 +833,15 @@ class PhotoWallDialog(QDialog):
         self._sort_keys["评分"].append((rating_key, index))
 
         # 处理日期排序键
-        date_key = nfo_data.get("release", "")
+        release = nfo_data.get("release", "")
+        # 确保日期格式正确
+        try:
+            from datetime import datetime
+
+            date_key = datetime.strptime(release, "%Y-%m-%d")
+        except:
+            date_key = datetime.min
+
         if "日期" not in self._sort_keys:
             self._sort_keys["日期"] = []
         self._sort_keys["日期"].append((date_key, index))
@@ -856,9 +873,12 @@ class PhotoWallDialog(QDialog):
 
         # 使用预处理的排序键进行排序
         if sort_by in self._sort_keys:
-            # 对索引进行排序
+            # 对索引进行排序，评分和日期默认降序，其他升序
+            reverse = sort_by in ["评分", "日期"]
             sorted_pairs = sorted(
-                self._sort_keys[sort_by], key=lambda x: x[0], reverse=True
+                self._sort_keys[sort_by],
+                key=lambda x: x[0] or "",  # 处理None值
+                reverse=reverse,
             )
 
             # 使用排序后的索引重组海报列表
