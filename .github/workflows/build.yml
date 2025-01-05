@@ -15,6 +15,8 @@ jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 15
+    permissions:
+      contents: write
 
     steps:
     - name: 检出代码
@@ -112,94 +114,36 @@ jobs:
         }
         Remove-Item -Path "dist/shared/NFO.Editor" -Recurse -Force -ErrorAction SilentlyContinue
         
-        # 构建其他工具...
-        # cg_crop
-        pyinstaller --name "cg_crop" `
-          --distpath "./dist/shared" `
-          --workpath "./build/shared" `
-          --onedir `
-          --noconsole `
-          --icon="cg_crop.ico" `
-          --add-data "*.ico;." `
-          --add-data "Img;Img" `
-          --add-binary "dist/NFOTools/PyQt5;PyQt5" `
-          --hidden-import PyQt5.QtCore `
-          --hidden-import PyQt5.QtGui `
-          --hidden-import PyQt5.QtWidgets `
-          --hidden-import PIL `
-          --hidden-import PIL._imaging `
-          --hidden-import PIL.Image `
-          -y `
-          "cg_crop.py"
-        
-        Move-Item -Path "dist/shared/cg_crop/cg_crop.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "dist/shared/cg_crop" -Recurse -Force -ErrorAction SilentlyContinue
-        
-        # cg_rename
-        pyinstaller --name "cg_rename" `
-          --distpath "./dist/shared" `
-          --workpath "./build/shared" `
-          --onedir `
-          --noconsole `
-          --icon="chuizi.ico" `
-          --add-data "chuizi.ico;." `
-          --add-data "mapping_actor.xml;." `
-          --hidden-import win32com `
-          --hidden-import win32com.client `
-          --hidden-import win32com.shell `
-          --hidden-import pythoncom `
-          --hidden-import pywintypes `
-          --hidden-import PIL `
-          --hidden-import PIL._imaging `
-          --hidden-import PIL.Image `
-          -y `
-          "cg_rename.py"
-        
-        Move-Item -Path "dist/shared/cg_rename/cg_rename.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "dist/shared/cg_rename" -Recurse -Force -ErrorAction SilentlyContinue
-        
-        # cg_dedupe
-        pyinstaller --name "cg_dedupe" `
-          --distpath "./dist/shared" `
-          --workpath "./build/shared" `
-          --onedir `
-          --noconsole `
-          --icon="cg_dedupe.ico" `
-          --add-data "cg_dedupe.ico;." `
-          --hidden-import win32com `
-          --hidden-import win32com.client `
-          --hidden-import win32com.shell `
-          --hidden-import pythoncom `
-          --hidden-import pywintypes `
-          --hidden-import PIL `
-          --hidden-import PIL._imaging `
-          --hidden-import PIL.Image `
-          -y `
-          "cg_dedupe.py"
-        
-        Move-Item -Path "dist/shared/cg_dedupe/cg_dedupe.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "dist/shared/cg_dedupe" -Recurse -Force -ErrorAction SilentlyContinue
+        # 构建其他工具
+        $tools = @(
+          @{name="cg_crop"; icon="cg_crop.ico"},
+          @{name="cg_rename"; icon="chuizi.ico"},
+          @{name="cg_dedupe"; icon="cg_dedupe.ico"},
+          @{name="cg_photo_wall"; icon="cg_photo_wall.ico"}
+        )
 
-        # cg_photo_wall
-        pyinstaller --name "cg_photo_wall" `
-          --distpath "./dist/shared" `
-          --workpath "./build/shared" `
-          --onedir `
-          --noconsole `
-          --icon="cg_photo_wall.ico" `
-          --add-data "*.ico;." `
-          --add-binary "dist/NFOTools/PyQt5;PyQt5" `
-          --hidden-import PyQt5.QtCore `
-          --hidden-import PyQt5.QtGui `
-          --hidden-import PyQt5.QtWidgets `
-          --hidden-import PIL `
-          --hidden-import PIL._imaging `
-          --hidden-import PIL.Image `
-          -y `
-          "cg_photo_wall.py"
-        
-        Move-Item -Path "dist/shared/cg_photo_wall/cg_photo_wall.exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "dist/shared/cg_photo_wall" -Recurse -Force -ErrorAction SilentlyContinue
+        foreach ($tool in $tools) {
+          pyinstaller --name $tool.name `
+            --distpath "./dist/shared" `
+            --workpath "./build/shared" `
+            --onedir `
+            --noconsole `
+            --icon=$tool.icon `
+            --add-data "*.ico;." `
+            --add-data "Img;Img" `
+            --add-binary "dist/NFOTools/PyQt5;PyQt5" `
+            --hidden-import PyQt5.QtCore `
+            --hidden-import PyQt5.QtGui `
+            --hidden-import PyQt5.QtWidgets `
+            --hidden-import PIL `
+            --hidden-import PIL._imaging `
+            --hidden-import PIL.Image `
+            -y `
+            "$($tool.name).py"
+          
+          Move-Item -Path "dist/shared/$($tool.name)/$($tool.name).exe" -Destination "dist/NFOTools/" -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "dist/shared/$($tool.name)" -Recurse -Force -ErrorAction SilentlyContinue
+        }
 
         # 移动共享依赖到最终目录
         Copy-Item -Path "shared_libs/*" -Destination "dist/NFOTools/" -Recurse -Force
@@ -207,119 +151,25 @@ jobs:
         # 移动额外资源文件
         Copy-Item -Path "Img" -Destination "dist/NFOTools/" -Recurse -Force
         Copy-Item -Path "mapping_actor.xml" -Destination "dist/NFOTools/" -Force
-        # Copy-Item -Path "chuizi.ico" -Destination "dist/NFOTools/" -Force
+        Copy-Item -Path "*.ico" -Destination "dist/NFOTools/" -Force
 
-    - name: 创建 NSIS 安装脚本
-      shell: pwsh
-      run: |
-        @'
-        !include "MUI2.nsh"
-        !define PRODUCT_NAME "NFO Tools"
-        !define PRODUCT_VERSION "${{ env.build_name }}"
-        !define PRODUCT_PUBLISHER "NFO Tools"
-
-        Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
-        OutFile "NFOTools.Setup.${{ env.build_name }}.exe"
-        InstallDir "$PROGRAMFILES\NFO Tools"
-        
-        !insertmacro MUI_PAGE_WELCOME
-        !insertmacro MUI_PAGE_DIRECTORY
-        !insertmacro MUI_PAGE_INSTFILES
-        !insertmacro MUI_PAGE_FINISH
-        !insertmacro MUI_UNPAGE_CONFIRM
-        !insertmacro MUI_UNPAGE_INSTFILES
-        
-        !insertmacro MUI_LANGUAGE "SimpChinese"
-        
-        Section "MainSection" SEC01
-          SetOutPath "$INSTDIR"
-          SetOverwrite ifnewer
-          
-          File /r "dist\NFOTools\*.*"
-          
-          CreateDirectory "$SMPROGRAMS\NFO Tools"
-          CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Editor.lnk" "$INSTDIR\NFO.Editor.exe"
-          CreateShortCut "$SMPROGRAMS\NFO Tools\Cg Crop.lnk" "$INSTDIR\cg_crop.exe"
-          CreateShortCut "$SMPROGRAMS\NFO Tools\Cg Rename.lnk" "$INSTDIR\cg_rename.exe"
-          CreateShortCut "$SMPROGRAMS\NFO Tools\NFO Dedupe.lnk" "$INSTDIR\cg_dedupe.exe"
-          CreateShortCut "$SMPROGRAMS\NFO Tools\Cg Photo Wall.lnk" "$INSTDIR\cg_photo_wall.exe"
-          
-          WriteUninstaller "$INSTDIR\uninstall.exe"
-          CreateShortCut "$SMPROGRAMS\NFO Tools\Uninstall.lnk" "$INSTDIR\uninstall.exe"
-        SectionEnd
-        
-        Section "Uninstall"
-          Delete "$INSTDIR\uninstall.exe"
-          Delete "$INSTDIR\cg_crop.exe"
-          Delete "$INSTDIR\NFO.Editor.exe"
-          Delete "$INSTDIR\cg_rename.exe"
-          Delete "$INSTDIR\cg_dedupe.exe"
-          Delete "$INSTDIR\cg_photo_wall.exe"
-          # Delete "$INSTDIR\chuizi.ico"
-          
-          Delete "$SMPROGRAMS\NFO Tools\NFO Editor.lnk"
-          Delete "$SMPROGRAMS\NFO Tools\Cg Crop.lnk"
-          Delete "$SMPROGRAMS\NFO Tools\Cg Rename.lnk"
-          Delete "$SMPROGRAMS\NFO Tools\NFO Dedupe.lnk"
-          Delete "$SMPROGRAMS\NFO Tools\Cg Photo Wall.lnk"
-          Delete "$SMPROGRAMS\NFO Tools\Uninstall.lnk"
-          
-          RMDir /r "$INSTDIR"
-          RMDir "$SMPROGRAMS\NFO Tools"
-        SectionEnd
-        '@ | Out-File -FilePath "installer.nsi" -Encoding utf8
-
-    - name: 安装 NSIS
-      run: |
-        choco install nsis -y --no-progress
-
-    - name: 构建安装程序
-      run: |
-        makensis installer.nsi
+        # 创建 ZIP 包
+        Compress-Archive -Path "dist/NFOTools/*" -DestinationPath "NFOTools.${{ env.build_name }}.zip" -Force
 
     - name: 上传构建工件
       uses: actions/upload-artifact@v4
       with:
-        name: nfo-tools-installer
-        path: NFOTools.Setup.${{ env.build_name }}.exe
+        name: nfo-tools-release
+        path: NFOTools.${{ env.build_name }}.zip
         retention-days: 7
 
-  release:
-    needs: build
-    runs-on: windows-latest
-    permissions:
-      contents: write
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: 设置构建名称
-        id: set_build_name
-        shell: pwsh
-        run: |
-          git fetch --tags
-          $latestTag = git describe --tags $(git rev-list --tags --max-count=1)
-          if ($null -eq $latestTag) {
-            Write-Error "未找到任何标签，无法继续。"
-            exit 1
-          }
-          echo "build_name=$latestTag" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: 下载安装程序
-        uses: actions/download-artifact@v4
-        with:
-          name: nfo-tools-installer
-          path: dist
-
-      - name: 创建 Release
-        uses: softprops/action-gh-release@v1
-        with:
-          name: Release ${{ env.build_name }}
-          tag_name: ${{ env.build_name }}
-          draft: false
-          prerelease: false
-          files: dist/*.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: 创建 Release
+      uses: softprops/action-gh-release@v1
+      with:
+        name: Release ${{ env.build_name }}
+        tag_name: ${{ env.build_name }}
+        draft: false
+        prerelease: false
+        files: NFOTools.${{ env.build_name }}.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
