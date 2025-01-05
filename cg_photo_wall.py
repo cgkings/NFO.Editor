@@ -175,6 +175,7 @@ class PhotoWallDialog(QDialog):
         self.parent_window = parent
         self.folder_path = folder_path
         self.all_posters = []
+        self._sort_keys = {}  # 初始化排序键字典
         self.resize_timer = QTimer()
         self.resize_timer.setSingleShot(True)
         self.resize_timer.timeout.connect(self.handle_resize)
@@ -204,9 +205,6 @@ class PhotoWallDialog(QDialog):
             last_dir = self.settings.value("last_directory", "")
             if last_dir and os.path.exists(last_dir):
                 self.folder_path = last_dir  # 仅保存路径，不自动加载
-
-        # 添加排序键的数据结构，用于优化排序性能
-        self._sort_keys = {}
 
     def init_ui(self):
         """初始化UI"""
