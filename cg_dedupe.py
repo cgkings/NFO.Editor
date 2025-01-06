@@ -156,7 +156,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             self.add_directory(initial_directory)
 
     def init_ui(self):
-        self.setWindowTitle("大锤 NFO查重工具 v9.5.8")
+        self.setWindowTitle("大锤 NFO查重工具 v9.5.9")
         self.setGeometry(100, 100, 800, 600)
         self.setMinimumSize(600, 400)
 
