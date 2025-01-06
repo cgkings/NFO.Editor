@@ -955,7 +955,14 @@ class PhotoWallDialog(QDialog):
                 self.parent_window.activateWindow()
                 self.parent_window.raise_()
             else:
-                current_dir = os.path.dirname(os.path.abspath(__file__))
+                # 获取当前程序所在目录
+                if getattr(sys, "frozen", False):
+                    # 如果是打包后的 exe
+                    current_dir = os.path.dirname(sys.executable)
+                else:
+                    # 如果是 py 脚本
+                    current_dir = os.path.dirname(os.path.abspath(__file__))
+
                 # 根据当前程序运行方式选择对应的编辑器程序
                 is_py = os.path.splitext(sys.argv[0])[1].lower() == ".py"
                 editor_name = "NFO.Editor.Qt5.py" if is_py else "NFO.Editor.Qt5.exe"
