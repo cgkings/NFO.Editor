@@ -902,9 +902,37 @@ class PhotoWallDialog(QDialog):
             self.progress_bar.setFormat("加载图片: %v/%m")
             self.image_manager.add_images(image_paths_and_labels)
 
+    def disable_sorting_controls(self):
+        """禁用排序和筛选相关的控件"""
+        # 禁用排序按钮
+        for button in self.sorting_group.buttons():
+            button.setEnabled(False)
+
+        # 禁用筛选控件
+        if hasattr(self, "field_combo"):
+            self.field_combo.setEnabled(False)
+        if hasattr(self, "condition_combo"):
+            self.condition_combo.setEnabled(False)
+        if hasattr(self, "filter_entry"):
+            self.filter_entry.setEnabled(False)
+
+    def enable_sorting_controls(self):
+        """启用排序和筛选相关的控件"""
+        # 启用排序按钮
+        for button in self.sorting_group.buttons():
+            button.setEnabled(True)
+
+        # 启用筛选控件
+        if hasattr(self, "field_combo"):
+            self.field_combo.setEnabled(True)
+        if hasattr(self, "condition_combo"):
+            self.condition_combo.setEnabled(True)
+        if hasattr(self, "filter_entry"):
+            self.filter_entry.setEnabled(True)
+
     def sort_posters(self):
-        """排序函数 - 完整修复版本"""
-        if not self.sorting_group.checkedButton() or not self.all_posters:
+        """带进度显示的排序函数"""
+        if not self.sorting_group.checkedButton():
             return
 
         sort_by = self.sorting_group.checkedButton().text()
@@ -912,160 +940,215 @@ class PhotoWallDialog(QDialog):
             QMessageBox.warning(self, "警告", f"未找到{sort_by}的排序数据")
             return
 
-        if not self._sort_keys[sort_by]:
-            QMessageBox.warning(self, "警告", f"无可用的{sort_by}数据进行排序")
-            return
-
-        # 禁用所有排序按钮
-        for button in self.sorting_group.buttons():
-            button.setEnabled(False)
-
-        self.is_loading = True  # 设置加载状态
-        self.progress_bar.show()
-        self.cancel_button.show()
-
         try:
-            # 使用预处理的排序键进行排序
-            if sort_by in self._sort_keys and self._sort_keys[sort_by]:
-                # 对索引进行排序，使用三元组确保稳定排序
-                reverse = sort_by in ["评分", "日期"]
-                sorted_tuples = sorted(
-                    self._sort_keys[sort_by],
-                    key=lambda x: (x[0] or "", x[2]),  # 使用原始顺序作为次要排序键
-                    reverse=reverse,
-                )
+            # 禁用UI控件,阻止重复操作
+            self.disable_sorting_controls()
+            self.is_loading = True  # 添加加载状态标记
 
-                # 获取排序后的索引
-                sorted_indices = [t[1] for t in sorted_tuples]
+            # 显示进度条
+            self.progress_bar.setFormat(f"正在{sort_by}排序: %v/%m")
+            self.progress_bar.setValue(0)
+            self.progress_bar.show()
+            self.cancel_button.show()
 
-                # 重新排序 all_posters
-                self.all_posters = [self.all_posters[i] for i in sorted_indices]
+            # 记录当前可见性和位置信息
+            visibility_states = {}
+            grid_positions = {}
+            for index, container_info in enumerate(self.poster_containers):
+                if container_info and "container" in container_info:
+                    visibility_states[index] = container_info["container"].isVisible()
+                    pos = self.grid.getItemPosition(
+                        self.grid.indexOf(container_info["container"])
+                    )
+                    grid_positions[index] = pos
 
-                # 清除现有图片
-                for container_info in self.poster_containers:
-                    if container_info and "poster_label" in container_info:
-                        container_info["poster_label"].clear()
-                        container_info["poster_label"].setText("加载中...")
+            # 排序
+            sort_tuples = self._sort_keys[sort_by]
+            reverse = sort_by in ["评分", "日期"]
+            sorted_tuples = sorted(
+                sort_tuples, key=lambda x: (x[0] or "", x[2]), reverse=reverse
+            )
+            sorted_indices = [t[1] for t in sorted_tuples]
 
-                # 重新构建排序键以保持一致性
-                old_sort_keys = self._sort_keys.copy()
-                self._sort_keys.clear()
+            # 创建临时数据存储
+            temp_posters = self.all_posters.copy()
+            temp_containers = self.poster_containers.copy()
 
-                # 更新容器内容和重建排序键
-                image_paths_and_labels = []
-                for new_index, original_index in enumerate(sorted_indices):
-                    try:
-                        poster_file, _, nfo_data = self.all_posters[new_index]
-                        self._update_sort_keys(nfo_data, new_index)  # 重建排序键
+            # 设置进度条最大值(可见项目数)
+            visible_total = sum(1 for i in visibility_states.values() if i)
+            self.progress_bar.setMaximum(visible_total)
+            progress = 0
 
+            # 更新数据和UI
+            visible_count = 0
+            columns = 8
+            for new_index, original_index in enumerate(sorted_indices):
+                if not self.is_loading:  # 检查是否被取消
+                    break
+
+                if original_index < len(temp_posters) and new_index < len(
+                    temp_containers
+                ):
+                    # 更新数据
+                    self.all_posters[new_index] = temp_posters[original_index]
+                    self.poster_containers[new_index] = temp_containers[original_index]
+
+                    container_info = self.poster_containers[new_index]
+                    if container_info and "container" in container_info:
                         # 更新容器内容
-                        self.update_container_content(new_index, poster_file, nfo_data)
+                        poster_file, _, nfo_data = self.all_posters[new_index]
 
-                        # 准备重新加载图片
-                        if os.path.exists(poster_file):
-                            container_info = self.poster_containers[new_index]
-                            image_paths_and_labels.append(
-                                (poster_file, container_info["poster_label"])
-                            )
-                    except Exception as e:
-                        print(f"更新容器内容失败，索引 {new_index}: {str(e)}")
+                        # 更新文本信息
+                        title = nfo_data.get("title", "")
+                        container_info["title_label"].setText(title)
 
-                # 重置图片加载管理器
-                if hasattr(self, "image_manager"):
-                    self.image_manager.stop()
-                    self.image_manager.executor.shutdown(wait=True)  # 等待所有任务完成
-                self.image_manager = ImageLoadManager()
-                self.image_manager.progress_updated.connect(self.update_progress)
-                self.image_manager.image_loaded.connect(self.update_image_label)
+                        info_parts = []
+                        if year := nfo_data.get("year"):
+                            info_parts.append(year)
+                        if rating := nfo_data.get("rating"):
+                            try:
+                                rating_float = float(rating)
+                                info_parts.append(f"★{rating_float:.1f}")
+                            except (ValueError, TypeError):
+                                pass
+                        if actors := nfo_data.get("actors"):
+                            if actors and isinstance(actors, list):
+                                info_parts.append(actors[0])
+                        container_info["info_label"].setText(" · ".join(info_parts))
 
-                # 重新加载图片
-                if image_paths_and_labels:
-                    self.progress_bar.setFormat("重新加载图片: %v/%m")
-                    self.image_manager.add_images(image_paths_and_labels)
-                else:
-                    # 如果没有图片需要加载，直接完成
-                    self.is_loading = False
-                    self.progress_bar.hide()
-                    self.cancel_button.hide()
+                        # 更新图片
+                        if visibility_states.get(original_index, True):
+                            # 如果之前是可见的，计算新位置
+                            row = visible_count // columns
+                            col = visible_count % columns
+                            self.grid.removeWidget(container_info["container"])
+                            self.grid.addWidget(container_info["container"], row, col)
+                            container_info["container"].show()
+                            visible_count += 1
+
+                            # 重新加载图片
+                            reader = QImageReader(poster_file)
+                            if reader.canRead():
+                                target_size = container_info["poster_label"].size()
+                                original_size = reader.size()
+                                width_ratio = (
+                                    target_size.width() / original_size.width()
+                                )
+                                height_ratio = (
+                                    target_size.height() / original_size.height()
+                                )
+                                scale_ratio = min(width_ratio, height_ratio)
+                                new_width = int(original_size.width() * scale_ratio)
+                                new_height = int(original_size.height() * scale_ratio)
+                                reader.setScaledSize(QSize(new_width, new_height))
+                                image = reader.read()
+                                if not image.isNull():
+                                    pixmap = QPixmap.fromImage(image)
+                                    container_info["poster_label"].setPixmap(pixmap)
+
+                            # 更新进度
+                            progress += 1
+                            self.progress_bar.setValue(progress)
+                            QApplication.processEvents()  # 允许UI更新
+                        else:
+                            container_info["container"].hide()
+
+            # 重建排序键
+            self._sort_keys.clear()
+            for index, (_, _, nfo_data) in enumerate(self.all_posters):
+                self._update_sort_keys(nfo_data, index)
 
         except Exception as e:
             print(f"排序失败: {str(e)}")
             QMessageBox.warning(self, "警告", "排序过程中发生错误")
-            self.is_loading = False
+        finally:
+            # 隐藏进度条
             self.progress_bar.hide()
             self.cancel_button.hide()
-        finally:
-            # 重新启用排序按钮
-            for button in self.sorting_group.buttons():
-                button.setEnabled(True)
+            # 恢复UI控件
+            self.enable_sorting_controls()
+            self.is_loading = False  # 重置加载状态
 
     def apply_filter(self):
-        """优化后的筛选函数"""
+        """修复后的筛选函数 - 确保结果连续显示"""
         field = self.field_combo.currentText()
         condition = self.condition_combo.currentText()
         filter_text = self.filter_entry.text().strip()
 
         try:
             visible_count = 0
+            columns = 8
 
+            # 如果没有筛选条件，显示所有内容
             if not filter_text:
-                # 显示所有内容
-                for index, (poster_file, _, nfo_data) in enumerate(self.all_posters):
-                    if index < len(self.poster_containers):
-                        container_info = self.poster_containers[index]
+                for index, container_info in enumerate(self.poster_containers):
+                    if container_info and "container" in container_info:
+                        # 计算新的网格位置
+                        row = visible_count // columns
+                        col = visible_count % columns
+
+                        # 移动到正确位置并显示
+                        self.grid.removeWidget(container_info["container"])
+                        self.grid.addWidget(container_info["container"], row, col)
                         container_info["container"].show()
                         visible_count += 1
+            else:
+                # 应用筛选条件
+                for index, (_, _, nfo_data) in enumerate(self.all_posters):
+                    if index >= len(self.poster_containers):
+                        continue
 
-                self.update_status(visible_count)
-                return
+                    container_info = self.poster_containers[index]
+                    if not container_info or "container" not in container_info:
+                        continue
 
-            # 筛选逻辑
-            for index, (poster_file, _, nfo_data) in enumerate(self.all_posters):
-                if index >= len(self.poster_containers):
-                    continue
+                    value = ""
+                    if field == "标题":
+                        value = nfo_data.get("title", "")
+                    elif field == "标签":
+                        value = ", ".join(nfo_data.get("tags", []))
+                    elif field == "演员":
+                        value = ", ".join(nfo_data.get("actors", []))
+                    elif field == "系列":
+                        value = nfo_data.get("series", "")
+                    elif field == "评分":
+                        value = nfo_data.get("rating", "0")
 
-                container_info = self.poster_containers[index]
-                value = ""
+                    match = False
+                    if field == "评分":
+                        try:
+                            current_value = float(value)
+                            filter_value = float(filter_text)
+                            if condition == "大于":
+                                match = current_value > filter_value
+                            else:  # 小于
+                                match = current_value < filter_value
+                        except ValueError:
+                            match = False
+                    else:
+                        if condition == "包含":
+                            match = filter_text.lower() in value.lower()
+                        else:  # 不包含
+                            match = filter_text.lower() not in value.lower()
 
-                if field == "标题":
-                    value = nfo_data.get("title", "")
-                elif field == "标签":
-                    value = ", ".join(nfo_data.get("tags", []))
-                elif field == "演员":
-                    value = ", ".join(nfo_data.get("actors", []))
-                elif field == "系列":
-                    value = nfo_data.get("series", "")
-                elif field == "评分":
-                    value = nfo_data.get("rating", "0")
+                    if match:
+                        # 计算新的网格位置
+                        row = visible_count // columns
+                        col = visible_count % columns
 
-                match = False
-                if field == "评分":
-                    try:
-                        current_value = float(value)
-                        filter_value = float(filter_text)
-                        if condition == "大于":
-                            match = current_value > filter_value
-                        else:  # 小于
-                            match = current_value < filter_value
-                    except ValueError:
-                        match = False
-                else:
-                    if condition == "包含":
-                        match = filter_text.lower() in value.lower()
-                    else:  # 不包含
-                        match = filter_text.lower() not in value.lower()
-
-                # 根据匹配结果显示或隐藏容器
-                if match:
-                    container_info["container"].show()
-                    visible_count += 1
-                else:
-                    container_info["container"].hide()
+                        # 移动到正确位置并显示
+                        self.grid.removeWidget(container_info["container"])
+                        self.grid.addWidget(container_info["container"], row, col)
+                        container_info["container"].show()
+                        visible_count += 1
+                    else:
+                        container_info["container"].hide()
 
             self.update_status(visible_count)
 
         except Exception as e:
             print(f"筛选失败: {str(e)}")
+            QMessageBox.warning(self, "警告", "筛选过程中发生错误")
 
     def on_field_changed(self, index):
         """字段改变处理"""
