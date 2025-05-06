@@ -12,14 +12,143 @@ import signal
 from threading import Lock
 
 
+class AppTheme:
+    """集中管理应用主题颜色"""
+
+    def __init__(self):
+        # 商务风配色常量 - 扩展版
+        self.colors = {
+            "primary": "#2c3e50",  # 深蓝灰色(主色)
+            "secondary": "#3498db",  # 中蓝色(辅助色)
+            "light": "#ecf0f1",  # 浅灰色(背景)
+            "border": "#d5d8dc",  # 边框颜色
+            "success": "#27ae60",  # 成功色
+            "warning": "#e74c3c",  # 警告色
+            "text": "#2c3e50",  # 文本颜色
+            "light_text": "#7f8c8d",  # 浅色文本
+            "group_bg": "#d6eaf8",  # 淡蓝色组背景
+            "item1_bg": "#e8f8f5",  # 浅绿色第一项背景
+            "item2_bg": "#fef9e7",  # 浅黄色其他项背景
+            "row_alt": "#ffffff",  # 交替行色
+        }
+
+    def get_button_style(self, is_action=False):
+        """获取按钮样式"""
+        return f"""
+            QPushButton {{
+                background-color: {self.colors["secondary"]};
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: #2980b9;
+            }}
+            QPushButton:pressed {{
+                background-color: #1f6da8;
+            }}
+        """
+
+    def get_directory_button_style(self):
+        """获取目录按钮样式"""
+        return f"""
+            QPushButton {{
+                text-align: left;
+                padding: 8px 10px;
+                background-color: white;
+                border: 1px solid {self.colors["border"]};
+                border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                background-color: {self.colors["light"]};
+                border: 1px solid {self.colors["secondary"]};
+            }}
+        """
+
+    def get_tree_widget_style(self):
+        """获取树形控件样式"""
+        return f"""
+            QTreeWidget {{
+                border: 1px solid {self.colors["border"]};
+                border-radius: 4px;
+                background-color: white;
+                alternate-background-color: {self.colors["light"]};
+                gridline-color: {self.colors["border"]};
+            }}
+            QTreeWidget::item {{
+                padding: 6px;
+                border-bottom: 1px solid {self.colors["border"]};
+                min-height: 24px;
+            }}
+            QTreeWidget::item:selected {{
+                background-color: {self.colors["secondary"]};
+                color: white;
+            }}
+            QHeaderView::section {{
+                background-color: {self.colors["primary"]};
+                color: white;
+                padding: 8px;
+                border: none;
+                font-weight: bold;
+            }}
+        """
+
+    def get_progress_bar_style(self):
+        """获取进度条样式"""
+        return f"""
+            QProgressBar {{
+                border: none;
+                border-radius: 4px;
+                background-color: {self.colors["light"]};
+                text-align: center;
+                height: 18px;
+                font-size: 12px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {self.colors["success"]};
+                border-radius: 4px;
+            }}
+        """
+
+    def get_label_style(self, is_tip=False, is_stats=False):
+        """获取标签样式"""
+        if is_tip:
+            return f"""
+                QLabel {{
+                    color: {self.colors["light_text"]};
+                    padding: 4px;
+                    font-size: 14px;
+                    border-bottom: 1px solid {self.colors["border"]};
+                    margin-bottom: 5px;
+                }}
+            """
+        elif is_stats:
+            return f"""
+                QLabel {{
+                    color: {self.colors["primary"]};
+                    font-weight: bold;
+                    padding: 4px;
+                    margin-top: 5px;
+                }}
+            """
+        else:
+            return f"""
+                QLabel {{
+                    color: {self.colors["text"]};
+                }}
+            """
+
+
 class CustomSpinner(QtWidgets.QWidget):
     valueChanged = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.initUI()
         self.current_index = 0
         self.options = ["番号", "系列"]
+        self.initUI()
 
     def initUI(self):
         layout = QtWidgets.QHBoxLayout()
@@ -29,7 +158,7 @@ class CustomSpinner(QtWidgets.QWidget):
         # 文本显示区域
         self.display = QtWidgets.QLineEdit()
         self.display.setReadOnly(True)
-        self.display.setText("番号")
+        self.display.setText(self.options[0])
         self.display.setAlignment(Qt.AlignCenter)
 
         # 按钮容器
@@ -51,7 +180,7 @@ class CustomSpinner(QtWidgets.QWidget):
         button_layout.addWidget(self.up_button)
         button_layout.addWidget(self.down_button)
         button_container.setLayout(button_layout)
-        button_container.setFixedWidth(24)  # 设置按钮容器宽度
+        button_container.setFixedWidth(24)
 
         # 添加到主布局
         layout.addWidget(self.display)
@@ -62,7 +191,7 @@ class CustomSpinner(QtWidgets.QWidget):
         self.up_button.clicked.connect(self.previous_item)
         self.down_button.clicked.connect(self.next_item)
 
-        # 设置样式
+        # 统一使用样式表
         self.setStyleSheet(
             """
             QLineEdit {
@@ -86,7 +215,7 @@ class CustomSpinner(QtWidgets.QWidget):
             QPushButton:pressed {
                 background: #f1f5f9;
             }
-        """
+            """
         )
 
     def previous_item(self):
@@ -111,21 +240,7 @@ class DirectoryButton(QtWidgets.QPushButton):
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
         )
-        self.setStyleSheet(
-            """
-            QPushButton {
-                text-align: left;
-                padding: 5px 8px;
-                background-color: white;
-                border: 1px solid #c0c0c0;
-                border-radius: 0px;
-            }
-            QPushButton:hover {
-                background-color: #f0f0f0;
-                border: 1px solid #2563eb;
-            }
-        """
-        )
+        # 样式将通过theme统一应用
 
     def setText(self, text):
         if text:
@@ -143,35 +258,448 @@ class DirectoryButton(QtWidgets.QPushButton):
             super().mousePressEvent(event)
 
 
+class NfoFile:
+    """NFO文件处理类"""
+
+    # 编码尝试顺序
+    ENCODINGS = ["utf-8", "gbk", "cp936", "latin1"]
+
+    # 番号匹配正则表达式
+    CODE_PATTERNS = [
+        (r"([A-Za-z]{2,15})-?(\d{2,5})", False),  # 标准番号如 MIDE-954 或 MY-948
+        (r"([A-Za-z]{2,15})(\d{2,5})", False),  # 无连字符格式如 MIDE954
+        (r"FC2-?PPV-?(\d{6,7})", True),  # FC2格式
+        (r"T-?(\d{2,3})-?(\d{3})", True),  # T28系列特殊格式
+        (r"(\d{6})-(\d{3})", True),  # 全数字格式如 050525-001
+    ]
+
+    @staticmethod
+    def safe_read_file(file_path):
+        """安全地读取文件，尝试多种编码"""
+        for encoding in NfoFile.ENCODINGS:
+            try:
+                with open(file_path, "r", encoding=encoding) as f:
+                    return f.read(), encoding
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                print(f"打开文件出错 {file_path}: {str(e)}")
+                return None, None
+
+        print(f"无法以任何编码打开文件 {file_path}")
+        return None, None
+
+    @staticmethod
+    def extract_code(text):
+        """从文本中提取番号"""
+        if not text:
+            return None
+
+        for pattern, is_special in NfoFile.CODE_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                if is_special:
+                    # 特殊格式处理
+                    if "FC2" in pattern:
+                        return match.group(0).upper()
+                    elif "T-?" in pattern:
+                        return f"T-{match.group(1)}-{match.group(2)}".upper()
+                    elif r"(\d{6})-(\d{3})" == pattern:
+                        # 保持全数字格式原样
+                        return f"{match.group(1)}-{match.group(2)}"
+                    else:
+                        return match.group(0).upper()
+                else:
+                    # 标准格式，确保使用连字符
+                    return f"{match.group(1)}-{match.group(2)}".upper()
+        return None
+
+
+class NfoDuplicateLogic:
+    """处理NFO文件查重的核心逻辑类"""
+
+    # 字段常量
+    FIELD_NUM = "番号"
+    FIELD_SERIES = "系列"
+
+    def get_nfo_files_generator(self, directories):
+        """使用生成器获取所有NFO文件路径"""
+        for directory in directories:
+            if os.path.exists(directory):
+                for root, _, files in os.walk(directory):
+                    for file in files:
+                        if file.lower().endswith(".nfo"):
+                            yield os.path.join(root, file)
+
+    def process_nfo_file(self, args):
+        """
+        处理单个NFO文件，提取指定字段值
+
+        Args:
+            args (tuple): (文件路径, 要查找的字段)
+
+        Returns:
+            tuple: (提取的值, 文件路径) 或 (None, 文件路径)表示未找到
+        """
+        nfo_file, field = args
+
+        # 检查文件是否存在
+        if not os.path.exists(nfo_file):
+            return None, nfo_file
+
+        # 读取文件内容
+        content, encoding = NfoFile.safe_read_file(nfo_file)
+        if content is None:
+            return None, nfo_file
+
+        # 解析XML
+        try:
+            tree = ET.fromstring(content)
+
+            if field == self.FIELD_NUM:
+                # 优先级1: <num>标签
+                num_elem = tree.find("num")
+                if num_elem is not None and num_elem.text:
+                    return num_elem.text.strip(), nfo_file
+
+                # 优先级2: 标题字段
+                for tag_name in ["title", "originaltitle", "sorttitle"]:
+                    elem = tree.find(tag_name)
+                    if elem is not None and elem.text:
+                        code = NfoFile.extract_code(elem.text)
+                        if code:
+                            return code, nfo_file
+
+                # 优先级3: 文件名
+                filename = os.path.basename(nfo_file)
+                code = NfoFile.extract_code(filename)
+                if code:
+                    return code, nfo_file
+
+            elif field == self.FIELD_SERIES:
+                series_elem = tree.find("series")
+                if series_elem is not None and series_elem.text:
+                    return series_elem.text.strip(), nfo_file
+
+            # 未找到任何匹配
+            return None, nfo_file
+
+        except ET.ParseError as e:
+            print(f"XML解析错误 {nfo_file}: {e}")
+        except Exception as e:
+            print(f"处理文件错误 {nfo_file}: {e}")
+
+        return None, nfo_file
+
+
+class NfoDuplicateOperations:
+    def __init__(self, ui_instance):
+        self.ui = ui_instance
+        self.result_lock = Lock()
+        self.progress_lock = Lock()
+        self.processed_files = 0
+        self.batch_size = 1000  # 固定批处理大小
+
+    def select_directories(self, index=-1):
+        """选择目录，index=-1表示新增，否则表示替换指定位置"""
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self.ui,
+            "选择目录",
+            ".",
+            QtWidgets.QFileDialog.ShowDirsOnly
+            | QtWidgets.QFileDialog.DontUseNativeDialog,
+        )
+        if directory and os.path.exists(directory):
+            if index >= 0:  # 替换模式
+                if index < len(self.ui.selected_directories):
+                    self.ui.selected_directories[index] = directory
+                    self.ui.update_directory_display()
+            else:  # 新增模式
+                self.ui.add_directory(directory)
+
+    def find_duplicates(self):
+        """查找重复项的核心方法"""
+        if not self.ui.selected_directories:
+            QtWidgets.QMessageBox.warning(self.ui, "错误", "请先选择至少一个目录！")
+            return
+
+        self.ui.start_button.setEnabled(False)
+        self.ui.start_button.setText("正在查找...")
+        self.processed_files = 0
+
+        selected_field = self.ui.field_spinner.get_current_value()
+        self.ui.progress_bar.setValue(0)
+        self.ui.progress_bar.setFormat("处理中: %p%")
+        self.ui.result_stats_label.setText("")
+
+        # 使用生成器获取文件列表
+        nfo_files = list(
+            self.ui.logic.get_nfo_files_generator(self.ui.selected_directories)
+        )
+        total_files = len(nfo_files)
+        self.ui.progress_bar.setMaximum(total_files)
+
+        duplicates = {}
+
+        # 创建一个定时器用于更新UI，避免从工作线程直接更新UI
+        self.update_timer = QtCore.QTimer()
+        self.update_timer.setInterval(100)  # 100毫秒更新一次
+        self.update_timer.timeout.connect(self._update_progress_ui)
+        self.update_timer.start()
+
+        # 划分批次
+        batches = [
+            nfo_files[i : i + self.batch_size]
+            for i in range(0, len(nfo_files), self.batch_size)
+        ]
+
+        # 使用线程池处理批次
+        with ThreadPoolExecutor(max_workers=cpu_count()) as executor:
+            future_to_batch = {
+                executor.submit(self._process_batch, batch, selected_field): batch
+                for batch in batches
+            }
+
+            for future in as_completed(future_to_batch):
+                try:
+                    batch_results = future.result()
+                    with self.result_lock:
+                        for key, values in batch_results.items():
+                            if key in duplicates:
+                                duplicates[key].extend(values)
+                            else:
+                                duplicates[key] = values
+                except Exception as e:
+                    print(f"处理批次时出错: {str(e)}")
+
+        # 停止定时器
+        self.update_timer.stop()
+
+        # 确保进度条显示100%
+        self.ui.progress_bar.setValue(total_files)
+
+        # 过滤掉没有重复的项
+        filtered_duplicates = {
+            key: paths for key, paths in duplicates.items() if len(paths) > 1
+        }
+
+        self.display_duplicates(filtered_duplicates)
+        self.ui.start_button.setEnabled(True)
+        self.ui.start_button.setText("开始查重")
+
+    def _update_progress_ui(self):
+        """更新UI进度条，由定时器调用"""
+        with self.progress_lock:
+            current_progress = self.processed_files
+            self.ui.progress_bar.setValue(current_progress)
+
+    def _process_batch(self, file_batch, selected_field):
+        """处理一批文件，由线程池调用"""
+        batch_results = {}
+        local_processed = 0
+
+        for nfo_file in file_batch:
+            result = self.ui.logic.process_nfo_file((nfo_file, selected_field))
+            if result[0]:  # 如果找到了字段值
+                field_value = result[0]
+                if field_value in batch_results:
+                    batch_results[field_value].append(result[1])
+                else:
+                    batch_results[field_value] = [result[1]]
+
+            local_processed += 1
+
+        # 批量更新进度，减少锁竞争
+        with self.progress_lock:
+            self.processed_files += local_processed
+
+        return batch_results
+
+    def display_duplicates(self, duplicates):
+        """显示重复项结果"""
+        # 清空现有结果
+        self.ui.result_list.clear()
+
+        # 排序重复项，按重复项数量从多到少排序
+        sorted_duplicates = sorted(
+            duplicates.items(), key=lambda x: len(x[1]), reverse=True
+        )
+
+        # 计算找到的重复组数量
+        group_count = 0
+        total_files = 0
+
+        # 第一个选择的目录（用于突出显示）
+        first_directory = (
+            self.ui.selected_directories[0] if self.ui.selected_directories else None
+        )
+
+        # 遍历所有重复项
+        for field_value, paths in sorted_duplicates:
+            # 仅处理确实有重复的项（路径数量大于1）
+            if len(paths) <= 1:
+                continue
+
+            group_count += 1
+            total_files += len(paths)
+
+            # 对路径进行排序，优先显示第一个文件夹内的文件
+            sorted_paths = sorted(
+                paths,
+                key=lambda x: (
+                    0 if first_directory and x.startswith(first_directory) else 1,
+                    x,
+                ),
+            )
+
+            # 创建根项（第一行：番号+第一个文件）
+            root_item = QtWidgets.QTreeWidgetItem(self.ui.result_list)
+            root_item.setText(0, f"{field_value} ({len(paths)}个文件)")
+            root_item.setText(1, sorted_paths[0] if sorted_paths else "")
+            root_item.setFont(0, QtGui.QFont("", weight=QtGui.QFont.Bold))
+
+            # 设置第一行背景色 - 使用theme中的颜色
+            root_item.setBackground(0, QtGui.QColor(self.ui.theme.colors["group_bg"]))
+            root_item.setBackground(1, QtGui.QColor(self.ui.theme.colors["item1_bg"]))
+
+            # 存储数据用于双击事件
+            root_item.setData(0, QtCore.Qt.UserRole, {"is_group": True, "paths": paths})
+            root_item.setData(
+                1,
+                QtCore.Qt.UserRole,
+                {"is_file": True, "path": sorted_paths[0] if sorted_paths else ""},
+            )
+
+            # 添加剩余项（从第二个开始）
+            use_alt_bg = True  # 交替背景色标志
+            for i, path in enumerate(sorted_paths[1:], 1):
+                child_item = QtWidgets.QTreeWidgetItem(root_item)
+                child_item.setText(1, path)  # 只设置第二列
+
+                # 交替背景色 - 使用theme中的颜色
+                bg_color = (
+                    QtGui.QColor(self.ui.theme.colors["item2_bg"])
+                    if use_alt_bg
+                    else QtGui.QColor(self.ui.theme.colors["row_alt"])
+                )
+                child_item.setBackground(1, bg_color)
+                use_alt_bg = not use_alt_bg  # 切换标志
+
+                # 如果是第一个文件夹的文件，添加前景色高亮
+                if first_directory and path.startswith(first_directory):
+                    child_item.setForeground(
+                        1, QtGui.QColor(self.ui.theme.colors["secondary"])
+                    )
+
+                # 储存路径信息用于双击处理
+                child_item.setData(
+                    1, QtCore.Qt.UserRole, {"is_file": True, "path": path}
+                )
+
+            # 默认展开所有组
+            root_item.setExpanded(True)
+
+        # 如果没有找到重复项，显示信息
+        if group_count == 0:
+            QtWidgets.QMessageBox.information(self.ui, "结果", "未找到重复项。")
+            self.ui.result_stats_label.setText("")
+        else:
+            # 更新结果统计
+            self.ui.result_stats_label.setText(
+                f"找到 {group_count} 组重复项，共 {total_files} 个文件"
+            )
+
+        # 重置进度条文本
+        self.ui.progress_bar.setFormat(
+            f"完成：找到 {group_count} 组重复项" if group_count > 0 else "完成"
+        )
+
+    def open_folder(self, item, column):
+        """处理项目双击事件，打开对应文件夹"""
+        # 获取项的用户数据
+        data = item.data(column, QtCore.Qt.UserRole)
+        if not data:
+            return
+
+        if column == 0 and data.get("is_group"):
+            # 点击番号列，打开所有相关文件夹
+            self._open_group_folders(data.get("paths", []))
+        elif data.get("is_file"):
+            # 点击文件路径，只打开该文件所在文件夹
+            path = data.get("path")
+            if path:
+                self._open_single_folder(os.path.dirname(path))
+
+    def _open_single_folder(self, folder_path):
+        """打开单个文件夹"""
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder_path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder_path])
+            else:
+                subprocess.Popen(["xdg-open", folder_path])
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self.ui, "错误", f"无法打开文件夹: {str(e)}")
+
+    def _open_group_folders(self, paths):
+        """打开一组文件夹"""
+        if not paths:
+            return
+
+        # 提取所有不同的文件夹路径
+        unique_folders = set()
+        for path in paths:
+            folder = os.path.dirname(path)
+            unique_folders.add(folder)
+
+        # 如果文件夹过多，询问用户是否继续
+        if len(unique_folders) > 5:
+            reply = QtWidgets.QMessageBox.question(
+                self.ui,
+                "确认",
+                f"将要打开 {len(unique_folders)} 个文件夹，是否继续？",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if reply == QtWidgets.QMessageBox.No:
+                return
+
+        # 打开所有文件夹
+        for folder in unique_folders:
+            self._open_single_folder(folder)
+
+    def clear_results_on_change(self):
+        """当选择器变化时清空结果"""
+        self.ui.result_list.clear()
+        self.ui.result_stats_label.setText("")
+
+
 class NfoDuplicateFinder(QtWidgets.QWidget):
     def __init__(self, initial_directory=None):
         super().__init__()
+        self.theme = AppTheme()  # 使用集中管理的主题
         self.logic = NfoDuplicateLogic()
-        self.operations = NfoDuplicateOperations(self)
         self.selected_directories = []
         self.dir_buttons = []
         self.init_ui()
+        # 在初始化UI后创建操作类实例
+        self.operations = NfoDuplicateOperations(self)
+        # 在operations实例化后应用需要使用operations的样式和连接
+        self.connect_signals()
+        # 加载目录
         self.load_directories()
         if initial_directory and os.path.exists(initial_directory):
             self.add_directory(initial_directory)
 
     def init_ui(self):
+        # 初始化UI组件，但不连接信号
         self.setWindowTitle("大锤 NFO查重工具 v9.6.0")
         self.setGeometry(100, 100, 800, 600)
         self.setMinimumSize(600, 400)
 
         # 加载窗口图标
-        try:
-            if getattr(sys, "frozen", False):
-                application_path = sys._MEIPASS
-            else:
-                application_path = os.path.dirname(os.path.abspath(__file__))
-
-            icon_path = os.path.join(application_path, "cg_dedupe.ico")
-            if os.path.exists(icon_path):
-                self.setWindowIcon(QtGui.QIcon(icon_path))
-        except Exception as e:
-            print(f"图标设置失败: {str(e)}")
+        self._load_app_icon()
 
         # 主布局
         main_layout = QtWidgets.QVBoxLayout()
@@ -198,10 +726,6 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         # 初始化按钮
         for i in range(9):
             btn = DirectoryButton()
-            btn.clicked.connect(
-                lambda checked, idx=i: self.operations.select_directories(idx)
-            )
-            btn.rightClicked.connect(lambda idx=i: self.remove_directory(idx))
             self.dir_buttons.append(btn)
             self.grid_layout.addWidget(btn, i // 3, i % 3)
 
@@ -243,37 +767,96 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.tip_label = QtWidgets.QLabel(
             "使用说明：九宫格内已选目录，左键重选，右键删除"
         )
-        self.tip_label.setStyleSheet(
-            """
-            QLabel {
-                color: #666666;
-                padding: 4px;
-                font-size: 16px;
-            }
-        """
-        )
 
         # 结果列表
         self.result_list = QtWidgets.QTreeWidget()
         self.result_list.setColumnCount(2)
-        self.result_list.setHeaderLabels(["重复内容", "NFO路径"])
+        self.result_list.setHeaderLabels(["重复番号/系列", "文件路径"])
         self.result_list.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.result_list.header().setStretchLastSection(True)
-        self.result_list.setAlternatingRowColors(True)
+        self.result_list.setIndentation(20)
+        self.result_list.setAnimated(True)
 
         # 进度条
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setValue(0)
 
+        # 结果统计标签
+        self.result_stats_label = QtWidgets.QLabel("")
+        self.result_stats_label.setAlignment(Qt.AlignRight)
+
         # 添加所有组件到主布局
         main_layout.addWidget(top_container)
-        main_layout.addWidget(self.tip_label)  # 添加提示标签
+        main_layout.addWidget(self.tip_label)
         main_layout.addWidget(self.result_list, 1)
+        main_layout.addWidget(self.result_stats_label)
         main_layout.addWidget(self.progress_bar)
 
         self.setLayout(main_layout)
 
-        # 连接信号
+        # 应用样式
+        self.apply_basic_styles()
+
+    def _load_app_icon(self):
+        """加载应用图标"""
+        try:
+            if getattr(sys, "frozen", False):
+                application_path = sys._MEIPASS
+            else:
+                application_path = os.path.dirname(os.path.abspath(__file__))
+
+            icon_path = os.path.join(application_path, "cg_dedupe.ico")
+            if os.path.exists(icon_path):
+                self.setWindowIcon(QtGui.QIcon(icon_path))
+        except Exception as e:
+            print(f"图标设置失败: {str(e)}")
+
+    def apply_basic_styles(self):
+        """应用基本样式，不涉及operations"""
+        # 设置主窗口样式
+        self.setStyleSheet(
+            f"""
+            QWidget {{
+                background-color: white;
+                color: {self.theme.colors["text"]};
+                font-family: 'Segoe UI', Arial, sans-serif;
+            }}
+        """
+        )
+
+        # 应用按钮样式
+        self.select_dir_button.setStyleSheet(self.theme.get_button_style())
+        self.start_button.setStyleSheet(self.theme.get_button_style())
+
+        # 应用目录按钮样式
+        for btn in self.dir_buttons:
+            btn.setStyleSheet(self.theme.get_directory_button_style())
+
+        # 提示标签样式
+        self.tip_label.setStyleSheet(self.theme.get_label_style(is_tip=True))
+
+        # 表格样式
+        self.result_list.setStyleSheet(self.theme.get_tree_widget_style())
+        self.result_list.setAlternatingRowColors(True)
+        self.result_list.setUniformRowHeights(True)
+        self.result_list.setColumnWidth(0, 200)  # 设置第一列宽度
+
+        # 结果统计标签样式
+        self.result_stats_label.setStyleSheet(self.theme.get_label_style(is_stats=True))
+
+        # 进度条样式
+        self.progress_bar.setStyleSheet(self.theme.get_progress_bar_style())
+
+    def connect_signals(self):
+        """连接所有信号，需要operations对象已初始化"""
+        # 连接目录按钮信号
+        for i, btn in enumerate(self.dir_buttons):
+            btn.clicked.connect(
+                lambda checked, idx=i: self.operations.select_directories(idx)
+            )
+            btn.rightClicked.connect(lambda idx=i: self.remove_directory(idx))
+
+        # 连接其他信号
         self.select_dir_button.clicked.connect(
             lambda: self.operations.select_directories()
         )
@@ -281,93 +864,6 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.start_button.clicked.connect(self.operations.find_duplicates)
         self.result_list.itemDoubleClicked.connect(
             lambda item, column: self.operations.open_folder(item, column)
-        )
-
-        # 应用样式
-        self.apply_styles()
-
-    def apply_styles(self):
-        # 设置主窗口背景色
-        self.setStyleSheet(
-            """
-            QWidget {
-                background-color: white;
-            }
-        """
-        )
-
-        # 选择目录按钮样式
-        self.select_dir_button.setStyleSheet(
-            """
-            QPushButton {
-                background-color: #2563eb;
-                color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 8px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #1d4ed8;
-            }
-            QPushButton:pressed {
-                background-color: #1e40af;
-            }
-        """
-        )
-
-        # 开始查找按钮样式
-        self.start_button.setStyleSheet(
-            """
-            QPushButton {
-                background-color: #2563eb;
-                color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 8px 16px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #1d4ed8;
-            }
-        """
-        )
-
-        # 表格样式
-        self.result_list.setStyleSheet(
-            """
-            QTableWidget {
-                border: 1px solid #e2e8f0;
-                border-radius: 6px;
-                background-color: white;
-                gridline-color: #f1f5f9;
-            }
-            QTableWidget::item {
-                padding: 4px;
-            }
-            QHeaderView::section {
-                background-color: #f8fafc;
-                padding: 6px;
-                border: none;
-                font-weight: bold;
-            }
-        """
-        )
-
-        # 进度条样式
-        self.progress_bar.setStyleSheet(
-            """
-            QProgressBar {
-                border: none;
-                border-radius: 6px;
-                background-color: #f1f5f9;
-                text-align: center;
-            }
-            QProgressBar::chunk {
-                background-color: #2563eb;
-                border-radius: 6px;
-            }
-        """
         )
 
     def add_directory(self, directory):
@@ -416,356 +912,9 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         settings.setValue("directories", self.selected_directories)
 
     def closeEvent(self, event):
+        """窗口关闭事件处理"""
         self.save_directories()
         event.accept()
-
-
-class NfoDuplicateOperations:
-    def __init__(self, ui_instance):
-        self.ui = ui_instance
-        self.result_lock = Lock()
-        self.progress_lock = Lock()
-        self.processed_files = 0
-        self.batch_size = 1000  # 固定批处理大小
-
-    def select_directories(self, index=-1):
-        """选择目录，index=-1表示新增，否则表示替换指定位置"""
-        directory = QtWidgets.QFileDialog.getExistingDirectory(
-            self.ui,
-            "选择目录",
-            ".",
-            QtWidgets.QFileDialog.ShowDirsOnly
-            | QtWidgets.QFileDialog.DontUseNativeDialog,
-        )
-        if directory and os.path.exists(directory):
-            if index >= 0:  # 替换模式
-                if index < len(self.ui.selected_directories):
-                    self.ui.selected_directories[index] = directory
-                    self.ui.update_directory_display()
-            else:  # 新增模式
-                self.ui.add_directory(directory)
-
-    def remove_selected_directory(self):
-        if not self.ui.selected_directories:
-            QtWidgets.QMessageBox.warning(self.ui, "提示", "没有可以取消的目录")
-            return
-
-        directory, ok = QtWidgets.QInputDialog.getItem(
-            self.ui,
-            "取消选择目录",
-            "请选择要取消的目录:",
-            self.ui.selected_directories,
-            0,
-            False,
-        )
-        if ok and directory:
-            self.ui.selected_directories.remove(directory)
-            self.ui.update_selected_directories_display()
-
-    def find_duplicates(self):
-        if not self.ui.selected_directories:
-            QtWidgets.QMessageBox.warning(self.ui, "错误", "请先选择至少一个目录！")
-            return
-
-        self.ui.start_button.setEnabled(False)
-        self.ui.start_button.setText("正在查找...")
-        self.processed_files = 0
-
-        selected_field = self.ui.field_spinner.get_current_value()
-        self.ui.progress_bar.setValue(0)
-
-        # 使用生成器获取文件列表
-        nfo_files = list(
-            self.ui.logic.get_nfo_files_generator(self.ui.selected_directories)
-        )
-        total_files = len(nfo_files)
-        self.ui.progress_bar.setMaximum(total_files)
-
-        duplicates = {}
-
-        def process_batch(file_batch):
-            batch_results = {}
-            for nfo_file in file_batch:
-                result = self.ui.logic.process_nfo_file((nfo_file, selected_field))
-                if result[0]:  # 如果找到了字段值
-                    field_value = result[0]
-                    if field_value in batch_results:
-                        batch_results[field_value].append(result[1])
-                    else:
-                        batch_results[field_value] = [result[1]]
-
-                with self.progress_lock:
-                    self.processed_files += 1
-                    self.ui.progress_bar.setValue(self.processed_files)
-
-            return batch_results
-
-        # 划分批次
-        batches = [
-            nfo_files[i : i + self.batch_size]
-            for i in range(0, len(nfo_files), self.batch_size)
-        ]
-
-        # 使用线程池处理批次
-        with ThreadPoolExecutor(max_workers=cpu_count()) as executor:
-            future_to_batch = {
-                executor.submit(process_batch, batch): batch for batch in batches
-            }
-
-            for future in as_completed(future_to_batch):
-                try:
-                    batch_results = future.result()
-                    with self.result_lock:
-                        for key, values in batch_results.items():
-                            if key in duplicates:
-                                duplicates[key].extend(values)
-                            else:
-                                duplicates[key] = values
-                except Exception as e:
-                    print(f"处理批次时出错: {str(e)}")
-
-        # 过滤掉没有重复的项
-        filtered_duplicates = {
-            key: paths for key, paths in duplicates.items() if len(paths) > 1
-        }
-
-        self.display_duplicates(filtered_duplicates)
-        self.ui.start_button.setEnabled(True)
-        self.ui.start_button.setText("查找重复项")
-
-    def display_duplicates(self, duplicates):
-        # 清空现有结果
-        self.ui.result_list.clear()
-
-        # 排序重复项，按重复项数量从多到少排序
-        sorted_duplicates = sorted(
-            duplicates.items(), key=lambda x: len(x[1]), reverse=True
-        )
-
-        # 计算找到的重复组数量
-        group_count = 0
-
-        # 第一个选择的目录（用于突出显示）
-        first_directory = (
-            self.ui.selected_directories[0] if self.ui.selected_directories else None
-        )
-
-        # 遍历所有重复项
-        for field_value, paths in sorted_duplicates:
-            # 仅处理确实有重复的项（路径数量大于1）
-            if len(paths) <= 1:
-                continue
-
-            group_count += 1
-
-            # 创建组标题项
-            group_item = QtWidgets.QTreeWidgetItem()
-            group_item.setText(0, f"{field_value} ({len(paths)}个文件)")
-            group_item.setFont(0, QtGui.QFont("", weight=QtGui.QFont.Bold))
-            group_item.setBackground(0, QtGui.QColor("#e2e8f0"))  # 设置背景色
-
-            # 储存组信息用于双击处理
-            group_item.setData(
-                0, QtCore.Qt.UserRole, {"is_group": True, "paths": paths}
-            )
-
-            # 添加到树控件
-            self.ui.result_list.addTopLevelItem(group_item)
-
-            # 对路径进行排序，优先显示第一个文件夹内的文件
-            sorted_paths = sorted(
-                paths,
-                key=lambda x: (
-                    0 if first_directory and x.startswith(first_directory) else 1,
-                    x,
-                ),
-            )
-
-            # 添加子项
-            for path in sorted_paths:
-                child_item = QtWidgets.QTreeWidgetItem()
-                child_item.setText(1, path)
-
-                # 如果是第一个文件夹的文件，设置背景色以突出显示
-                if first_directory and path.startswith(first_directory):
-                    child_item.setBackground(1, QtGui.QColor("#e6f3ff"))  # 浅蓝色背景
-
-                # 储存路径信息用于双击处理
-                child_item.setData(
-                    1, QtCore.Qt.UserRole, {"is_file": True, "path": path}
-                )
-
-                # 添加到组项下
-                group_item.addChild(child_item)
-
-            # 默认展开组
-            group_item.setExpanded(True)
-
-        # 如果没有找到重复项，显示信息
-        if group_count == 0:
-            QtWidgets.QMessageBox.information(self.ui, "结果", "未找到重复项。")
-        else:
-            # 自动调整列宽
-            self.ui.result_list.resizeColumnToContents(0)
-
-    def open_folder(self, item, column):
-        # 获取项的用户数据
-        data = item.data(column, QtCore.Qt.UserRole)
-        if not data:
-            return
-
-        if data.get("is_group"):
-            # 如果是组项，打开该组所有文件夹
-            self._open_group_folders(data.get("paths", []))
-        elif data.get("is_file"):
-            # 如果是文件项，打开单个文件夹
-            path = data.get("path")
-            if path:
-                self._open_single_folder(os.path.dirname(path))
-
-    def _open_single_folder(self, folder_path):
-        """打开单个文件夹"""
-        try:
-            if sys.platform == "win32":
-                os.startfile(folder_path)
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", folder_path])
-            else:
-                subprocess.Popen(["xdg-open", folder_path])
-        except Exception as e:
-            QtWidgets.QMessageBox.warning(self.ui, "错误", f"无法打开文件夹: {str(e)}")
-
-    def _open_group_folders(self, paths):
-        """打开一组文件夹"""
-        if not paths:
-            return
-
-        # 提取所有不同的文件夹路径
-        unique_folders = set()
-        for path in paths:
-            folder = os.path.dirname(path)
-            unique_folders.add(folder)
-
-        # 如果文件夹过多，询问用户是否继续
-        if len(unique_folders) > 5:
-            reply = QtWidgets.QMessageBox.question(
-                self.ui,
-                "确认",
-                f"将要打开 {len(unique_folders)} 个文件夹，是否继续？",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                QtWidgets.QMessageBox.No,
-            )
-            if reply == QtWidgets.QMessageBox.No:
-                return
-
-        # 打开所有文件夹
-        for folder in unique_folders:
-            self._open_single_folder(folder)
-
-    def clear_results_on_change(self):
-        self.ui.result_list.setRowCount(0)
-
-
-class NfoDuplicateLogic:
-    def get_nfo_files_generator(self, directories):
-        """使用生成器获取所有NFO文件路径"""
-        for directory in directories:
-            if os.path.exists(directory):
-                for root, _, files in os.walk(directory):
-                    for file in files:
-                        if file.lower().endswith(".nfo"):
-                            yield os.path.join(root, file)
-
-    def process_nfo_file(self, args):
-        """处理单个NFO文件，只读取不修改"""
-        nfo_file, field = args
-        try:
-            if not os.path.exists(nfo_file):
-                return None, nfo_file
-
-            # 使用read-only模式打开文件
-            with open(nfo_file, "r", encoding="utf-8") as f:
-                try:
-                    tree = ET.parse(f)
-                    root = tree.getroot()
-
-                    if field == "番号":
-                        # 首先尝试从<num>标签获取番号
-                        field_value = root.find("num")
-
-                        # 如果找到了<num>标签且有值，直接返回
-                        if field_value is not None and field_value.text:
-                            return field_value.text.strip(), nfo_file
-
-                        # 如果没有<num>标签，尝试从标题中提取番号
-                        import re
-
-                        # 从文件名提取番号（作为备选方案）
-                        filename_code = None
-                        filename = os.path.basename(nfo_file)
-                        filename_patterns = [
-                            r"([A-Za-z]{2,15})-?(\d{2,5})",  # 匹配如 MIDE-954
-                            r"([A-Za-z]{2,15})(\d{2,5})",  # 匹配如 MIDE954
-                            r"FC2-?PPV-?(\d{6,7})",  # 匹配如 FC2-PPV-1234567
-                        ]
-
-                        for pattern in filename_patterns:
-                            match = re.search(pattern, filename, re.IGNORECASE)
-                            if match:
-                                if "FC2" in pattern:
-                                    filename_code = match.group(0).upper()
-                                else:
-                                    filename_code = (
-                                        f"{match.group(1)}-{match.group(2)}".upper()
-                                    )
-                                break
-
-                        # 尝试从title和originaltitle中提取
-                        title_elements = [
-                            root.find("title"),
-                            root.find("originaltitle"),
-                            root.find("sorttitle"),
-                        ]
-
-                        for title_elem in title_elements:
-                            if title_elem is not None and title_elem.text:
-                                # 定义多个正则模式来匹配不同的番号格式
-                                title_patterns = [
-                                    r"([A-Za-z]{2,15})-?(\d{2,5})",  # 标准番号如 MIDE-954
-                                    r"FC2-?PPV-?(\d{6,7})",  # FC2格式
-                                ]
-
-                                for pattern in title_patterns:
-                                    match = re.search(
-                                        pattern, title_elem.text, re.IGNORECASE
-                                    )
-                                    if match:
-                                        if "FC2" in pattern:
-                                            extracted_num = match.group(0).upper()
-                                        else:
-                                            extracted_num = f"{match.group(1)}-{match.group(2)}".upper()
-                                        return extracted_num, nfo_file
-
-                        # 如果从标题中未提取到，但从文件名提取到了，就返回文件名中的番号
-                        if filename_code:
-                            return filename_code, nfo_file
-
-                    elif field == "系列":
-                        field_value = root.find("series")
-                    else:
-                        field_value = None
-
-                    if field_value is not None and field_value.text:
-                        return field_value.text.strip(), nfo_file
-                except ET.ParseError as e:
-                    print(f"XML解析错误 {nfo_file}: {e}")
-                except Exception as e:
-                    print(f"处理文件错误 {nfo_file}: {e}")
-
-            return None, nfo_file
-        except Exception as e:
-            print(f"读取文件错误 {nfo_file}: {e}")
-            return None, nfo_file
 
 
 if __name__ == "__main__":
@@ -786,7 +935,7 @@ if __name__ == "__main__":
     app.setStyle("Fusion")
     window = NfoDuplicateFinder(initial_directory=initial_directory)
 
-    # Center window on screen
+    # 窗口居中显示
     screen = app.primaryScreen().geometry()
     window_geometry = window.geometry()
     x = (screen.width() - window_geometry.width()) // 2
