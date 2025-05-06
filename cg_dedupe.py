@@ -690,7 +690,66 @@ class NfoDuplicateLogic:
                     root = tree.getroot()
 
                     if field == "番号":
+                        # 首先尝试从<num>标签获取番号
                         field_value = root.find("num")
+
+                        # 如果找到了<num>标签且有值，直接返回
+                        if field_value is not None and field_value.text:
+                            return field_value.text.strip(), nfo_file
+
+                        # 如果没有<num>标签，尝试从标题中提取番号
+                        import re
+
+                        # 从文件名提取番号（作为备选方案）
+                        filename_code = None
+                        filename = os.path.basename(nfo_file)
+                        filename_patterns = [
+                            r"([A-Za-z]{2,15})-?(\d{2,5})",  # 匹配如 MIDE-954
+                            r"([A-Za-z]{2,15})(\d{2,5})",  # 匹配如 MIDE954
+                            r"FC2-?PPV-?(\d{6,7})",  # 匹配如 FC2-PPV-1234567
+                        ]
+
+                        for pattern in filename_patterns:
+                            match = re.search(pattern, filename, re.IGNORECASE)
+                            if match:
+                                if "FC2" in pattern:
+                                    filename_code = match.group(0).upper()
+                                else:
+                                    filename_code = (
+                                        f"{match.group(1)}-{match.group(2)}".upper()
+                                    )
+                                break
+
+                        # 尝试从title和originaltitle中提取
+                        title_elements = [
+                            root.find("title"),
+                            root.find("originaltitle"),
+                            root.find("sorttitle"),
+                        ]
+
+                        for title_elem in title_elements:
+                            if title_elem is not None and title_elem.text:
+                                # 定义多个正则模式来匹配不同的番号格式
+                                title_patterns = [
+                                    r"([A-Za-z]{2,15})-?(\d{2,5})",  # 标准番号如 MIDE-954
+                                    r"FC2-?PPV-?(\d{6,7})",  # FC2格式
+                                ]
+
+                                for pattern in title_patterns:
+                                    match = re.search(
+                                        pattern, title_elem.text, re.IGNORECASE
+                                    )
+                                    if match:
+                                        if "FC2" in pattern:
+                                            extracted_num = match.group(0).upper()
+                                        else:
+                                            extracted_num = f"{match.group(1)}-{match.group(2)}".upper()
+                                        return extracted_num, nfo_file
+
+                        # 如果从标题中未提取到，但从文件名提取到了，就返回文件名中的番号
+                        if filename_code:
+                            return filename_code, nfo_file
+
                     elif field == "系列":
                         field_value = root.find("series")
                     else:
