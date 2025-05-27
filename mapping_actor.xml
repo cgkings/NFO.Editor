@@ -4,6 +4,7 @@ keyword：用于匹配演员名字，其中的每个名字前后都需要用逗�
 zh_cn/zh_tw/jp：指对应语言输出的演员名字，按设置的对应语言输出。
 href：演员主页，刮削时在主界面点击演员名可以打开主页。-->
 <actor>
+  <a zh_cn="川奈亜希" zh_tw="川奈亜希" jp="川奈亜希" keyword=",川菜亜希,前田はるか,倉貫杏子,三条あき," href="https://javdb.com/actors/YEW8"/>
   <a zh_cn="神乐桃果" zh_tw="神乐桃果" jp="神楽ももか" keyword=",神楽ももか," href="https://javdb.com/actors/mex4Z"/>
   <a zh_cn="佐野由真" zh_tw="佐野由真" jp="佐野ゆま" keyword=",山本えりか,山本エリカ,佐野ゆま,仲田靖子," href="https://javdb.com/actors/5ERmD"/>
   <a zh_cn="长滨蜜璃" zh_tw="长滨蜜璃" jp="長浜みつり" keyword=",長浜みつり," href="https://javdb.com/actors/zK9pQ"/>
@@ -6119,7 +6120,7 @@ href：演员主页，刮削时在主界面点击演员名可以打开主页。-
   <a zh_cn="祐希リサ" zh_tw="祐希リサ" jp="祐希リサ" keyword=",祐希リサ," href="https://javdb.com/actors/dWVg"/>
   <a zh_cn="神雪" zh_tw="神雪" jp="神ユキ" keyword=",神雪,神ユキ,山内美紗,宮本恵梨香," href="https://javdb.com/actors/gPQQ"/>
   <a zh_cn="神乃みこと" zh_tw="神乃みこと" jp="神乃みこと" keyword=",神乃みこと," href="https://javdb.com/actors/EObQ"/>
-  <a zh_cn="神乐凛" zh_tw="神樂凜" jp="神楽りん" keyword=",神乐凛,神樂凜,神楽りん,本田りりか,上坂玲,心美さん," href="https://javdb.com/actors/KXd7"/>
+  <a zh_cn="神乐凛" zh_tw="神樂凜" jp="神楽りん" keyword=",神乐凛,神樂凜,神楽りん,本田りりか,本田かなの,上坂玲,心美さん," href="https://javdb.com/actors/KXd7"/>
   <a zh_cn="神代にな" zh_tw="神代にな" jp="神代にな" keyword=",神代にな,浜崎みくる," href="https://javdb.com/actors/YWaD"/>
   <a zh_cn="神代みゆ" zh_tw="神代みゆ" jp="神代みゆ" keyword=",神代みゆ," href="https://javdb.com/actors/e7G1"/>
   <a zh_cn="神代里真" zh_tw="神代裡真" jp="神代りま" keyword=",神代里真,神代裡真,神代りま," href="https://javdb.com/actors/O2KZO"/>
