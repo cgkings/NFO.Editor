@@ -8,18 +8,18 @@ from datetime import datetime
 from PIL import Image
 from PyQt5.QtWidgets import (
     QApplication,
-    QButtonGroup,
-    QComboBox,
+    # QButtonGroup,
+    # QComboBox,
     QFrame,
     QLabel,
     QLineEdit,
-    QMainWindow,
+    # QMainWindow,
     QFileDialog,
     QMenu,
     QMessageBox,
     QProgressDialog,
     QPushButton,
-    QRadioButton,
+    # QRadioButton,
     QShortcut,
     QTextEdit,
     QTreeWidget,
@@ -30,6 +30,8 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QGridLayout,
     QHBoxLayout,
+    QGroupBox,
+    QCheckBox,
 )
 from PyQt5.QtCore import (
     Qt,
@@ -42,9 +44,314 @@ from PyQt5.QtCore import (
 from PyQt5.QtGui import QIcon, QPixmap, QKeySequence
 import subprocess
 import winshell
+import json
 
 from NFO_Editor_ui import NFOEditorQt
 
+class ConfigManager:
+    def __init__(self):
+        self.config_file = "settings.json"
+        self.default_config = {
+            "search_sites": {
+                "predefined_sites": {
+                    "supjav": True,
+                    "subtitlecat": True,
+                    "javdb": True,
+                    "javtrailers": True
+                },
+                "custom_sites": [
+                    {"name": "", "url_template": "", "enabled": False},
+                    {"name": "", "url_template": "", "enabled": False},
+                    {"name": "", "url_template": "", "enabled": False}
+                ]
+            }
+        }
+    
+    def load_config(self):
+        """加载配置文件"""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                # 合并默认配置，确保所有键都存在
+                return self._merge_config(self.default_config, config)
+            else:
+                return self.default_config.copy()
+        except Exception as e:
+            print(f"加载配置文件失败: {e}")
+            return self.default_config.copy()
+    
+    def save_config(self, config):
+        """保存配置文件"""
+        try:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            return True
+        except Exception as e:
+            print(f"保存配置文件失败: {e}")
+            return False
+    
+    def _merge_config(self, default, user_config):
+        """合并默认配置和用户配置"""
+        result = default.copy()
+        for key, value in user_config.items():
+            if key in result:
+                if isinstance(value, dict) and isinstance(result[key], dict):
+                    result[key] = self._merge_config(result[key], value)
+                else:
+                    result[key] = value
+        return result
+
+class SearchSiteManager:
+    def __init__(self):
+        self.predefined_sites = {
+            'supjav': {
+                'name': 'SupJAV',
+                'description': '立即打开搜索页面'
+            },
+            'subtitlecat': {
+                'name': 'SubtitleCat', 
+                'description': '立即打开搜索页面'
+            },
+            'javdb': {
+                'name': 'JAVDB',
+                'description': '智能跳转详情页'
+            },
+            'javtrailers': {
+                'name': 'JavTrailers',
+                'description': '智能跳转详情页'
+            }
+        }
+    
+    def handle_custom_site(self, url_template, number):
+        """自定义网站处理"""
+        try:
+            url = url_template.replace('{number}', number)
+            webbrowser.open(url)
+            return True
+        except Exception as e:
+            print(f"自定义网站搜索出错: {e}")
+            return False
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent = parent
+        self.config_manager = ConfigManager()
+        self.config = self.config_manager.load_config()
+        
+        self.setWindowTitle("NFO Editor - 设置")
+        self.setFixedSize(600, 500)
+        self.setWindowModality(Qt.ApplicationModal)
+        
+        self.setup_ui()
+        self.load_current_settings()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # 创建滚动区域
+        scroll = QScrollArea()
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+        
+        # 番号搜索网站设置组
+        search_group = self.create_search_sites_group()
+        scroll_layout.addWidget(search_group)
+        
+        # 预留其他设置组的空间
+        scroll_layout.addStretch()
+        
+        scroll.setWidget(scroll_widget)
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll)
+        
+        # 按钮区域
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addStretch()
+        
+        self.apply_btn = QPushButton("应用")
+        self.ok_btn = QPushButton("确定")
+        self.cancel_btn = QPushButton("取消")
+        
+        buttons_layout.addWidget(self.apply_btn)
+        buttons_layout.addWidget(self.ok_btn)
+        buttons_layout.addWidget(self.cancel_btn)
+        
+        layout.addLayout(buttons_layout)
+        
+        # 连接信号
+        self.apply_btn.clicked.connect(self.apply_settings)
+        self.ok_btn.clicked.connect(self.accept_settings)
+        self.cancel_btn.clicked.connect(self.reject)
+    
+    def create_search_sites_group(self):
+        group = QGroupBox("番号搜索网站设置")
+        layout = QVBoxLayout(group)
+        
+        # 预设网站部分
+        predefined_label = QLabel("预设网站 (智能跳转详情页):")
+        predefined_label.setStyleSheet("font-weight: bold; margin-top: 5px;")
+        layout.addWidget(predefined_label)
+        
+        self.predefined_checkboxes = {}
+        predefined_sites = {
+            'supjav': 'SupJAV (立即打开)',
+            'subtitlecat': 'SubtitleCat (立即打开)',
+            'javdb': 'JAVDB (智能跳转)',
+            'javtrailers': 'JavTrailers (智能跳转)'
+        }
+        
+        for site_id, site_name in predefined_sites.items():
+            checkbox = QCheckBox(site_name)
+            self.predefined_checkboxes[site_id] = checkbox
+            layout.addWidget(checkbox)
+        
+        # 分隔线
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(line)
+        
+        # 自定义网站部分
+        custom_label = QLabel("自定义网站 (打开搜索页面):")
+        custom_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        layout.addWidget(custom_label)
+        
+        help_label = QLabel("URL模板示例: https://example.com/search/{number}")
+        help_label.setStyleSheet("color: gray; font-style: italic;")
+        layout.addWidget(help_label)
+        
+        self.custom_site_widgets = []
+        
+        for i in range(3):
+            site_layout = QHBoxLayout()
+            
+            # 启用复选框
+            enabled_cb = QCheckBox(f"自定义网站{i+1}")
+            enabled_cb.setFixedWidth(120)
+            
+            # 网站名称输入框
+            name_edit = QLineEdit()
+            name_edit.setPlaceholderText("网站名称")
+            name_edit.setFixedWidth(100)
+            
+            # URL模板输入框
+            url_edit = QLineEdit()
+            url_edit.setPlaceholderText("https://example.com/search/{number}")
+            
+            site_layout.addWidget(enabled_cb)
+            site_layout.addWidget(name_edit)
+            site_layout.addWidget(url_edit)
+            
+            layout.addLayout(site_layout)
+            
+            self.custom_site_widgets.append({
+                'enabled': enabled_cb,
+                'name': name_edit,
+                'url': url_edit
+            })
+            
+            # 启用状态改变时更新输入框状态
+            enabled_cb.stateChanged.connect(
+                lambda state, widgets=(name_edit, url_edit): self.toggle_custom_site_inputs(state, widgets)
+            )
+        
+        return group
+    
+    def toggle_custom_site_inputs(self, state, widgets):
+        """切换自定义网站输入框的启用状态"""
+        enabled = state == Qt.Checked
+        for widget in widgets:
+            widget.setEnabled(enabled)
+    
+    def load_current_settings(self):
+        """加载当前设置到界面"""
+        # 加载预设网站设置
+        predefined_sites = self.config.get('search_sites', {}).get('predefined_sites', {})
+        for site_id, checkbox in self.predefined_checkboxes.items():
+            checkbox.setChecked(predefined_sites.get(site_id, False))
+        
+        # 加载自定义网站设置
+        custom_sites = self.config.get('search_sites', {}).get('custom_sites', [])
+        for i, site_config in enumerate(custom_sites[:3]):  # 最多3个
+            if i < len(self.custom_site_widgets):
+                widgets = self.custom_site_widgets[i]
+                enabled = site_config.get('enabled', False)
+                name = site_config.get('name', '')
+                url = site_config.get('url_template', '')
+                
+                widgets['enabled'].setChecked(enabled)
+                widgets['name'].setText(name)
+                widgets['url'].setText(url)
+                
+                # 设置输入框启用状态
+                widgets['name'].setEnabled(enabled)
+                widgets['url'].setEnabled(enabled)
+    
+    def get_current_settings(self):
+        """获取当前界面设置"""
+        config = self.config.copy()
+        
+        # 获取预设网站设置
+        predefined_sites = {}
+        for site_id, checkbox in self.predefined_checkboxes.items():
+            predefined_sites[site_id] = checkbox.isChecked()
+        
+        # 获取自定义网站设置
+        custom_sites = []
+        for widgets in self.custom_site_widgets:
+            custom_sites.append({
+                'enabled': widgets['enabled'].isChecked(),
+                'name': widgets['name'].text().strip(),
+                'url_template': widgets['url'].text().strip()
+            })
+        
+        config['search_sites'] = {
+            'predefined_sites': predefined_sites,
+            'custom_sites': custom_sites
+        }
+        
+        return config
+    
+    def apply_settings(self):
+        """应用设置"""
+        try:
+            new_config = self.get_current_settings()
+            
+            # 验证自定义网站设置
+            for i, site in enumerate(new_config['search_sites']['custom_sites']):
+                if site['enabled']:
+                    if not site['name'] or not site['url_template']:
+                        QMessageBox.warning(
+                            self, "设置错误", 
+                            f"自定义网站{i+1}已启用但缺少网站名称或URL模板"
+                        )
+                        return
+                    if '{number}' not in site['url_template']:
+                        QMessageBox.warning(
+                            self, "设置错误",
+                            f"自定义网站{i+1}的URL模板必须包含 {{number}} 占位符"
+                        )
+                        return
+            
+            # 保存配置
+            if self.config_manager.save_config(new_config):
+                self.config = new_config
+                # 通知父窗口配置已更改
+                if hasattr(self.parent, 'on_settings_changed'):
+                    self.parent.on_settings_changed()
+                QMessageBox.information(self, "成功", "设置已保存")
+            else:
+                QMessageBox.critical(self, "错误", "保存设置失败")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"应用设置时出错: {str(e)}")
+    
+    def accept_settings(self):
+        """确定按钮处理"""
+        self.apply_settings()
+        self.accept()
 
 class FileOperationThread(QThread):
     """文件操作线程类"""
@@ -147,6 +454,10 @@ class NFOEditorQt5(NFOEditorQt):
         self.move_thread = None
         self.file_watcher = QFileSystemWatcher()
 
+        # 添加配置和搜索管理器
+        self.config_manager = ConfigManager()
+        self.search_site_manager = SearchSiteManager()
+
         # 默认勾选显示图片选项
         self.show_images_checkbox.setChecked(True)
 
@@ -202,6 +513,8 @@ class NFOEditorQt5(NFOEditorQt):
                 btn.clicked.connect(self.show_photo_wall)
             elif text == "🔜":
                 btn.clicked.connect(self.start_move_thread)
+            elif text == "⚙️":  # 新增设置按钮连接
+                btn.clicked.connect(self.open_settings)
             elif text == "批量填充 (Batch Filling)":
                 btn.clicked.connect(self.batch_filling)
             elif text == "批量新增 (Batch Add)":
@@ -362,6 +675,24 @@ class NFOEditorQt5(NFOEditorQt):
 
         # 调用原始的事件处理
         QTextEdit.keyReleaseEvent(widget, event)
+
+    def open_settings(self):
+        """打开设置对话框"""
+        try:
+            dialog = SettingsDialog(self)
+            dialog.exec_()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"打开设置失败: {str(e)}")
+
+    def on_settings_changed(self):
+        """设置改变回调"""
+        # 重新加载配置，这里可以添加其他需要在设置改变后执行的逻辑
+        try:
+            # 可以在这里添加配置改变后的处理逻辑
+            # 比如更新UI状态等
+            pass
+        except Exception as e:
+            print(f"处理设置改变时出错: {str(e)}")
 
     def set_nfo_folder(self, folder_path):
         """设置NFO文件夹的公共方法"""
@@ -566,17 +897,192 @@ class NFOEditorQt5(NFOEditorQt):
             QMessageBox.critical(self, "错误", f"加载NFO文件失败: {str(e)}")
 
     def open_number_search(self, event):
-        """打开番号搜索网页"""
+        """打开番号搜索网页 - 集成现有优化逻辑"""
         if event.button() == Qt.LeftButton:  # 只响应左键点击
             num_text = self.fields_entries["num"].text().strip()
-            if num_text:
+            if not num_text:
+                return
+                
+            try:
+                # 加载配置
+                config = self.config_manager.load_config()
+                predefined_sites = config.get('search_sites', {}).get('predefined_sites', {})
+                custom_sites = config.get('search_sites', {}).get('custom_sites', [])
+                
+                # 导入需要的模块
+                import concurrent.futures
+                import requests
+                from bs4 import BeautifulSoup
+                import threading
+                
+                # 设置通用请求头，模拟真实浏览器
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'DNT': '1',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                }
+                
+                opened_count = 0
+                
+                # 立即打开不需要解析的网站
+                immediate_sites = []
+                if predefined_sites.get('supjav', False):
+                    webbrowser.open(f"https://supjav.com/zh/?s={num_text}")
+                    immediate_sites.append('SupJAV')
+                    opened_count += 1
+                    
+                if predefined_sites.get('subtitlecat', False):
+                    webbrowser.open(f"https://www.subtitlecat.com/index.php?search={num_text}")
+                    immediate_sites.append('SubtitleCat')
+                    opened_count += 1
+                
+                if immediate_sites:
+                    print(f"已立即打开: {', '.join(immediate_sites)} 搜索页面")
+                
+                # 处理自定义网站（立即打开）
+                for custom_site in custom_sites:
+                    if (custom_site.get('enabled', False) and 
+                        custom_site.get('name') and 
+                        custom_site.get('url_template')):
+                        try:
+                            if self.search_site_manager.handle_custom_site(
+                                custom_site['url_template'], num_text):
+                                opened_count += 1
+                                print(f"已打开自定义网站: {custom_site['name']}")
+                        except Exception as e:
+                            print(f"打开自定义网站 {custom_site['name']} 时出错: {e}")
+                
+                # 定义需要后台解析的网站处理函数
+                def search_javdb():
+                    """搜索JavDB"""
+                    if not predefined_sites.get('javdb', False):
+                        return False
+                        
+                    try:
+                        search_url = f"https://javdb.com/search?q={num_text}&f=all"
+                        response = requests.get(search_url, headers=headers, timeout=10)
+                        
+                        if response.status_code == 200:
+                            soup = BeautifulSoup(response.text, 'lxml')
+                            
+                            # 检查是否显示"暂无内容"
+                            empty_message = soup.find('div', class_='empty-message')
+                            if empty_message:
+                                print(f"JavDB: 没有找到 {num_text} 的搜索结果")
+                                return False
+                            
+                            # 查找搜索结果列表
+                            movie_list = soup.find('div', class_='movie-list')
+                            if movie_list:
+                                items = movie_list.find_all('div', class_='item')
+                                
+                                for item in items:
+                                    # 查找番号标签
+                                    strong_tag = item.find('strong')
+                                    if strong_tag and strong_tag.text.strip().upper() == num_text.upper():
+                                        # 找到匹配的番号，获取详情页链接
+                                        link_tag = item.find('a', class_='box')
+                                        if link_tag and link_tag.get('href'):
+                                            detail_url = f"https://javdb.com{link_tag['href']}"
+                                            webbrowser.open(detail_url)
+                                            print(f"JavDB: 打开详情页 {detail_url}")
+                                            return True
+                                
+                                print(f"JavDB: 没有找到完全匹配 {num_text} 的番号")
+                            else:
+                                print(f"JavDB: 搜索页面格式可能已变更")
+                        else:
+                            print(f"JavDB: 访问失败，状态码: {response.status_code}")
+                    except Exception as e:
+                        print(f"JavDB: 搜索失败: {str(e)}")
+                    return False
+                
+                def search_javtrailers():
+                    """搜索JavTrailers"""
+                    if not predefined_sites.get('javtrailers', False):
+                        return False
+                        
+                    try:
+                        search_url = f"https://javtrailers.com/search/{num_text}"
+                        response = requests.get(search_url, headers=headers, timeout=10)
+                        
+                        if response.status_code == 200:
+                            soup = BeautifulSoup(response.text, 'lxml')
+                            
+                            # 查找搜索结果列表
+                            videos_section = soup.find('section', class_='videos-list')
+                            if videos_section:
+                                # 查找所有视频卡片
+                                video_links = videos_section.find_all('a', class_='video-link')
+                                
+                                for link in video_links:
+                                    # 查找视频标题
+                                    title_element = link.find('p', class_='vid-title')
+                                    if title_element:
+                                        title_text = title_element.text.strip()
+                                        # 检查标题是否以搜索的番号开头
+                                        if title_text.upper().startswith(num_text.upper() + ' '):
+                                            # 找到匹配的番号，获取详情页链接
+                                            href = link.get('href')
+                                            if href:
+                                                detail_url = f"https://javtrailers.com{href}"
+                                                webbrowser.open(detail_url)
+                                                print(f"JavTrailers: 打开详情页 {detail_url}")
+                                                return True
+                                
+                                print(f"JavTrailers: 没有找到完全匹配 {num_text} 的番号")
+                            else:
+                                print(f"JavTrailers: 搜索页面格式可能已变更")
+                        else:
+                            print(f"JavTrailers: 访问失败，状态码: {response.status_code}")
+                    except Exception as e:
+                        print(f"JavTrailers: 搜索失败: {str(e)}")
+                    return False
+                
+                # 在后台并发处理需要解析的网站
+                def background_search():
+                    parse_sites = []
+                    if predefined_sites.get('javdb', False):
+                        parse_sites.append(search_javdb)
+                    if predefined_sites.get('javtrailers', False):
+                        parse_sites.append(search_javtrailers)
+                    
+                    if parse_sites:
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                            # 提交搜索任务
+                            futures = [executor.submit(func) for func in parse_sites]
+                            
+                            # 等待所有任务完成
+                            for future in concurrent.futures.as_completed(futures, timeout=30):
+                                try:
+                                    if future.result():
+                                        nonlocal opened_count
+                                        opened_count += 1
+                                except Exception as e:
+                                    print(f"搜索任务执行失败: {str(e)}")
+                
+                # 启动后台搜索线程（如果有需要解析的网站）
+                if predefined_sites.get('javdb', False) or predefined_sites.get('javtrailers', False):
+                    threading.Thread(target=background_search, daemon=True).start()
+                
+                # 状态反馈
+                if opened_count == 0:
+                    self.status_bar.showMessage("未配置搜索网站", 3000)
+                else:
+                    self.status_bar.showMessage(f"已处理 {opened_count} 个搜索网站", 3000)
+                    
+            except Exception as e:
+                QMessageBox.warning(self, "警告", f"打开搜索网站失败: {str(e)}")
+                # 降级到原始方式
                 try:
-                    # 打开JavDB搜索
                     webbrowser.open(f"https://javdb.com/search?q={num_text}&f=all")
-                    # 打开JavTrailers搜索
                     webbrowser.open(f"https://javtrailers.com/search/{num_text}")
-                except Exception as e:
-                    QMessageBox.warning(self, "警告", f"打开网页失败: {str(e)}")
+                except Exception as fallback_error:
+                    QMessageBox.critical(self, "错误", f"所有搜索方式都失败了: {str(fallback_error)}")
 
     def load_target_files(self, target_path):
         """加载目标文件夹内容"""

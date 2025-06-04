@@ -10,20 +10,23 @@ from PyQt5.QtWidgets import (
     QLabel,
     QFrame,
     QTreeWidget,
-    QTreeWidgetItem,
+    # QTreeWidgetItem,
     QRadioButton,
     QButtonGroup,
     QComboBox,
     QLineEdit,
-    QScrollArea,
+    # QScrollArea,
     QTextEdit,
     QCheckBox,
     QGridLayout,
     QSizePolicy,
-    QLayout,
+    # QLayout,
+    # QDialog,
+    # QGroupBox,
+    # QMessageBox,
 )
 from PyQt5.QtCore import Qt, QSize, QSettings
-from PyQt5.QtGui import QIcon, QPixmap, QCursor, QFont
+from PyQt5.QtGui import QIcon, QCursor, QPixmap, QFont
 
 
 def get_resource_path(relative_path):
@@ -32,7 +35,6 @@ def get_resource_path(relative_path):
     else:
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
-
 
 class NFOEditorQt(QMainWindow):
     def __init__(self):
@@ -46,7 +48,7 @@ class NFOEditorQt(QMainWindow):
         self.screen_dpi = self.screen().logicalDotsPerInch()
         self.scale_factor = self.screen_dpi / 96.0
 
-        self.setWindowTitle("大锤 NFO Editor Qt v9.6.0")
+        self.setWindowTitle("大锤 NFO Editor Qt v9.6.1")
         self.resize(1280, 800)
 
         # 初始化状态栏
@@ -255,12 +257,16 @@ class NFOEditorQt(QMainWindow):
                 "移动nfo所在文件夹到目标目录,快捷键方向键→",
                 int(40 * self.scale_factor),
             ),
+            ("⚙️", None, "打开设置", int(40 * self.scale_factor)),  # 新增设置按钮
         ]
 
         for col, (text, func, tooltip, width) in enumerate(buttons_info):
             btn = QPushButton(text)
             btn.setFixedSize(width, button_height)
             btn.setToolTip(tooltip)
+            # 为设置按钮设置对象名称，便于后续识别
+            if text == "⚙️":
+                btn.setObjectName("settings_button")
             grid.addWidget(btn, 0, col)
 
         # 将checkbox移到最右侧
