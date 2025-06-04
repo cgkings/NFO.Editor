@@ -46,7 +46,7 @@ class NFOEditorQt(QMainWindow):
         self.screen_dpi = self.screen().logicalDotsPerInch()
         self.scale_factor = self.screen_dpi / 96.0
 
-        self.setWindowTitle("大锤 NFO Editor Qt v9.5.9")
+        self.setWindowTitle("大锤 NFO Editor Qt v9.6.0")
         self.resize(1280, 800)
 
         # 初始化状态栏
@@ -527,6 +527,12 @@ class NFOEditorQt(QMainWindow):
                 entry.setStyleSheet("color: blue; text-decoration: underline;")
                 entry.setFixedWidth(int(text_width * 0.6))
                 num_layout.addWidget(entry)
+                
+                # 添加复制按钮
+                self.copy_num_button = QPushButton("📋")
+                self.copy_num_button.setFixedSize(int(30 * self.scale_factor), int(30 * self.scale_factor))
+                self.copy_num_button.setToolTip("复制番号")
+                num_layout.addWidget(self.copy_num_button)
 
                 year_frame = QFrame()
                 year_layout = QHBoxLayout(year_frame)

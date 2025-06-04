@@ -37,6 +37,7 @@ from PyQt5.QtCore import (
     pyqtSignal,
     QSettings,
     QFileSystemWatcher,
+    QTimer,
 )
 from PyQt5.QtGui import QIcon, QPixmap, QKeySequence
 import subprocess
@@ -148,6 +149,9 @@ class NFOEditorQt5(NFOEditorQt):
 
         # 默认勾选显示图片选项
         self.show_images_checkbox.setChecked(True)
+
+        # 启用拖拽功能
+        self.setAcceptDrops(True)
 
         # 连接信号槽
         self.setup_signals()
@@ -261,6 +265,10 @@ class NFOEditorQt5(NFOEditorQt):
             num_label = self.fields_entries["num"]
             num_label.mousePressEvent = lambda event: self.open_number_search(event)
 
+        # 连接复制番号按钮
+        if hasattr(self, 'copy_num_button'):
+            self.copy_num_button.clicked.connect(self.copy_number_to_clipboard)
+
     def eventFilter(self, obj, event):
         """事件过滤器"""
         if (
@@ -355,6 +363,20 @@ class NFOEditorQt5(NFOEditorQt):
         # 调用原始的事件处理
         QTextEdit.keyReleaseEvent(widget, event)
 
+    def set_nfo_folder(self, folder_path):
+        """设置NFO文件夹的公共方法"""
+        self.folder_path = folder_path
+        # 保存当前选择的目录
+        settings = QSettings("NFOEditor", "Directories")
+        settings.setValue("last_nfo_dir", folder_path)
+        # 直接加载文件
+        self.load_files_in_folder()
+
+        # 添加文件夹监控
+        if self.folder_path in self.file_watcher.directories():
+            self.file_watcher.removePath(self.folder_path)
+        self.file_watcher.addPath(self.folder_path)
+
     def open_folder(self):
         """选择并打开NFO文件夹"""
         # 获取上次打开的目录
@@ -366,16 +388,7 @@ class NFOEditorQt5(NFOEditorQt):
         )
 
         if folder_selected:
-            self.folder_path = folder_selected
-            # 保存当前选择的目录
-            settings.setValue("last_nfo_dir", folder_selected)
-            # 直接加载文件而不更新label
-            self.load_files_in_folder()
-
-            # 添加文件夹监控
-            if self.folder_path in self.file_watcher.directories():
-                self.file_watcher.removePath(self.folder_path)
-            self.file_watcher.addPath(self.folder_path)
+            self.set_nfo_folder(folder_selected)
 
     def select_target_folder(self):
         """选择目标文件夹处理函数"""
@@ -1657,9 +1670,7 @@ class NFOEditorQt5(NFOEditorQt):
         if urls:
             path = urls[0].toLocalFile()
             if os.path.isdir(path):
-                self.folder_path = path
-                self.folder_path_label.setText(path)
-                self.load_files_in_folder()
+                self.set_nfo_folder(path)
 
     def show_photo_wall(self):
         """显示照片墙对话框"""
@@ -1722,6 +1733,37 @@ class NFOEditorQt5(NFOEditorQt):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"选择文件夹失败: {str(e)}")
 
+    def copy_number_to_clipboard(self):
+        """复制番号到剪贴板"""
+        try:
+            if "num" in self.fields_entries:
+                num_text = self.fields_entries["num"].text().strip()
+                if num_text:
+                    # 获取系统剪贴板
+                    clipboard = QApplication.clipboard()
+                    clipboard.setText(num_text)
+                    
+                    # 改变按钮图标为对勾
+                    self.copy_num_button.setText("✅")
+                    self.copy_num_button.setToolTip("已复制")
+                    
+                    # 在状态栏显示提示信息（保留，因为状态栏信息不会打断操作）
+                    self.status_bar.showMessage(f"番号已复制: {num_text}", 2000)
+                    
+                    # 2秒后恢复原图标
+                    from PyQt5.QtCore import QTimer
+                    QTimer.singleShot(2000, self.restore_copy_button)
+                    
+                else:
+                    self.status_bar.showMessage("番号为空，无法复制", 2000)
+        except Exception as e:
+            QMessageBox.warning(self, "警告", f"复制番号失败: {str(e)}")
+
+    def restore_copy_button(self):
+        """恢复复制按钮的原始状态"""
+        if hasattr(self, 'copy_num_button'):
+            self.copy_num_button.setText("📋")
+            self.copy_num_button.setToolTip("复制番号")
 
 def main():
     # 在创建 QApplication 之前设置高DPI属性
