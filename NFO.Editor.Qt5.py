@@ -57,7 +57,6 @@ class ConfigManager:
                     "supjav": True,
                     "subtitlecat": True,
                     "javdb": True,
-                    "javtrailers": True
                 },
                 "custom_sites": [
                     {"name": "", "url_template": "", "enabled": False},
@@ -115,10 +114,6 @@ class SearchSiteManager:
             },
             'javdb': {
                 'name': 'JAVDB',
-                'description': '智能跳转详情页'
-            },
-            'javtrailers': {
-                'name': 'JavTrailers',
                 'description': '智能跳转详情页'
             }
         }
@@ -198,8 +193,7 @@ class SettingsDialog(QDialog):
         predefined_sites = {
             'supjav': 'SupJAV (立即打开)',
             'subtitlecat': 'SubtitleCat (立即打开)',
-            'javdb': 'JAVDB (智能跳转)',
-            'javtrailers': 'JavTrailers (智能跳转)'
+            'javdb': 'JAVDB (智能跳转)'
         }
         
         for site_id, site_name in predefined_sites.items():
@@ -581,6 +575,10 @@ class NFOEditorQt5(NFOEditorQt):
         # 连接复制番号按钮
         if hasattr(self, 'copy_num_button'):
             self.copy_num_button.clicked.connect(self.copy_number_to_clipboard)
+
+        # 连接播放预告片按钮 - 新增代码
+        if hasattr(self, 'play_trailer_button'):
+            self.play_trailer_button.clicked.connect(self.play_trailer)
 
     def eventFilter(self, obj, event):
         """事件过滤器"""
@@ -1000,56 +998,12 @@ class NFOEditorQt5(NFOEditorQt):
                     except Exception as e:
                         print(f"JavDB: 搜索失败: {str(e)}")
                     return False
-                
-                def search_javtrailers():
-                    """搜索JavTrailers"""
-                    if not predefined_sites.get('javtrailers', False):
-                        return False
-                        
-                    try:
-                        search_url = f"https://javtrailers.com/search/{num_text}"
-                        response = requests.get(search_url, headers=headers, timeout=10)
-                        
-                        if response.status_code == 200:
-                            soup = BeautifulSoup(response.text, 'lxml')
-                            
-                            # 查找搜索结果列表
-                            videos_section = soup.find('section', class_='videos-list')
-                            if videos_section:
-                                # 查找所有视频卡片
-                                video_links = videos_section.find_all('a', class_='video-link')
                                 
-                                for link in video_links:
-                                    # 查找视频标题
-                                    title_element = link.find('p', class_='vid-title')
-                                    if title_element:
-                                        title_text = title_element.text.strip()
-                                        # 检查标题是否以搜索的番号开头
-                                        if title_text.upper().startswith(num_text.upper() + ' '):
-                                            # 找到匹配的番号，获取详情页链接
-                                            href = link.get('href')
-                                            if href:
-                                                detail_url = f"https://javtrailers.com{href}"
-                                                webbrowser.open(detail_url)
-                                                print(f"JavTrailers: 打开详情页 {detail_url}")
-                                                return True
-                                
-                                print(f"JavTrailers: 没有找到完全匹配 {num_text} 的番号")
-                            else:
-                                print(f"JavTrailers: 搜索页面格式可能已变更")
-                        else:
-                            print(f"JavTrailers: 访问失败，状态码: {response.status_code}")
-                    except Exception as e:
-                        print(f"JavTrailers: 搜索失败: {str(e)}")
-                    return False
-                
                 # 在后台并发处理需要解析的网站
                 def background_search():
                     parse_sites = []
                     if predefined_sites.get('javdb', False):
                         parse_sites.append(search_javdb)
-                    if predefined_sites.get('javtrailers', False):
-                        parse_sites.append(search_javtrailers)
                     
                     if parse_sites:
                         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -1066,7 +1020,7 @@ class NFOEditorQt5(NFOEditorQt):
                                     print(f"搜索任务执行失败: {str(e)}")
                 
                 # 启动后台搜索线程（如果有需要解析的网站）
-                if predefined_sites.get('javdb', False) or predefined_sites.get('javtrailers', False):
+                if predefined_sites.get('javdb', False):
                     threading.Thread(target=background_search, daemon=True).start()
                 
                 # 状态反馈
@@ -1080,7 +1034,6 @@ class NFOEditorQt5(NFOEditorQt):
                 # 降级到原始方式
                 try:
                     webbrowser.open(f"https://javdb.com/search?q={num_text}&f=all")
-                    webbrowser.open(f"https://javtrailers.com/search/{num_text}")
                 except Exception as fallback_error:
                     QMessageBox.critical(self, "错误", f"所有搜索方式都失败了: {str(fallback_error)}")
 
@@ -2270,6 +2223,135 @@ class NFOEditorQt5(NFOEditorQt):
         if hasattr(self, 'copy_num_button'):
             self.copy_num_button.setText("📋")
             self.copy_num_button.setToolTip("复制番号")
+
+    def play_trailer(self):
+        """播放预告片"""
+        if not self.current_file_path:
+            QMessageBox.warning(self, "警告", "请先选择NFO文件")
+            return
+
+        try:
+            # 获取NFO所在目录
+            folder = os.path.dirname(self.current_file_path)
+            
+            # 获取番号
+            num_text = self.fields_entries["num"].text().strip()
+            if not num_text:
+                QMessageBox.warning(self, "警告", "番号为空")
+                return
+
+            # 查找包含trailer的视频文件
+            trailer_extensions = [".mp4", ".mkv", ".avi", ".mov", ".rm", ".mpeg", ".ts", ".strm"]
+            trailer_files = []
+            
+            for file in os.listdir(folder):
+                file_lower = file.lower()
+                if "trailer" in file_lower:
+                    for ext in trailer_extensions:
+                        if file_lower.endswith(ext):
+                            trailer_files.append(os.path.join(folder, file))
+                            break
+
+            if trailer_files:
+                # 播放找到的第一个trailer文件
+                trailer_path = trailer_files[0]
+                
+                if trailer_path.lower().endswith(".strm"):
+                    # 处理strm文件
+                    try:
+                        with open(trailer_path, "r", encoding="utf-8") as f:
+                            strm_url = f.readline().strip()
+                        if strm_url:
+                            subprocess.Popen(["mpvnet", strm_url])
+                            # self.status_bar.showMessage(f"正在播放预告片: {os.path.basename(trailer_path)}", 3000)
+                        else:
+                            QMessageBox.critical(self, "错误", "STRM文件内容为空或无效")
+                    except Exception as e:
+                        QMessageBox.critical(self, "错误", f"读取STRM文件失败: {str(e)}")
+                else:
+                    # 播放普通视频文件
+                    subprocess.Popen(["mpvnet", trailer_path])
+                    self.status_bar.showMessage(f"正在播放预告片: {os.path.basename(trailer_path)}", 3000)
+            else:
+                # 没找到trailer文件，打开javtrailers网站
+                self.open_javtrailers_detail(num_text)
+
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"播放预告片失败: {str(e)}")
+
+    def open_javtrailers_detail(self, num_text):
+        """打开JavTrailers详情页"""
+        try:
+            import requests
+            from bs4 import BeautifulSoup
+            import threading
+            
+            def search_and_open():
+                try:
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                        'Accept-Encoding': 'gzip, deflate, br',
+                        'DNT': '1',
+                        'Connection': 'keep-alive',
+                        'Upgrade-Insecure-Requests': '1',
+                    }
+                    
+                    search_url = f"https://javtrailers.com/search/{num_text}"
+                    response = requests.get(search_url, headers=headers, timeout=10)
+                    
+                    if response.status_code == 200:
+                        soup = BeautifulSoup(response.text, 'lxml')
+                        
+                        # 查找搜索结果列表
+                        videos_section = soup.find('section', class_='videos-list')
+                        if videos_section:
+                            # 查找所有视频卡片
+                            video_links = videos_section.find_all('a', class_='video-link')
+                            
+                            for link in video_links:
+                                # 查找视频标题
+                                title_element = link.find('p', class_='vid-title')
+                                if title_element:
+                                    title_text = title_element.text.strip()
+                                    # 检查标题是否以搜索的番号开头
+                                    if title_text.upper().startswith(num_text.upper() + ' '):
+                                        # 找到匹配的番号，获取详情页链接
+                                        href = link.get('href')
+                                        if href:
+                                            detail_url = f"https://javtrailers.com{href}"
+                                            webbrowser.open(detail_url)
+                                            print(f"JavTrailers: 打开详情页 {detail_url}")
+                                            return True
+                            
+                            # 没找到匹配的，打开搜索页面
+                            webbrowser.open(search_url)
+                            print(f"JavTrailers: 未找到匹配番号，打开搜索页面")
+                        else:
+                            # 搜索页面格式可能已变更，直接打开搜索页面
+                            webbrowser.open(search_url)
+                            print(f"JavTrailers: 搜索页面格式可能已变更，打开搜索页面")
+                    else:
+                        # 访问失败，直接打开搜索页面
+                        webbrowser.open(search_url)
+                        print(f"JavTrailers: 访问失败，打开搜索页面")
+                except Exception as e:
+                    # 出错时打开搜索页面
+                    search_url = f"https://javtrailers.com/search/{num_text}"
+                    webbrowser.open(search_url)
+                    print(f"JavTrailers: 搜索失败，打开搜索页面: {str(e)}")
+            
+            # 在后台线程中执行搜索
+            threading.Thread(target=search_and_open, daemon=True).start()
+            self.status_bar.showMessage("正在打开JavTrailers预告片页面...", 3000)
+            
+        except Exception as e:
+            # 如果导入失败或其他错误，直接打开搜索页面
+            search_url = f"https://javtrailers.com/search/{num_text}"
+            webbrowser.open(search_url)
+            self.status_bar.showMessage("已打开JavTrailers搜索页面", 3000)
+
 
 def main():
     # 在创建 QApplication 之前设置高DPI属性

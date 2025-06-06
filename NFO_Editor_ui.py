@@ -48,7 +48,7 @@ class NFOEditorQt(QMainWindow):
         self.screen_dpi = self.screen().logicalDotsPerInch()
         self.scale_factor = self.screen_dpi / 96.0
 
-        self.setWindowTitle("大锤 NFO Editor Qt v9.6.1")
+        self.setWindowTitle("大锤 NFO Editor Qt v9.6.2")
         self.resize(1280, 800)
 
         # 初始化状态栏
@@ -539,7 +539,12 @@ class NFOEditorQt(QMainWindow):
                 self.copy_num_button.setFixedSize(int(30 * self.scale_factor), int(30 * self.scale_factor))
                 self.copy_num_button.setToolTip("复制番号")
                 num_layout.addWidget(self.copy_num_button)
-
+                # 添加播放预告片按钮 - 新增代码
+                self.play_trailer_button = QPushButton("🎬")
+                self.play_trailer_button.setFixedSize(int(30 * self.scale_factor), int(30 * self.scale_factor))
+                self.play_trailer_button.setToolTip("播放预告片")
+                num_layout.addWidget(self.play_trailer_button)
+                
                 year_frame = QFrame()
                 year_layout = QHBoxLayout(year_frame)
                 year_layout.setContentsMargins(0, 0, 0, 0)
