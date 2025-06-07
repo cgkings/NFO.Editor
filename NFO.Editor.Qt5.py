@@ -1,6 +1,7 @@
 import os
 import shutil
 import sys
+import threading
 import webbrowser
 import xml.etree.ElementTree as ET
 import xml.dom.minidom as minidom
@@ -45,6 +46,8 @@ from PyQt5.QtGui import QIcon, QPixmap, QKeySequence
 import subprocess
 import winshell
 import json
+import requests
+from bs4 import BeautifulSoup
 
 from NFO_Editor_ui import NFOEditorQt
 
@@ -100,33 +103,6 @@ class ConfigManager:
                 else:
                     result[key] = value
         return result
-
-class SearchSiteManager:
-    def __init__(self):
-        self.predefined_sites = {
-            'supjav': {
-                'name': 'SupJAV',
-                'description': '立即打开搜索页面'
-            },
-            'subtitlecat': {
-                'name': 'SubtitleCat', 
-                'description': '立即打开搜索页面'
-            },
-            'javdb': {
-                'name': 'JAVDB',
-                'description': '智能跳转详情页'
-            }
-        }
-    
-    def handle_custom_site(self, url_template, number):
-        """自定义网站处理"""
-        try:
-            url = url_template.replace('{number}', number)
-            webbrowser.open(url)
-            return True
-        except Exception as e:
-            print(f"自定义网站搜索出错: {e}")
-            return False
 
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
@@ -431,6 +407,89 @@ class FileOperationThread(QThread):
         except Exception as e:
             self.error.emit(f"操作过程中发生错误: {str(e)}")
 
+class SearchEngine:
+    def __init__(self):
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        }
+    
+    def search_javdb(self, num_text):
+        """搜索JavDB并返回详情页URL，找不到返回None"""
+        try:
+            search_url = f"https://javdb.com/search?q={num_text}&f=all"
+            response = requests.get(search_url, headers=self.headers, timeout=10)
+            
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'lxml')
+                
+                empty_message = soup.find('div', class_='empty-message')
+                if empty_message:
+                    print(f"JavDB: 没有找到 {num_text} 的搜索结果")
+                    return None
+                
+                movie_list = soup.find('div', class_='movie-list')
+                if movie_list:
+                    items = movie_list.find_all('div', class_='item')
+                    
+                    for item in items:
+                        strong_tag = item.find('strong')
+                        if strong_tag and strong_tag.text.strip().upper() == num_text.upper():
+                            link_tag = item.find('a', class_='box')
+                            if link_tag and link_tag.get('href'):
+                                detail_url = f"https://javdb.com{link_tag['href']}"
+                                print(f"JavDB: 找到详情页 {detail_url}")
+                                return detail_url
+                    
+                    print(f"JavDB: 没有找到完全匹配 {num_text} 的番号")
+                else:
+                    print(f"JavDB: 搜索页面格式可能已变更")
+            else:
+                print(f"JavDB: 访问失败，状态码: {response.status_code}")
+            return None
+        except Exception as e:
+            print(f"JavDB搜索失败: {str(e)}")
+            return None
+    
+    def search_javtrailers(self, num_text):
+        """搜索JavTrailers并返回详情页URL，找不到返回None"""
+        try:
+            search_url = f"https://javtrailers.com/search/{num_text}"
+            response = requests.get(search_url, headers=self.headers, timeout=10)
+            
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'lxml')
+                
+                videos_section = soup.find('section', class_='videos-list')
+                if videos_section:
+                    video_links = videos_section.find_all('a', class_='video-link')
+                    
+                    for link in video_links:
+                        title_element = link.find('p', class_='vid-title')
+                        if title_element:
+                            title_text = title_element.text.strip()
+                            if title_text.upper().startswith(num_text.upper() + ' '):
+                                href = link.get('href')
+                                if href:
+                                    detail_url = f"https://javtrailers.com{href}"
+                                    print(f"JavTrailers: 找到详情页 {detail_url}")
+                                    return detail_url
+                    
+                    print(f"JavTrailers: 没有找到完全匹配 {num_text} 的番号")
+                else:
+                    print(f"JavTrailers: 搜索页面格式可能已变更")
+            else:
+                print(f"JavTrailers: 访问失败，状态码: {response.status_code}")
+            return None
+        except Exception as e:
+            print(f"JavTrailers搜索失败: {str(e)}")
+            return None
+
 
 class NFOEditorQt5(NFOEditorQt):
     def __init__(self):
@@ -450,7 +509,6 @@ class NFOEditorQt5(NFOEditorQt):
 
         # 添加配置和搜索管理器
         self.config_manager = ConfigManager()
-        self.search_site_manager = SearchSiteManager()
 
         # 默认勾选显示图片选项
         self.show_images_checkbox.setChecked(True)
@@ -895,38 +953,24 @@ class NFOEditorQt5(NFOEditorQt):
             QMessageBox.critical(self, "错误", f"加载NFO文件失败: {str(e)}")
 
     def open_number_search(self, event):
-        """打开番号搜索网页 - 集成现有优化逻辑"""
-        if event.button() == Qt.LeftButton:  # 只响应左键点击
+        """打开番号搜索网页并复制番号到剪贴板"""
+        if event.button() == Qt.LeftButton:
             num_text = self.fields_entries["num"].text().strip()
             if not num_text:
                 return
                 
             try:
-                # 加载配置
+                # 复制番号到剪贴板
+                clipboard = QApplication.clipboard()
+                clipboard.setText(num_text)
+                
                 config = self.config_manager.load_config()
                 predefined_sites = config.get('search_sites', {}).get('predefined_sites', {})
                 custom_sites = config.get('search_sites', {}).get('custom_sites', [])
                 
-                # 导入需要的模块
-                import concurrent.futures
-                import requests
-                from bs4 import BeautifulSoup
-                import threading
-                
-                # 设置通用请求头，模拟真实浏览器
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'DNT': '1',
-                    'Connection': 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1',
-                }
-                
                 opened_count = 0
                 
-                # 立即打开不需要解析的网站
+                # 立即打开的网站
                 immediate_sites = []
                 if predefined_sites.get('supjav', False):
                     webbrowser.open(f"https://supjav.com/zh/?s={num_text}")
@@ -941,7 +985,7 @@ class NFOEditorQt5(NFOEditorQt):
                 if immediate_sites:
                     print(f"已立即打开: {', '.join(immediate_sites)} 搜索页面")
                 
-                # 处理自定义网站（立即打开）
+                # 处理自定义网站
                 for custom_site in custom_sites:
                     if (custom_site.get('enabled', False) and 
                         custom_site.get('name') and 
@@ -954,88 +998,47 @@ class NFOEditorQt5(NFOEditorQt):
                         except Exception as e:
                             print(f"打开自定义网站 {custom_site['name']} 时出错: {e}")
                 
-                # 定义需要后台解析的网站处理函数
-                def search_javdb():
-                    """搜索JavDB"""
-                    if not predefined_sites.get('javdb', False):
-                        return False
-                        
-                    try:
-                        search_url = f"https://javdb.com/search?q={num_text}&f=all"
-                        response = requests.get(search_url, headers=headers, timeout=10)
-                        
-                        if response.status_code == 200:
-                            soup = BeautifulSoup(response.text, 'lxml')
-                            
-                            # 检查是否显示"暂无内容"
-                            empty_message = soup.find('div', class_='empty-message')
-                            if empty_message:
-                                print(f"JavDB: 没有找到 {num_text} 的搜索结果")
-                                return False
-                            
-                            # 查找搜索结果列表
-                            movie_list = soup.find('div', class_='movie-list')
-                            if movie_list:
-                                items = movie_list.find_all('div', class_='item')
-                                
-                                for item in items:
-                                    # 查找番号标签
-                                    strong_tag = item.find('strong')
-                                    if strong_tag and strong_tag.text.strip().upper() == num_text.upper():
-                                        # 找到匹配的番号，获取详情页链接
-                                        link_tag = item.find('a', class_='box')
-                                        if link_tag and link_tag.get('href'):
-                                            detail_url = f"https://javdb.com{link_tag['href']}"
-                                            webbrowser.open(detail_url)
-                                            print(f"JavDB: 打开详情页 {detail_url}")
-                                            return True
-                                
-                                print(f"JavDB: 没有找到完全匹配 {num_text} 的番号")
-                            else:
-                                print(f"JavDB: 搜索页面格式可能已变更")
-                        else:
-                            print(f"JavDB: 访问失败，状态码: {response.status_code}")
-                    except Exception as e:
-                        print(f"JavDB: 搜索失败: {str(e)}")
-                    return False
-                                
-                # 在后台并发处理需要解析的网站
-                def background_search():
-                    parse_sites = []
-                    if predefined_sites.get('javdb', False):
-                        parse_sites.append(search_javdb)
-                    
-                    if parse_sites:
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                            # 提交搜索任务
-                            futures = [executor.submit(func) for func in parse_sites]
-                            
-                            # 等待所有任务完成
-                            for future in concurrent.futures.as_completed(futures, timeout=30):
-                                try:
-                                    if future.result():
-                                        nonlocal opened_count
-                                        opened_count += 1
-                                except Exception as e:
-                                    print(f"搜索任务执行失败: {str(e)}")
-                
-                # 启动后台搜索线程（如果有需要解析的网站）
+                # 处理需要智能跳转的网站（仅JavDB，且用户可配置）
                 if predefined_sites.get('javdb', False):
-                    threading.Thread(target=background_search, daemon=True).start()
+                    self._start_javdb_search(num_text, opened_count)
                 
-                # 状态反馈
-                if opened_count == 0:
-                    self.status_bar.showMessage("未配置搜索网站", 3000)
+                # 状态反馈（包含复制成功信息）
+                total_sites = opened_count + (1 if predefined_sites.get('javdb', False) else 0)
+                if total_sites == 0:
+                    self.status_bar.showMessage(f"已复制番号: {num_text}，但未配置搜索网站", 3000)
                 else:
-                    self.status_bar.showMessage(f"已处理 {opened_count} 个搜索网站", 3000)
+                    self.status_bar.showMessage(f"已复制番号: {num_text}，正在处理 {total_sites} 个搜索网站", 3000)
                     
             except Exception as e:
-                QMessageBox.warning(self, "警告", f"打开搜索网站失败: {str(e)}")
-                # 降级到原始方式
-                try:
-                    webbrowser.open(f"https://javdb.com/search?q={num_text}&f=all")
-                except Exception as fallback_error:
-                    QMessageBox.critical(self, "错误", f"所有搜索方式都失败了: {str(fallback_error)}")
+                QMessageBox.warning(self, "警告", f"操作失败: {str(e)}")
+
+    def _start_javdb_search(self, num_text, initial_count):
+        """启动JavDB搜索，没有详情页就降级到搜索页"""
+        def search_javdb():
+            search_engine = SearchEngine()
+            opened_count = initial_count
+            
+            try:
+                # 尝试获取详情页
+                detail_url = search_engine.search_javdb(num_text)
+                if detail_url:
+                    # 找到详情页，直接打开
+                    webbrowser.open(detail_url)
+                    opened_count += 1
+                    print(f"JavDB: 打开详情页 {detail_url}")
+                else:
+                    # 没找到详情页，降级到搜索页
+                    search_url = f"https://javdb.com/search?q={num_text}&f=all"
+                    webbrowser.open(search_url)
+                    opened_count += 1
+                    print(f"JavDB: 降级打开搜索页 {search_url}")
+            except Exception as e:
+                print(f"JavDB处理失败: {str(e)}")
+            
+            # 更新最终状态
+            QTimer.singleShot(0, lambda: self.status_bar.showMessage(f"已处理 {opened_count} 个搜索网站", 3000))
+        
+        threading.Thread(target=search_javdb, daemon=True).start()
 
     def load_target_files(self, target_path):
         """加载目标文件夹内容"""
@@ -1098,7 +1101,7 @@ class NFOEditorQt5(NFOEditorQt):
                     elem = ET.SubElement(root, field)
                 elem.text = value
 
-            # 更新 criticrating 字段
+            # 0
             try:
                 rating_value = float(rating)
                 critic_rating = int(rating_value * 10)  # 将 rating 转换为 criticrating
@@ -1330,6 +1333,96 @@ class NFOEditorQt5(NFOEditorQt):
                     QMessageBox.warning(self, "警告", "未找到匹配的视频文件")
                 else:
                     QMessageBox.critical(self, "错误", f"NFO文件不存在: {nfo_path}")
+
+    def play_trailer(self):
+        """播放预告片"""
+        if not self.current_file_path:
+            QMessageBox.warning(self, "警告", "请先选择NFO文件")
+            return
+
+        try:
+            # 获取NFO所在目录
+            folder = os.path.dirname(self.current_file_path)
+            
+            # 获取番号
+            num_text = self.fields_entries["num"].text().strip()
+            if not num_text:
+                QMessageBox.warning(self, "警告", "番号为空")
+                return
+                
+            # 第一步：查找本地包含trailer的视频文件
+            trailer_extensions = [".mp4", ".mkv", ".avi", ".mov", ".rm", ".mpeg", ".ts", ".strm"]
+            trailer_files = []
+            
+            for file in os.listdir(folder):
+                file_lower = file.lower()
+                if "trailer" in file_lower:
+                    for ext in trailer_extensions:
+                        if file_lower.endswith(ext):
+                            trailer_files.append(os.path.join(folder, file))
+                            break
+
+            if trailer_files:
+                # 播放找到的第一个trailer文件
+                trailer_path = trailer_files[0]
+                
+                if trailer_path.lower().endswith(".strm"):
+                    # 处理strm文件
+                    try:
+                        with open(trailer_path, "r", encoding="utf-8") as f:
+                            strm_url = f.readline().strip()
+                        if strm_url:
+                            subprocess.Popen(["mpvnet", strm_url])
+                            self.status_bar.showMessage(f"正在播放预告片: {os.path.basename(trailer_path)}", 3000)
+                        else:
+                            QMessageBox.critical(self, "错误", "STRM文件内容为空或无效")
+                    except Exception as e:
+                        QMessageBox.critical(self, "错误", f"读取STRM文件失败: {str(e)}")
+                else:
+                    # 播放普通视频文件
+                    subprocess.Popen(["mpvnet", trailer_path])
+                    self.status_bar.showMessage(f"正在播放预告片: {os.path.basename(trailer_path)}", 3000)
+            else:
+                # 没找到trailer文件，按优先级搜索在线资源
+                search_engine = SearchEngine()
+                
+                # 第二步：尝试JavTrailers详情页
+                try:
+                    print("本地未找到预告片，搜索JavTrailers...")
+                    javtrailers_url = search_engine.search_javtrailers(num_text)
+                    if javtrailers_url:
+                        webbrowser.open(javtrailers_url)
+                        print(f"预告片: JavTrailers详情页 - {javtrailers_url}")
+                        self.status_bar.showMessage("已打开JavTrailers详情页", 3000)
+                        return
+                except Exception as e:
+                    print(f"JavTrailers搜索出错: {str(e)}")
+                
+                # 第三步：降级到JavDB详情页
+                try:
+                    print("JavTrailers未找到详情页，尝试JavDB详情页...")
+                    javdb_url = search_engine.search_javdb(num_text)
+                    if javdb_url:
+                        webbrowser.open(javdb_url)
+                        print(f"预告片: JavDB详情页 - {javdb_url}")
+                        self.status_bar.showMessage("已打开JavDB详情页", 3000)
+                        return
+                except Exception as e:
+                    print(f"JavDB搜索出错: {str(e)}")
+                
+                # 第四步：最终降级到JavDB搜索页
+                try:
+                    print("JavDB详情页未找到，降级到JavDB搜索页...")
+                    fallback_url = f"https://javdb.com/search?q={num_text}&f=all"
+                    webbrowser.open(fallback_url)
+                    print(f"预告片: 降级到JavDB搜索页面 - {fallback_url}")
+                    self.status_bar.showMessage("已打开JavDB搜索页面", 3000)
+                except Exception as e:
+                    print(f"打开JavDB搜索页面失败: {str(e)}")
+                    self.status_bar.showMessage("预告片搜索失败", 3000)
+                    
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"播放预告片失败: {str(e)}")
 
     def has_unsaved_changes(self):
         """检查是否有未保存的更改"""
@@ -1650,7 +1743,7 @@ class NFOEditorQt5(NFOEditorQt):
             QLineEdit,
             QPushButton,
             QTextEdit,
-            QLabel,  # 添加 QLabel 导入
+            QLabel,
         )
 
         dialog = QDialog(self)
@@ -1658,12 +1751,12 @@ class NFOEditorQt5(NFOEditorQt):
         dialog.resize(400, 600)
 
         layout = QVBoxLayout()
-        dialog.setLayout(layout)  # 将layout设置为dialog的布局
+        dialog.setLayout(layout)
 
         # 字段选择
         layout.addWidget(QLabel("选择填充替换字段:"))
-        field_buttons = []  # 创建一个列表来存储单选按钮
-        for field in ["series", "rating"]:
+        field_buttons = []
+        for field in ["series", "rating", "actor"]:
             rb = QRadioButton(field)
             if not field_buttons:  # 如果是第一个按钮
                 rb.setChecked(True)
@@ -1674,10 +1767,73 @@ class NFOEditorQt5(NFOEditorQt):
         layout.addWidget(QLabel("填充替换值:"))
         value_entry = QLineEdit()
         layout.addWidget(value_entry)
-
+        
         # 日志显示
         log_text = QTextEdit()
         layout.addWidget(log_text)
+
+        # 为评分字段添加格式化功能
+        original_key_release = value_entry.keyReleaseEvent
+        
+        def format_rating_input(widget, event):
+            """评分输入格式化处理（复用主编辑区的逻辑）"""
+            try:
+                current_text = widget.text().strip()
+
+                if not current_text:
+                    original_key_release(event)
+                    return
+
+                key_text = event.text()
+
+                if key_text.isdigit():
+                    if "." in current_text:
+                        main_num = current_text.split(".")[0]
+                        formatted_rating = f"{main_num}.{key_text}"
+
+                        try:
+                            if float(formatted_rating) <= 9.9:
+                                widget.setText(formatted_rating)
+                            else:
+                                widget.setText("9.9")
+                        except ValueError:
+                            pass
+                    elif current_text.isdigit():
+                        try:
+                            formatted_rating = f"{float(current_text):.1f}"
+                            widget.setText(formatted_rating)
+                        except ValueError:
+                            pass
+
+                    widget.setCursorPosition(len(widget.text()))
+
+            except Exception as e:
+                print(f"处理评分输入时出错: {str(e)}")
+
+            original_key_release(event)
+        
+        def on_field_changed():
+            """当字段选择改变时，更新输入框的行为"""
+            selected_field = None
+            for rb in field_buttons:
+                if rb.isChecked():
+                    selected_field = rb.text()
+                    break
+            
+            if selected_field == "rating":
+                def rating_key_handler(event):
+                    format_rating_input(value_entry, event)
+                value_entry.keyReleaseEvent = rating_key_handler
+                value_entry.setPlaceholderText("输入评分 (如: 8.5)")
+            else:
+                value_entry.keyReleaseEvent = original_key_release
+                if selected_field == "actor":
+                    value_entry.setPlaceholderText("输入演员名，多个用逗号分隔")
+                else:
+                    value_entry.setPlaceholderText("输入填充值")
+            
+            # 重新设置焦点
+            value_entry.setFocus()
 
         def apply_fill():
             # 获取选中的字段
@@ -1713,11 +1869,49 @@ class NFOEditorQt5(NFOEditorQt):
                     tree = ET.parse(nfo_path)
                     root = tree.getroot()
 
-                    elem = root.find(field)
-                    if elem is None:
-                        elem = ET.SubElement(root, field)
-                    elem.text = fill_value
+                    if field == "actor":
+                        # 处理actor字段的特殊逻辑
+                        for actor_elem in root.findall("actor"):
+                            root.remove(actor_elem)
+                        
+                        for actor_name in fill_value.split(","):
+                            actor_name = actor_name.strip()
+                            if actor_name:
+                                actor_elem = ET.SubElement(root, "actor")
+                                name_elem = ET.SubElement(actor_elem, "name")
+                                name_elem.text = actor_name
+                        
+                        operation_log.append(f"{nfo_path}: actor字段填充成功")
+                        
+                    elif field == "rating":
+                        # rating字段的特殊处理，联动更新criticrating
+                        rating_elem = root.find("rating")
+                        if rating_elem is None:
+                            rating_elem = ET.SubElement(root, "rating")
+                        rating_elem.text = fill_value
+                        
+                        try:
+                            rating_value = float(fill_value)
+                            critic_rating = int(rating_value * 10)
+                            critic_elem = root.find("criticrating")
+                            if critic_elem is None:
+                                critic_elem = ET.SubElement(root, "criticrating")
+                            critic_elem.text = str(critic_rating)
+                            
+                            operation_log.append(f"{nfo_path}: rating字段填充成功 (rating: {fill_value}, criticrating: {critic_rating})")
+                        except ValueError:
+                            operation_log.append(f"{nfo_path}: rating字段填充成功，但criticrating转换失败")
+                            
+                    else:
+                        # 处理其他字段（series等）
+                        elem = root.find(field)
+                        if elem is None:
+                            elem = ET.SubElement(root, field)
+                        elem.text = fill_value
+                        
+                        operation_log.append(f"{nfo_path}: {field}字段填充成功")
 
+                    # 保存文件
                     xml_str = ET.tostring(root, encoding="utf-8")
                     parsed_str = minidom.parseString(xml_str)
                     pretty_str = parsed_str.toprettyxml(indent="  ", encoding="utf-8")
@@ -1730,8 +1924,6 @@ class NFOEditorQt5(NFOEditorQt):
                     with open(nfo_path, "w", encoding="utf-8") as f:
                         f.write(pretty_str)
 
-                    operation_log.append(f"{nfo_path}: {field}字段填充成功")
-
                 except Exception as e:
                     operation_log.append(f"{nfo_path}: {field}字段填充失败 - {str(e)}")
 
@@ -1740,44 +1932,48 @@ class NFOEditorQt5(NFOEditorQt):
             if self.current_file_path:
                 self.load_nfo_fields()
 
+        # 为字段选择按钮添加事件监听
+        for rb in field_buttons:
+            rb.toggled.connect(on_field_changed)
+        
+        # 按钮
         apply_button = QPushButton("应用填充")
         apply_button.clicked.connect(apply_fill)
         layout.addWidget(apply_button)
 
+        # 初始化输入框状态和设置事件
+        on_field_changed()
+        value_entry.returnPressed.connect(apply_fill)
+
         dialog.exec_()
 
     def batch_add(self):
-        """批量新增"""
+        """批量新增标签"""
         from PyQt5.QtWidgets import (
             QDialog,
             QVBoxLayout,
-            QRadioButton,
             QLineEdit,
             QPushButton,
             QTextEdit,
-            QLabel,  # 添加 QLabel 导入
+            QLabel,
         )
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("批量新增")
-        dialog.resize(400, 600)
+        dialog.setWindowTitle("批量新增标签")
+        dialog.resize(400, 500)
 
         layout = QVBoxLayout()
-        dialog.setLayout(layout)  # 将layout设置为dialog的布局
+        dialog.setLayout(layout)
 
-        # 字段选择
-        layout.addWidget(QLabel("选择字段新增一个值:"))
-        field_buttons = []  # 创建一个列表来存储单选按钮
-        for field in ["tag", "genre"]:
-            rb = QRadioButton(field)
-            if not field_buttons:  # 如果是第一个按钮
-                rb.setChecked(True)
-            field_buttons.append(rb)
-            layout.addWidget(rb)
+        # 说明文字
+        layout.addWidget(QLabel("为选中的NFO文件批量新增标签:"))
+        layout.addWidget(QLabel("(将同时添加到tag和genre字段)"))
+        layout.addWidget(QLabel("多个标签请用逗号分隔"))
 
         # 新增值输入
-        layout.addWidget(QLabel("输入新增值:"))
+        layout.addWidget(QLabel("输入新增标签:"))
         value_entry = QLineEdit()
+        value_entry.setPlaceholderText("例如: 新标签1, 新标签2, 新标签3")
         layout.addWidget(value_entry)
 
         # 日志显示
@@ -1785,18 +1981,9 @@ class NFOEditorQt5(NFOEditorQt):
         layout.addWidget(log_text)
 
         def apply_add():
-            # 获取选中的字段
-            field = None
-            for rb in field_buttons:
-                if rb.isChecked():
-                    field = rb.text()
-                    break
-
-            if not field:
-                return
-
             add_value = value_entry.text().strip()
             if not add_value:
+                QMessageBox.warning(dialog, "警告", "请输入标签内容")
                 return
 
             selected_items = self.file_tree.selectedItems()
@@ -1818,9 +2005,52 @@ class NFOEditorQt5(NFOEditorQt):
                     tree = ET.parse(nfo_path)
                     root = tree.getroot()
 
-                    new_elem = ET.SubElement(root, field)
-                    new_elem.text = add_value
+                    # 获取现有标签，保持原有顺序
+                    existing_tags = []
+                    for tag in root.findall("tag"):
+                        if tag is not None and tag.text:
+                            tag_text = tag.text.strip()
+                            if "," in tag_text:
+                                # 如果标签包含逗号，按逗号分割
+                                for sub_tag in tag_text.split(","):
+                                    sub_tag = sub_tag.strip()
+                                    if sub_tag:
+                                        existing_tags.append(sub_tag)
+                            else:
+                                existing_tags.append(tag_text)
+                    
+                    # 按逗号分割新输入的标签，并去重
+                    new_tags = []
+                    for tag in add_value.split(","):
+                        tag = tag.strip()
+                        if tag and tag not in existing_tags:  # 避免重复
+                            new_tags.append(tag)
+                    
+                    # 如果没有新标签需要添加，跳过此文件
+                    if not new_tags:
+                        operation_log.append(f"{nfo_path}: 所有标签已存在，跳过")
+                        continue
+                    
+                    # 合并所有标签：现有标签 + 新标签
+                    all_tags = existing_tags + new_tags
+                    
+                    # 删除现有的所有标签和类型
+                    for tag_elem in root.findall("tag"):
+                        root.remove(tag_elem)
+                    for genre_elem in root.findall("genre"):
+                        root.remove(genre_elem)
+                    
+                    # 先创建所有tag节点
+                    for tag in all_tags:
+                        tag_elem = ET.SubElement(root, "tag")
+                        tag_elem.text = tag
+                        
+                    # 再创建所有genre节点
+                    for tag in all_tags:
+                        genre_elem = ET.SubElement(root, "genre")
+                        genre_elem.text = tag
 
+                    # 保存文件
                     xml_str = ET.tostring(root, encoding="utf-8")
                     parsed_str = minidom.parseString(xml_str)
                     pretty_str = parsed_str.toprettyxml(indent="  ", encoding="utf-8")
@@ -1833,19 +2063,32 @@ class NFOEditorQt5(NFOEditorQt):
                     with open(nfo_path, "w", encoding="utf-8") as f:
                         f.write(pretty_str)
 
-                    operation_log.append(f"{nfo_path}: {field}字段新增成功")
+                    operation_log.append(f"{nfo_path}: 成功新增{len(new_tags)}个标签")
 
                 except Exception as e:
-                    operation_log.append(f"{nfo_path}: {field}字段新增失败 - {str(e)}")
+                    operation_log.append(f"{nfo_path}: 标签新增失败 - {str(e)}")
 
             log_text.setText("\n".join(operation_log))
-            # 刷新显示
+            
+            # 刷新当前显示的NFO文件
             if self.current_file_path:
                 self.load_nfo_fields()
 
+        # 按钮布局
+        button_layout = QHBoxLayout()
         apply_button = QPushButton("应用新增")
         apply_button.clicked.connect(apply_add)
-        layout.addWidget(apply_button)
+        
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(dialog.close)
+        
+        button_layout.addWidget(apply_button)
+        button_layout.addWidget(close_button)
+        layout.addLayout(button_layout)
+
+        # 设置回车键快捷操作和自动焦点
+        value_entry.returnPressed.connect(apply_add)
+        value_entry.setFocus()
 
         dialog.exec_()
 
@@ -2223,135 +2466,6 @@ class NFOEditorQt5(NFOEditorQt):
         if hasattr(self, 'copy_num_button'):
             self.copy_num_button.setText("📋")
             self.copy_num_button.setToolTip("复制番号")
-
-    def play_trailer(self):
-        """播放预告片"""
-        if not self.current_file_path:
-            QMessageBox.warning(self, "警告", "请先选择NFO文件")
-            return
-
-        try:
-            # 获取NFO所在目录
-            folder = os.path.dirname(self.current_file_path)
-            
-            # 获取番号
-            num_text = self.fields_entries["num"].text().strip()
-            if not num_text:
-                QMessageBox.warning(self, "警告", "番号为空")
-                return
-
-            # 查找包含trailer的视频文件
-            trailer_extensions = [".mp4", ".mkv", ".avi", ".mov", ".rm", ".mpeg", ".ts", ".strm"]
-            trailer_files = []
-            
-            for file in os.listdir(folder):
-                file_lower = file.lower()
-                if "trailer" in file_lower:
-                    for ext in trailer_extensions:
-                        if file_lower.endswith(ext):
-                            trailer_files.append(os.path.join(folder, file))
-                            break
-
-            if trailer_files:
-                # 播放找到的第一个trailer文件
-                trailer_path = trailer_files[0]
-                
-                if trailer_path.lower().endswith(".strm"):
-                    # 处理strm文件
-                    try:
-                        with open(trailer_path, "r", encoding="utf-8") as f:
-                            strm_url = f.readline().strip()
-                        if strm_url:
-                            subprocess.Popen(["mpvnet", strm_url])
-                            # self.status_bar.showMessage(f"正在播放预告片: {os.path.basename(trailer_path)}", 3000)
-                        else:
-                            QMessageBox.critical(self, "错误", "STRM文件内容为空或无效")
-                    except Exception as e:
-                        QMessageBox.critical(self, "错误", f"读取STRM文件失败: {str(e)}")
-                else:
-                    # 播放普通视频文件
-                    subprocess.Popen(["mpvnet", trailer_path])
-                    self.status_bar.showMessage(f"正在播放预告片: {os.path.basename(trailer_path)}", 3000)
-            else:
-                # 没找到trailer文件，打开javtrailers网站
-                self.open_javtrailers_detail(num_text)
-
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"播放预告片失败: {str(e)}")
-
-    def open_javtrailers_detail(self, num_text):
-        """打开JavTrailers详情页"""
-        try:
-            import requests
-            from bs4 import BeautifulSoup
-            import threading
-            
-            def search_and_open():
-                try:
-                    headers = {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                        'Accept-Encoding': 'gzip, deflate, br',
-                        'DNT': '1',
-                        'Connection': 'keep-alive',
-                        'Upgrade-Insecure-Requests': '1',
-                    }
-                    
-                    search_url = f"https://javtrailers.com/search/{num_text}"
-                    response = requests.get(search_url, headers=headers, timeout=10)
-                    
-                    if response.status_code == 200:
-                        soup = BeautifulSoup(response.text, 'lxml')
-                        
-                        # 查找搜索结果列表
-                        videos_section = soup.find('section', class_='videos-list')
-                        if videos_section:
-                            # 查找所有视频卡片
-                            video_links = videos_section.find_all('a', class_='video-link')
-                            
-                            for link in video_links:
-                                # 查找视频标题
-                                title_element = link.find('p', class_='vid-title')
-                                if title_element:
-                                    title_text = title_element.text.strip()
-                                    # 检查标题是否以搜索的番号开头
-                                    if title_text.upper().startswith(num_text.upper() + ' '):
-                                        # 找到匹配的番号，获取详情页链接
-                                        href = link.get('href')
-                                        if href:
-                                            detail_url = f"https://javtrailers.com{href}"
-                                            webbrowser.open(detail_url)
-                                            print(f"JavTrailers: 打开详情页 {detail_url}")
-                                            return True
-                            
-                            # 没找到匹配的，打开搜索页面
-                            webbrowser.open(search_url)
-                            print(f"JavTrailers: 未找到匹配番号，打开搜索页面")
-                        else:
-                            # 搜索页面格式可能已变更，直接打开搜索页面
-                            webbrowser.open(search_url)
-                            print(f"JavTrailers: 搜索页面格式可能已变更，打开搜索页面")
-                    else:
-                        # 访问失败，直接打开搜索页面
-                        webbrowser.open(search_url)
-                        print(f"JavTrailers: 访问失败，打开搜索页面")
-                except Exception as e:
-                    # 出错时打开搜索页面
-                    search_url = f"https://javtrailers.com/search/{num_text}"
-                    webbrowser.open(search_url)
-                    print(f"JavTrailers: 搜索失败，打开搜索页面: {str(e)}")
-            
-            # 在后台线程中执行搜索
-            threading.Thread(target=search_and_open, daemon=True).start()
-            self.status_bar.showMessage("正在打开JavTrailers预告片页面...", 3000)
-            
-        except Exception as e:
-            # 如果导入失败或其他错误，直接打开搜索页面
-            search_url = f"https://javtrailers.com/search/{num_text}"
-            webbrowser.open(search_url)
-            self.status_bar.showMessage("已打开JavTrailers搜索页面", 3000)
-
 
 def main():
     # 在创建 QApplication 之前设置高DPI属性
