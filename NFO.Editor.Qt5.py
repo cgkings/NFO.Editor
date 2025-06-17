@@ -579,6 +579,22 @@ class NFOEditorQt5(NFOEditorQt):
         self.file_tree.itemSelectionChanged.connect(self.on_file_select)
         self.file_tree.itemDoubleClicked.connect(self.on_file_double_click)
 
+        # 设置文件树在失去焦点时仍显示选中状态
+        self.file_tree.setStyleSheet("""
+            QTreeWidget {
+                selection-background-color: #3daee9;
+                selection-color: white;
+            }
+            QTreeWidget::item:selected {
+                background-color: #3daee9;
+                color: white;
+            }
+            QTreeWidget::item:selected:!focus {
+                background-color: #bfbfbf;  /* 失去焦点时的背景色 */
+                color: black;
+            }
+        """)
+
         # 文件系统监控信号
         self.file_watcher.fileChanged.connect(self.on_file_changed)
         self.file_watcher.directoryChanged.connect(self.on_directory_changed)
@@ -816,10 +832,18 @@ class NFOEditorQt5(NFOEditorQt):
         # 更新状态栏信息
         self.status_bar.showMessage("目标目录已清除")
 
-    def load_files_in_folder(self):
+    def load_files_in_folder(self, auto_select=True):
         """加载文件夹中的NFO文件"""
         if not self.folder_path:
             return
+
+        # 保存当前选中的项目信息
+        current_selection = None
+        if not auto_select:
+            selected_items = self.file_tree.selectedItems()
+            if selected_items:
+                item = selected_items[0]
+                current_selection = [item.text(i) for i in range(3)]
 
         self.file_tree.clear()
         self.nfo_files = []
@@ -848,16 +872,30 @@ class NFOEditorQt5(NFOEditorQt):
                         item = QTreeWidgetItem([first_level, second_level, nfo_file])
                         self.file_tree.addTopLevelItem(item)
 
-            # 选中第一项
-            if self.file_tree.topLevelItemCount() > 0:
+            # 选择逻辑优化
+            if auto_select and self.file_tree.topLevelItemCount() > 0:
+                # 初次加载时选中第一项
                 first_item = self.file_tree.topLevelItem(0)
                 self.file_tree.setCurrentItem(first_item)
                 self.on_file_select()
+            elif current_selection and self.file_tree.topLevelItemCount() > 0:
+                # 尝试恢复之前的选择
+                selection_restored = False
+                for i in range(self.file_tree.topLevelItemCount()):
+                    item = self.file_tree.topLevelItem(i)
+                    if [item.text(j) for j in range(3)] == current_selection:
+                        self.file_tree.setCurrentItem(item)
+                        selection_restored = True
+                        break
+                
+                # 如果无法恢复原选择，则清除选择状态
+                if not selection_restored:
+                    self.file_tree.clearSelection()
 
             # 更新状态栏信息
             total_folders = len(set(os.path.dirname(f) for f in self.nfo_files))
             status_msg = f"目录: {self.folder_path} (共加载 {total_folders} 个文件夹)"
-            self.status_bar.showMessage(status_msg)  # 使用 self.status_bar
+            self.status_bar.showMessage(status_msg)
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载文件失败: {str(e)}")
@@ -1497,7 +1535,8 @@ class NFOEditorQt5(NFOEditorQt):
     def on_directory_changed(self, path):
         """目录变化响应"""
         if path == self.folder_path:
-            self.load_files_in_folder()
+            # 目录变化时不自动选择第一项，保持当前选择状态
+            self.load_files_in_folder(auto_select=False)
 
     def toggle_image_display(self):
         """切换图片显示状态"""
