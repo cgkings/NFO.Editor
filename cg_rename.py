@@ -3,19 +3,9 @@ import sys
 import re
 from xml.etree import ElementTree as ET
 from PyQt5.QtWidgets import (
-    QApplication,
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QPushButton,
-    QCheckBox,
-    QTextEdit,
-    QProgressBar,
-    QFileDialog,
-    QMessageBox,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QLineEdit, QPushButton, QCheckBox, QTextEdit, QProgressBar,
+    QFileDialog, QMessageBox,
 )
 from PyQt5.QtCore import QSize, Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon
@@ -25,74 +15,102 @@ from dataclasses import dataclass, field
 
 # 配置常量
 class Config:
-    DEFAULT_FOLDER_FORMAT = "number smart_actor"
+    DEFAULT_FOLDER_FORMAT = "filename smart_actor"
     SUPPORTED_NFO_EXTENSIONS = ['.nfo']
     INVALID_FILENAME_CHARS = r'[\\/:*?"<>|]'
-    APP_VERSION = "v9.6.5"
+    APP_VERSION = "v9.6.6"
     WINDOW_MIN_SIZE = (900, 850)
+    
+    # 样式常量
+    MAIN_STYLE = """
+        QMainWindow { background-color: #f5f5f5; }
+        QWidget { font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif; }
+        QLineEdit {
+            padding: 8px; border: 1px solid #dcdcdc; border-radius: 6px;
+            background-color: white;
+        }
+        QLineEdit:focus { border: 1px solid #2196F3; }
+        QPushButton {
+            padding: 8px 16px; border-radius: 6px; font-weight: bold;
+            background-color: #f0f0f0; border: none;
+        }
+        QPushButton:hover { background-color: #e0e0e0; }
+        QPushButton:pressed { background-color: #d0d0d0; }
+        QTextEdit {
+            border: 1px solid #dcdcdc; border-radius: 6px;
+            background-color: white; padding: 8px;
+        }
+        QProgressBar {
+            border: none; border-radius: 6px; background-color: #f0f0f0;
+            text-align: center; min-height: 12px;
+        }
+        QProgressBar::chunk { border-radius: 6px; background-color: #2196F3; }
+        QCheckBox { padding: 5px; }
+        QCheckBox::indicator {
+            width: 18px; height: 18px; border-radius: 4px; border: 2px solid #dcdcdc;
+        }
+        QCheckBox::indicator:checked {
+            background-color: #2196F3; border-color: #2196F3;
+        }
+    """
+    
+    CONTAINER_STYLE = """
+        background-color: white; border-radius: 8px; padding: 10px;
+    """
+    
+    PRIMARY_BUTTON_STYLE = """
+        QPushButton {
+            background-color: #2196F3; color: white;
+            font-size: 14px; font-weight: bold;
+        }
+        QPushButton:hover { background-color: #1976D2; }
+        QPushButton:pressed { background-color: #0D47A1; }
+    """
 
 
 @dataclass
 class NFOFields:
-    """NFO文件字段数据类"""
+    """NFO文件字段数据类 - 精简版"""
+    # 基础字段
     title: str = ""
-    originaltitle: str = ""
     number: str = ""
-    letters: str = ""
-    first_letter: str = ""
     filename: str = ""
     
-    # 演员相关（原始数据，未应用映射）
-    original_actors: List[str] = field(default_factory=list)
-    # 演员相关（已应用映射）
-    actors: List[str] = field(default_factory=list)
+    # 演员相关
     actor: str = ""
-    all_actor: str = ""
-    first_actor: str = ""
     smart_actor: str = ""
-    actor_count: str = ""
     
     # 制作信息
     director: str = ""
     series: str = ""
     studio: str = ""
     publisher: str = ""
-    release: str = ""
     year: str = ""
     
     # 技术信息
     runtime: str = ""
     rating: str = ""
-    score: str = ""
     mosaic: str = ""
     definition: str = ""
     four_k: str = ""
-    
-    # 其他
-    wanted: str = ""
-    outline: str = ""
 
 
 class NFOParser:
-    """NFO文件解析器"""
+    """NFO文件解析器 - 精简版"""
     
-    # XML字段映射配置
+    # 精简的字段映射配置
     FIELD_MAPPINGS = {
         'title': ['.//title'],
-        'originaltitle': ['.//originaltitle'],
         'number': ['.//num', './/id', './/number'],
         'director': ['.//director'],
         'series': ['.//series', './/set'],
         'studio': ['.//studio'],
         'publisher': ['.//publisher'],
-        'release': ['.//releasedate', './/release', './/premiered'],
         'year': ['.//year'],
         'runtime': ['.//runtime'],
         'rating': ['.//rating'],
         'mosaic': ['.//mosaic'],
         'definition': ['.//definition', './/resolution'],
-        'wanted': ['.//wanted'],
-        'outline': ['.//plot', './/outline'],
     }
     
     def __init__(self, actor_mapping: Optional[Dict[str, str]] = None):
@@ -109,85 +127,63 @@ class NFOParser:
             fields.filename = Path(nfo_path).stem
             
             # 解析基本字段
-            self._parse_basic_fields(root, fields)
+            for field_name, xpath_list in self.FIELD_MAPPINGS.items():
+                setattr(fields, field_name, self._find_first_valid_text(root, xpath_list))
+            
+            # 处理特殊字段
+            self._process_special_fields(fields)
             
             # 解析演员信息
-            self._parse_actor_fields(root, fields)
-            
-            # 解析派生字段
-            self._parse_derived_fields(fields)
+            self._parse_actors(root, fields)
             
             return fields
             
         except Exception as e:
             raise Exception(f"解析NFO文件失败 {nfo_path}: {e}")
     
-    def _parse_basic_fields(self, root: ET.Element, fields: NFOFields):
-        """解析基本字段"""
-        for field_name, xpath_list in self.FIELD_MAPPINGS.items():
-            value = self._find_first_valid_text(root, xpath_list)
-            setattr(fields, field_name, value)
-        
-        # 特殊处理评分字段
+    def _process_special_fields(self, fields: NFOFields):
+        """处理特殊字段"""
+        # 处理评分
         if fields.rating:
             try:
                 rating_value = float(fields.rating)
                 fields.rating = f"{rating_value:.1f}"
-                fields.score = fields.rating
             except ValueError:
                 fields.rating = ""
-                fields.score = ""
-        
-        # 处理番号相关字段
-        if fields.number:
-            match = re.match(r'^([A-Za-z]+)', fields.number)
-            fields.letters = match.group(1) if match else ""
-            fields.first_letter = fields.letters[:1] if fields.letters else ""
         
         # 处理4K标识
         fields.four_k = "4K" if any(keyword in fields.definition.lower() 
                                   for keyword in ['4k', '2160']) else ""
     
-    def _parse_actor_fields(self, root: ET.Element, fields: NFOFields):
+    def _parse_actors(self, root: ET.Element, fields: NFOFields):
         """解析演员信息"""
-        actor_elements = root.findall(".//actor")
+        actors = []
         
-        for actor in actor_elements:
+        for actor in root.findall(".//actor"):
             name_element = actor.find("name")
             if name_element is not None and name_element.text:
                 original_name = name_element.text.strip()
-                fields.original_actors.append(original_name)
-                
                 # 应用映射关系
                 mapped_name = self.actor_mapping.get(original_name, original_name)
-                fields.actors.append(mapped_name)
+                actors.append(mapped_name)
         
-        # 设置演员相关字段
-        self._set_actor_related_fields(fields)
+        if actors:
+            fields.actor = ",".join(actors)
+            fields.smart_actor = self._generate_smart_actor(actors)
     
-    def _set_actor_related_fields(self, fields: NFOFields):
-        """设置演员相关的派生字段"""
-        if not fields.actors:
-            return
-        
-        fields.actor = ",".join(fields.actors)
-        fields.all_actor = fields.actor
-        fields.first_actor = fields.actors[0]
-        fields.actor_count = str(len(fields.actors))
-        
-        # 智能演员显示逻辑
-        actor_count = len(fields.actors)
-        if actor_count == 1:
-            fields.smart_actor = fields.actors[0]
-        elif actor_count == 2:
-            fields.smart_actor = f"{fields.actors[0]},{fields.actors[1]}"
-        elif actor_count >= 3:
-            fields.smart_actor = f"{fields.actors[0]}等演员"
-    
-    def _parse_derived_fields(self, fields: NFOFields):
-        """解析派生字段（基于其他字段计算得出的字段）"""
-        # 目前主要是演员相关字段，已在 _parse_actor_fields 中处理
-        pass
+    def _generate_smart_actor(self, actors: List[str]) -> str:
+        """生成智能演员显示 - 更加智能的逻辑"""
+        count = len(actors)
+        if count == 0:
+            return ""
+        elif count == 1:
+            return actors[0]
+        elif count == 2:
+            return f"{actors[0]},{actors[1]}"
+        elif count == 3:
+            return f"{actors[0]},{actors[1]},{actors[2]}"
+        else:  # 3个以上
+            return f"{actors[0]},{actors[1]},{actors[2]}等演员"
     
     def _find_first_valid_text(self, root: ET.Element, xpath_list: List[str]) -> str:
         """从xpath列表中查找第一个有效的文本值"""
@@ -210,80 +206,55 @@ class NFOModifier:
             tree = ET.parse(nfo_path)
             root = tree.getroot()
             
+            stats = {'actor': 0, 'tag': 0, 'genre': 0}
             modified = False
             all_actors = []
-            modification_stats = {
-                'actor': 0,
-                'tag': 0, 
-                'genre': 0
-            }
             
-            # 处理 <actor><name> 标签
-            actor_modified, actors = self._modify_actor_elements(root)
-            if actor_modified:
-                modified = True
-                modification_stats['actor'] = len([a for a in actors if a])
-            all_actors.extend(actors)
-            
-            # 处理 <tag> 标签
-            tag_modified, tag_count = self._modify_text_elements(root, './/tag')
-            if tag_modified:
-                modified = True
-                modification_stats['tag'] = tag_count
-            
-            # 处理 <genre> 标签
-            genre_modified, genre_count = self._modify_text_elements(root, './/genre')
-            if genre_modified:
-                modified = True
-                modification_stats['genre'] = genre_count
+            # 处理各类元素
+            for element_type, xpath in [('actor', './/actor'), ('tag', './/tag'), ('genre', './/genre')]:
+                elem_modified, actors, count = self._modify_elements(root, xpath, element_type == 'actor')
+                if elem_modified:
+                    modified = True
+                    if element_type == 'actor':
+                        all_actors.extend(actors)
+                        stats['actor'] = len([a for a in actors if a])
+                    else:
+                        stats[element_type] = count
             
             if modified:
                 tree.write(nfo_path, encoding="utf-8", xml_declaration=True)
             
-            return modified, all_actors, modification_stats
+            return modified, all_actors, stats
             
         except Exception as e:
             raise Exception(f"修改NFO文件失败 {nfo_path}: {e}")
     
-    def _modify_actor_elements(self, root: ET.Element) -> Tuple[bool, List[str]]:
-        """修改 <actor><name> 元素"""
-        modified = False
-        actors = []
+    def _modify_elements(self, root: ET.Element, xpath: str, is_actor: bool) -> Tuple[bool, List[str], int]:
+        """修改元素"""
+        modified, actors, count = False, [], 0
         
-        actor_elements = root.findall(".//actor")
-        for actor in actor_elements:
-            name_element = actor.find("name")
-            if name_element is not None and name_element.text:
-                original_name = name_element.text.strip()
-                mapped_name = self.actor_mapping.get(original_name, original_name)
-                
-                if mapped_name != original_name:
-                    name_element.text = mapped_name
-                    modified = True
-                
-                actors.append(mapped_name)
-        
-        return modified, actors
-    
-    def _modify_text_elements(self, root: ET.Element, xpath: str) -> Tuple[bool, int]:
-        """修改文本元素（如tag、genre）"""
-        modified = False
-        modification_count = 0
-        
-        elements = root.findall(xpath)
-        for element in elements:
-            if element.text:
-                original_text = element.text.strip()
-                
-                # 检查是否是演员名（在映射表中存在）
-                if original_text in self.actor_mapping:
+        for element in root.findall(xpath):
+            if is_actor:
+                name_element = element.find("name")
+                if name_element is not None and name_element.text:
+                    original_name = name_element.text.strip()
+                    mapped_name = self.actor_mapping.get(original_name, original_name)
+                    
+                    if mapped_name != original_name:
+                        name_element.text = mapped_name
+                        modified = True
+                    
+                    actors.append(mapped_name)
+            else:
+                if element.text and element.text.strip() in self.actor_mapping:
+                    original_text = element.text.strip()
                     mapped_name = self.actor_mapping[original_text]
                     if mapped_name != original_text:
                         element.text = mapped_name
                         modified = True
-                        modification_count += 1
+                        count += 1
         
-        return modified, modification_count
+        return modified, actors, count
 
 
 class FolderRenamer:
@@ -298,12 +269,19 @@ class FolderRenamer:
             return fields.filename
         
         result = self.format_string
-        field_dict = self._fields_to_dict(fields)
         
-        # 按字段名长度降序排列，避免短字段名影响长字段名
-        sorted_fields = sorted(field_dict.items(), key=lambda x: len(x[0]), reverse=True)
+        # 获取所有字段（排除私有属性）
+        field_dict = {
+            name: getattr(fields, name) 
+            for name in dir(fields) 
+            if not name.startswith('_') and not callable(getattr(fields, name))
+        }
         
-        for field_name, field_value in sorted_fields:
+        # 添加特殊字段映射
+        field_dict['4k'] = fields.four_k
+        
+        # 按字段名长度降序替换，避免短字段名影响长字段名
+        for field_name, field_value in sorted(field_dict.items(), key=lambda x: len(x[0]), reverse=True):
             pattern = r'(?<!\w)' + re.escape(field_name) + r'(?!\w)'
             if re.search(pattern, result):
                 clean_value = self._clean_filename(str(field_value)) if field_value else ""
@@ -329,20 +307,6 @@ class FolderRenamer:
             
         except Exception as e:
             raise Exception(f"重命名文件夹失败: {e}")
-    
-    def _fields_to_dict(self, fields: NFOFields) -> Dict[str, str]:
-        """将字段对象转换为字典"""
-        field_dict = {}
-        for field_name in dir(fields):
-            if not field_name.startswith('_') and field_name not in ['original_actors', 'actors']:
-                value = getattr(fields, field_name)
-                if not callable(value):
-                    field_dict[field_name] = value
-        
-        # 处理特殊字段名
-        field_dict['4k'] = fields.four_k
-        
-        return field_dict
     
     def _clean_filename(self, filename: str) -> str:
         """清理文件名中的非法字符"""
@@ -378,7 +342,6 @@ class RenameWorker(QThread):
     
     def _process_directory(self):
         """处理目录"""
-        # 收集所有需要处理的文件夹
         folders_to_process = self._collect_folders_with_nfo()
         total_folders = len(folders_to_process)
         
@@ -389,10 +352,7 @@ class RenameWorker(QThread):
                 self._process_single_folder(folder_path, nfo_path, i, total_folders)
             except Exception as e:
                 self.logUpdated.emit(f"处理文件夹 {folder_path} 时出错: {e}")
-                continue
-        
-        self.logUpdated.emit("\n所有处理完成！")
-    
+            
     def _collect_folders_with_nfo(self) -> List[Tuple[str, str]]:
         """收集包含NFO文件的文件夹"""
         folders_with_nfo = []
@@ -407,31 +367,36 @@ class RenameWorker(QThread):
         
         return folders_with_nfo
     
-    def _process_single_folder(self, folder_path: str, nfo_path: str, 
-                             current: int, total: int):
+    def _process_single_folder(self, folder_path: str, nfo_path: str, current: int, total: int):
         """处理单个文件夹"""
         folder_name = Path(folder_path).name
         self.logUpdated.emit(f"\n[{current}/{total}] 处理文件夹: {folder_name}")
         
-        # 1. 解析NFO文件
+        # 解析NFO文件
         try:
             nfo_fields = self.nfo_parser.parse_nfo_file(nfo_path)
         except Exception as e:
             self.logUpdated.emit(f"解析NFO文件失败: {e}")
             return
         
-        # 2. 修改演员信息
+        # 修改演员信息
+        self._modify_actor_info(nfo_path)
+        
+        # 重命名文件夹
+        if self.rename_folders:
+            self._rename_folder_if_needed(folder_path, nfo_fields)
+        
+        # 更新进度
+        self.progressUpdated.emit(current, total)
+    
+    def _modify_actor_info(self, nfo_path: str):
+        """修改演员信息"""
         try:
             modified, new_actors, stats = self.nfo_modifier.modify_actor_names(nfo_path)
             if modified:
-                # 详细显示修改统计
-                details = []
-                if stats['actor'] > 0:
-                    details.append(f"演员标签: {stats['actor']}个")
-                if stats['tag'] > 0:
-                    details.append(f"标签: {stats['tag']}个")
-                if stats['genre'] > 0:
-                    details.append(f"类型: {stats['genre']}个")
+                details = [f"{k}: {v}个" for k, v in 
+                          [('演员标签', stats['actor']), ('标签', stats['tag']), ('类型', stats['genre'])] 
+                          if v > 0]
                 
                 if details:
                     self.logUpdated.emit(f"演员信息已更新 - {', '.join(details)}")
@@ -443,23 +408,20 @@ class RenameWorker(QThread):
                 self.logUpdated.emit("演员信息无需修改")
         except Exception as e:
             self.logUpdated.emit(f"修改演员信息失败: {e}")
-        
-        # 3. 重命名文件夹（如果启用）
-        if self.rename_folders:
-            try:
-                expected_name = self.folder_renamer.generate_folder_name(nfo_fields)
-                current_name = Path(folder_path).name
-                
-                if current_name != expected_name:
-                    self.folder_renamer.rename_folder(folder_path, expected_name)
-                    self.logUpdated.emit(f"文件夹已重命名: {current_name} → {expected_name}")
-                else:
-                    self.logUpdated.emit("文件夹名称符合规范，无需重命名")
-            except Exception as e:
-                self.logUpdated.emit(f"重命名文件夹失败: {e}")
-        
-        # 4. 更新进度
-        self.progressUpdated.emit(current, total)
+    
+    def _rename_folder_if_needed(self, folder_path: str, nfo_fields: NFOFields):
+        """根据需要重命名文件夹"""
+        try:
+            expected_name = self.folder_renamer.generate_folder_name(nfo_fields)
+            current_name = Path(folder_path).name
+            
+            if current_name != expected_name:
+                self.folder_renamer.rename_folder(folder_path, expected_name)
+                self.logUpdated.emit(f"文件夹已重命名: {current_name} → {expected_name}")
+            else:
+                self.logUpdated.emit("文件夹名称符合规范，无需重命名")
+        except Exception as e:
+            self.logUpdated.emit(f"重命名文件夹失败: {e}")
     
     def _find_nfo_file(self, folder_path: str) -> Optional[str]:
         """在文件夹中查找NFO文件"""
@@ -475,27 +437,21 @@ class ActorMappingLoader:
     @staticmethod
     def find_mapping_file() -> Optional[str]:
         """查找映射文件"""
-        # 优先查找外部配置文件
+        # 确定基础路径
         if getattr(sys, "frozen", False):
             exe_dir = Path(sys.executable).parent
+            base_path = Path(sys._MEIPASS)
         else:
-            exe_dir = Path(__file__).parent
+            exe_dir = base_path = Path(__file__).parent
         
+        # 优先查找外部配置文件
         external_mapping = exe_dir / "mapping_actor.xml"
         if external_mapping.exists():
             return str(external_mapping)
         
         # 查找内置配置文件
-        if getattr(sys, "frozen", False):
-            base_path = Path(sys._MEIPASS)
-        else:
-            base_path = Path(__file__).parent
-        
         internal_mapping = base_path / "mapping_actor.xml"
-        if internal_mapping.exists():
-            return str(internal_mapping)
-        
-        return None
+        return str(internal_mapping) if internal_mapping.exists() else None
     
     @staticmethod
     def load_mapping(mapping_file: str) -> Dict[str, str]:
@@ -532,81 +488,14 @@ class RenameToolGUI(QMainWindow):
         """初始化用户界面"""
         self.setWindowTitle(f"大锤 批量改名工具 {Config.APP_VERSION}")
         self.setMinimumSize(*Config.WINDOW_MIN_SIZE)
+        self.setStyleSheet(Config.MAIN_STYLE)
         
-        # 设置样式
-        self._setup_styles()
-        
-        # 居中窗口
+        # 居中窗口和设置图标
         self._center_window()
-        
-        # 设置图标
         self._setup_icon()
         
         # 创建界面
         self._create_widgets()
-    
-    def _setup_styles(self):
-        """设置界面样式"""
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #f5f5f5;
-            }
-            QWidget {
-                font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
-            }
-            QLineEdit {
-                padding: 8px;
-                border: 1px solid #dcdcdc;
-                border-radius: 6px;
-                background-color: white;
-            }
-            QLineEdit:focus {
-                border: 1px solid #2196F3;
-            }
-            QPushButton {
-                padding: 8px 16px;
-                border-radius: 6px;
-                font-weight: bold;
-                background-color: #f0f0f0;
-                border: none;
-            }
-            QPushButton:hover {
-                background-color: #e0e0e0;
-            }
-            QPushButton:pressed {
-                background-color: #d0d0d0;
-            }
-            QTextEdit {
-                border: 1px solid #dcdcdc;
-                border-radius: 6px;
-                background-color: white;
-                padding: 8px;
-            }
-            QProgressBar {
-                border: none;
-                border-radius: 6px;
-                background-color: #f0f0f0;
-                text-align: center;
-                min-height: 12px;
-            }
-            QProgressBar::chunk {
-                border-radius: 6px;
-                background-color: #2196F3;
-            }
-            QCheckBox {
-                padding: 5px;
-            }
-            QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
-                border-radius: 4px;
-                border: 2px solid #dcdcdc;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #2196F3;
-                border-color: #2196F3;
-            }
-        """)
     
     def _center_window(self):
         """窗口居中"""
@@ -636,44 +525,32 @@ class RenameToolGUI(QMainWindow):
         """创建界面组件"""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(15)
+        layout = QVBoxLayout(central_widget)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
 
-        # 路径选择区域
-        main_layout.addWidget(self._create_path_container())
-        
-        # 选项区域
-        main_layout.addWidget(self._create_options_container())
+        # 添加各个组件
+        layout.addWidget(self._create_path_container())
+        layout.addWidget(self._create_options_container())
         
         # 映射文件路径显示
         self.mapping_label = QLabel()
-        self.mapping_label.setStyleSheet("""
-            color: #2196F3;
-            background-color: white;
-            padding: 10px;
-            border-radius: 8px;
-        """)
-        main_layout.addWidget(self.mapping_label)
+        self.mapping_label.setStyleSheet(f"color: #2196F3; {Config.CONTAINER_STYLE}")
+        layout.addWidget(self.mapping_label)
         
-        # 日志区域
-        main_layout.addWidget(self._create_log_container(), stretch=1)
-        
-        # 底部区域
-        main_layout.addWidget(self._create_bottom_container())
+        layout.addWidget(self._create_log_container(), stretch=1)
+        layout.addWidget(self._create_bottom_container())
+    
+    def _create_container(self, name: str) -> QWidget:
+        """创建通用容器"""
+        container = QWidget()
+        container.setObjectName(name)
+        container.setStyleSheet(f"QWidget#{name} {{ {Config.CONTAINER_STYLE} }}")
+        return container
     
     def _create_path_container(self):
         """创建路径选择容器"""
-        container = QWidget()
-        container.setObjectName("pathContainer")
-        container.setStyleSheet("""
-            QWidget#pathContainer {
-                background-color: white;
-                border-radius: 8px;
-                padding: 10px;
-            }
-        """)
-        
+        container = self._create_container("pathContainer")
         layout = QHBoxLayout(container)
         layout.setContentsMargins(10, 10, 10, 10)
         
@@ -691,21 +568,13 @@ class RenameToolGUI(QMainWindow):
     
     def _create_options_container(self):
         """创建选项容器"""
-        container = QWidget()
-        container.setObjectName("optionsContainer")
-        container.setStyleSheet("""
-            QWidget#optionsContainer {
-                background-color: white;
-                border-radius: 8px;
-                padding: 10px;
-            }
-        """)
-        
+        container = self._create_container("optionsContainer")
         layout = QVBoxLayout(container)
         
         # 重命名文件夹选项
         first_row = QHBoxLayout()
         self.rename_folders_cb = QCheckBox("同时重命名文件夹")
+        self.rename_folders_cb.setChecked(True)  # 默认选中
         first_row.addWidget(self.rename_folders_cb)
         first_row.addStretch()
         layout.addLayout(first_row)
@@ -716,7 +585,7 @@ class RenameToolGUI(QMainWindow):
         
         self.folder_format_entry = QLineEdit()
         self.folder_format_entry.setText(Config.DEFAULT_FOLDER_FORMAT)
-        self.folder_format_entry.setPlaceholderText("例如: number smart_actor 或 smart_actor title rating")
+        self.folder_format_entry.setPlaceholderText("例如: number smart_actor 或 filename smart_actor")
         format_row.addWidget(self.folder_format_entry)
         
         help_btn = QPushButton("说明")
@@ -730,16 +599,7 @@ class RenameToolGUI(QMainWindow):
     
     def _create_log_container(self):
         """创建日志容器"""
-        container = QWidget()
-        container.setObjectName("logContainer")
-        container.setStyleSheet("""
-            QWidget#logContainer {
-                background-color: white;
-                border-radius: 8px;
-                padding: 10px;
-            }
-        """)
-        
+        container = self._create_container("logContainer")
         layout = QVBoxLayout(container)
         layout.setContentsMargins(10, 10, 10, 10)
         
@@ -751,16 +611,7 @@ class RenameToolGUI(QMainWindow):
     
     def _create_bottom_container(self):
         """创建底部容器"""
-        container = QWidget()
-        container.setObjectName("bottomContainer")
-        container.setStyleSheet("""
-            QWidget#bottomContainer {
-                background-color: white;
-                border-radius: 8px;
-                padding: 10px;
-            }
-        """)
-        
+        container = self._create_container("bottomContainer")
         layout = QVBoxLayout(container)
         layout.setContentsMargins(10, 10, 10, 10)
         
@@ -774,20 +625,7 @@ class RenameToolGUI(QMainWindow):
         # 执行按钮
         execute_btn = QPushButton("执行")
         execute_btn.setMinimumHeight(45)
-        execute_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2196F3;
-                color: white;
-                font-size: 14px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-            QPushButton:pressed {
-                background-color: #0D47A1;
-            }
-        """)
+        execute_btn.setStyleSheet(Config.PRIMARY_BUTTON_STYLE)
         execute_btn.clicked.connect(self.execute_rename)
         layout.addWidget(execute_btn)
         
@@ -796,60 +634,44 @@ class RenameToolGUI(QMainWindow):
     def show_field_help(self):
         """显示字段帮助"""
         help_text = """
-        支持的字段名称：
+支持的字段名称：
 
-        基础字段：
-        • title - 标题
-        • originaltitle - 原标题  
-        • number - 番号
-        • letters - 番号前缀
-        • first_letter - 首位字母
-        • filename - nfo文件名
+基础字段：
+• title - 标题
+• number - 番号
+• filename - nfo文件名（不含扩展名）
 
-        演员相关：
-        • actor - 女演员（多个用逗号分隔）
-        • all_actor - 所有演员
-        • first_actor - 首位演员（已映射）
-        • smart_actor - 智能演员显示（推荐使用）
-        ├─ 1个演员：直接显示演员名
-        ├─ 2个演员：演员1,演员2
-        └─ 3个及以上：演员1等演员
-        • actor_count - 演员数量
+演员相关：
+• actor - 所有演员（多个用逗号分隔）
+• smart_actor - 智能演员显示（推荐使用）
+├─ 1个演员：直接显示演员名
+├─ 2个演员：演员1,演员2
+├─ 3个演员：演员1,演员2,演员3
+└─ 3个以上：演员1,演员2,演员3等演员
 
-        制作信息：
-        • director - 导演
-        • series - 系列
-        • studio - 片商
-        • publisher - 发行商
-        • release - 发行日期
-        • year - 年份
+制作信息：
+• director - 导演
+• series - 系列
+• studio - 片商
+• publisher - 发行商
+• year - 年份
 
-        技术信息：
-        • runtime - 时长
-        • rating - 评分
-        • score - 评分（同rating）
-        • mosaic - 有码/无码
-        • definition - 分辨率
-        • 4k - 4K标识
+技术信息：
+• runtime - 时长
+• rating - 评分
+• mosaic - 有码/无码
+• definition - 分辨率
+• 4k - 4K标识
 
-        其他：
-        • wanted - 想看人数
-        • outline - 剧情简介
+使用示例：
+• "number smart_actor" → "PRED-001 桥本有菜"
+• "filename smart_actor" → "PRED-001 桥本有菜"（使用NFO文件名）
+• "smart_actor title rating" → "桥本有菜等演员 完全主观 9.2"
 
-        使用示例：
-        • "number smart_actor" → "PRED-001 桥本有菜"
-        • "smart_actor title rating" → "桥本有菜等演员 完全主观 9.2"
-        • "studio number smart_actor" → "Premium PRED-001 桥本有菜等演员"
-
-        推荐格式：
-        • 单演员：number smart_actor
-        • 多演员：number smart_actor（会自动显示为"主演等演员"）
-
-        注意：
-        • smart_actor字段会根据演员数量智能调整显示方式
-        • 所有演员名都会自动应用映射关系
-        • 字段之间用空格分隔，程序会自动替换为对应的值
-                """
+注意：
+• smart_actor字段会根据演员数量智能调整显示方式
+• 所有演员名都会自动应用映射关系
+        """
                 
         QMessageBox.information(self, "字段说明", help_text)
     
@@ -898,17 +720,14 @@ class RenameToolGUI(QMainWindow):
             self.progress_bar.setValue(0)
             self.log_text.append("开始处理...")
             
-            folder_format = self.folder_format_entry.text().strip()
-            if not folder_format:
-                folder_format = Config.DEFAULT_FOLDER_FORMAT
+            folder_format = self.folder_format_entry.text().strip() or Config.DEFAULT_FOLDER_FORMAT
             
             self.worker = RenameWorker(
-                directory,
-                self.actor_mapping,
-                self.rename_folders_cb.isChecked(),
-                folder_format
+                directory, self.actor_mapping,
+                self.rename_folders_cb.isChecked(), folder_format
             )
             
+            # 连接信号
             self.worker.progressUpdated.connect(self.update_progress)
             self.worker.logUpdated.connect(self.update_log)
             self.worker.finished.connect(self.on_worker_finished)
@@ -939,7 +758,7 @@ class RenameToolGUI(QMainWindow):
     
     def on_worker_finished(self):
         """工作线程完成"""
-        self.log_text.append("\n处理完成！")
+        self.log_text.append("\n所有处理完成！")
         self.progress_bar.setFormat("完成")
     
     def handle_error(self, error_message: str):

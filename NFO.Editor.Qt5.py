@@ -2293,9 +2293,7 @@ class NFOEditorQt5(NFOEditorQt):
                     break
 
             # 获取NFO文件的基础名称
-            nfo_base_name = os.path.splitext(os.path.basename(self.current_file_path))[
-                0
-            ]
+            nfo_base_name = os.path.splitext(os.path.basename(self.current_file_path))[0]
 
             # 创建裁剪工具窗口
             crop_tool = EmbyPosterCrop(nfo_base_name=nfo_base_name)
@@ -2303,13 +2301,8 @@ class NFOEditorQt5(NFOEditorQt):
             # 加载图片
             crop_tool.load_initial_image(image_path)
 
-            # 设置水印选项
-            if has_subtitle:
-                crop_tool.sub_check.setChecked(True)
-            for button in crop_tool.mark_group.buttons():
-                if button.property("value") == mark_type:
-                    button.setChecked(True)
-                    break
+            # 设置水印选项 - 使用新的封装方法
+            crop_tool.set_watermark_options(has_subtitle, mark_type)
 
             # 运行窗口并等待其完成
             crop_tool.exec_()
