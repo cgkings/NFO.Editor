@@ -9,18 +9,14 @@ from datetime import datetime
 from PIL import Image
 from PyQt5.QtWidgets import (
     QApplication,
-    # QButtonGroup,
-    # QComboBox,
     QFrame,
     QLabel,
     QLineEdit,
-    # QMainWindow,
     QFileDialog,
     QMenu,
     QMessageBox,
     QProgressDialog,
     QPushButton,
-    # QRadioButton,
     QShortcut,
     QTextEdit,
     QTreeWidget,
@@ -358,7 +354,9 @@ class FileOperationThread(QThread):
 
                 try:
                     folder_name = os.path.basename(src_path)
-                    dest_folder_path = os.path.join(dest_path, folder_name)
+                    if dest_path is None or folder_name is None:
+                        raise Exception("目标路径或文件夹名称无效")
+                    dest_folder_path = os.path.join(str(dest_path), str(folder_name))
 
                     # 检查目标路径
                     if not os.path.exists(dest_path):
@@ -440,7 +438,7 @@ class SearchEngine:
                     for item in items:
                         strong_tag = item.find('strong')
                         if strong_tag and strong_tag.text.strip().upper() == num_text.upper():
-                            link_tag = item.find('a', class_='box')
+                            link_tag = item.find('a', class_='box') # type: ignore
                             if link_tag and link_tag.get('href'):
                                 detail_url = f"https://javdb.com{link_tag['href']}"
                                 print(f"JavDB: 找到详情页 {detail_url}")
@@ -470,7 +468,7 @@ class SearchEngine:
                     video_links = videos_section.find_all('a', class_='video-link')
                     
                     for link in video_links:
-                        title_element = link.find('p', class_='vid-title')
+                        title_element = link.find('p', class_='vid-title') # type: ignore
                         if title_element:
                             title_text = title_element.text.strip()
                             if title_text.upper().startswith(num_text.upper() + ' '):
@@ -508,26 +506,23 @@ class NFOEditorQt5(NFOEditorQt):
     def __init__(self):
         super().__init__()
         # 设置合理的窗口大小和限制
-        self.setMinimumSize(953, 782)  # 设置最小尺寸
-        self.resize(1280, 900)  # 设置初始大小
+        # self.setMinimumSize(953, 782)  # 设置最小尺寸
+        # self.resize(1280, 900)  # 设置初始大小
 
         # 成员变量初始化
-        self.current_file_path = None
-        self.folder_path = None
-        self.current_target_path = None
+        # self.current_file_path = None
+        # self.folder_path = None
+        # self.current_target_path = None
         self.nfo_files = []
         self.selected_index_cache = None
         self.move_thread = None
         self.file_watcher = QFileSystemWatcher()
 
-        # 添加配置和搜索管理器
+        # 添加配置
         self.config_manager = ConfigManager()
         
-        # 添加搜索网站管理器（新增）
+        # 添加搜索网站管理器
         self.search_site_manager = SearchSiteManager()
-
-        # 添加配置和搜索管理器
-        self.config_manager = ConfigManager()
 
         # 默认勾选显示图片选项
         self.show_images_checkbox.setChecked(True)
@@ -771,6 +766,7 @@ class NFOEditorQt5(NFOEditorQt):
         """打开设置对话框"""
         try:
             dialog = SettingsDialog(self)
+            dialog.setAttribute(Qt.WA_DeleteOnClose)
             dialog.exec_()
         except Exception as e:
             QMessageBox.critical(self, "错误", f"打开设置失败: {str(e)}")
@@ -1805,6 +1801,7 @@ class NFOEditorQt5(NFOEditorQt):
         )
 
         dialog = QDialog(self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
         dialog.setWindowTitle("批量填充")
         dialog.resize(400, 600)
 
@@ -2017,6 +2014,7 @@ class NFOEditorQt5(NFOEditorQt):
         )
 
         dialog = QDialog(self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
         dialog.setWindowTitle("批量新增标签")
         dialog.resize(400, 500)
 
@@ -2447,6 +2445,7 @@ class NFOEditorQt5(NFOEditorQt):
 
             # 创建照片墙对话框实例
             dialog = PhotoWallDialog(self.folder_path, self)
+            dialog.setAttribute(Qt.WA_DeleteOnClose)
             dialog.show()  # 非模态显示
 
         except Exception as e:
@@ -2619,6 +2618,29 @@ class NFOEditorQt5(NFOEditorQt):
         if hasattr(self, 'copy_num_button'):
             self.copy_num_button.setText("📋")
             self.copy_num_button.setToolTip("复制番号")
+
+    def closeEvent(self, event):
+        """程序关闭时的基础清理"""
+        try:
+            # 停止文件监控
+            if hasattr(self, 'file_watcher'):
+                directories = self.file_watcher.directories()
+                files = self.file_watcher.files()
+                if directories:
+                    self.file_watcher.removePaths(directories)
+                if files:
+                    self.file_watcher.removePaths(files)
+            
+            # 简单的线程清理
+            if hasattr(self, 'move_thread') and self.move_thread and self.move_thread.isRunning():
+                self.move_thread.terminate()  # 简单但有效
+                self.move_thread.wait(1000)   # 等待1秒
+            
+        except Exception as e:
+            print(f"清理资源时出错: {e}")
+        
+        event.accept()
+
 
 def main():
     # 在创建 QApplication 之前设置高DPI属性

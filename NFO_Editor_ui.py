@@ -10,20 +10,14 @@ from PyQt5.QtWidgets import (
     QLabel,
     QFrame,
     QTreeWidget,
-    # QTreeWidgetItem,
     QRadioButton,
     QButtonGroup,
     QComboBox,
     QLineEdit,
-    # QScrollArea,
     QTextEdit,
     QCheckBox,
     QGridLayout,
     QSizePolicy,
-    # QLayout,
-    # QDialog,
-    # QGroupBox,
-    # QMessageBox,
 )
 from PyQt5.QtCore import Qt, QSize, QSettings
 from PyQt5.QtGui import QIcon, QCursor, QPixmap, QFont
@@ -48,7 +42,7 @@ class NFOEditorQt(QMainWindow):
         self.screen_dpi = self.screen().logicalDotsPerInch()
         self.scale_factor = self.screen_dpi / 96.0
 
-        self.setWindowTitle("大锤 NFO Editor Qt v9.6.7")
+        self.setWindowTitle("大锤 NFO Editor Qt v9.6.8")
         self.resize(1280, 800)
 
         # 初始化状态栏
