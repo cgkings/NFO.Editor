@@ -490,6 +490,19 @@ class SearchEngine:
             print(f"JavTrailers搜索失败: {str(e)}")
             return None
 
+class SearchSiteManager:
+    """搜索网站管理器"""
+    
+    def handle_custom_site(self, url_template, num_text):
+        """处理自定义网站搜索"""
+        try:
+            # 替换URL模板中的{number}占位符
+            search_url = url_template.replace('{number}', num_text)
+            webbrowser.open(search_url)
+            return True
+        except Exception as e:
+            print(f"打开自定义网站失败: {str(e)}")
+            return False
 
 class NFOEditorQt5(NFOEditorQt):
     def __init__(self):
@@ -506,6 +519,12 @@ class NFOEditorQt5(NFOEditorQt):
         self.selected_index_cache = None
         self.move_thread = None
         self.file_watcher = QFileSystemWatcher()
+
+        # 添加配置和搜索管理器
+        self.config_manager = ConfigManager()
+        
+        # 添加搜索网站管理器（新增）
+        self.search_site_manager = SearchSiteManager()
 
         # 添加配置和搜索管理器
         self.config_manager = ConfigManager()
@@ -1023,7 +1042,7 @@ class NFOEditorQt5(NFOEditorQt):
                 if immediate_sites:
                     print(f"已立即打开: {', '.join(immediate_sites)} 搜索页面")
                 
-                # 处理自定义网站
+                # 处理自定义网站（修复）
                 for custom_site in custom_sites:
                     if (custom_site.get('enabled', False) and 
                         custom_site.get('name') and 
@@ -2381,6 +2400,17 @@ class NFOEditorQt5(NFOEditorQt):
             video_action = menu.addAction("播放视频")
             video_action.triggered.connect(self.open_selected_video)
 
+            # 新增：批量搜索选项
+            menu.addSeparator()
+            if len(self.file_tree.selectedItems()) > 1:
+                batch_search_action = menu.addAction(f"批量搜索番号 ({len(self.file_tree.selectedItems())}个)")
+                batch_search_action.triggered.connect(self.batch_search_numbers)
+            else:
+                search_action = menu.addAction("搜索番号")
+                search_action.triggered.connect(lambda: self.open_number_search(
+                    type('Event', (), {'button': lambda: Qt.LeftButton})()
+                ))
+
             # 将删除操作添加到上下文菜单
             menu.addSeparator()
             delete_action = menu.addAction("删除文件夹")
@@ -2466,6 +2496,97 @@ class NFOEditorQt5(NFOEditorQt):
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"选择文件夹失败: {str(e)}")
+
+    def batch_search_numbers(self):
+        """批量搜索选中NFO文件的番号"""
+        selected_items = self.file_tree.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "警告", "请先选择要搜索的NFO文件")
+            return
+        
+        # 收集所有番号
+        numbers = []
+        for item in selected_items:
+            try:
+                values = [item.text(i) for i in range(3)]
+                if values[2]:  # 如果有NFO文件名
+                    nfo_path = (
+                        os.path.join(self.folder_path, values[0], values[1], values[2])
+                        if values[1]
+                        else os.path.join(self.folder_path, values[0], values[2])
+                    )
+                    
+                    if os.path.exists(nfo_path):
+                        tree = ET.parse(nfo_path)
+                        root = tree.getroot()
+                        num_elem = root.find("num")
+                        if num_elem is not None and num_elem.text:
+                            numbers.append(num_elem.text.strip())
+            except Exception as e:
+                print(f"处理NFO文件失败: {str(e)}")
+                continue
+        
+        if not numbers:
+            QMessageBox.warning(self, "警告", "选中的NFO文件中没有找到有效的番号")
+            return
+        
+        # 复制所有番号到剪贴板（用逗号分隔）
+        clipboard = QApplication.clipboard()
+        clipboard.setText(", ".join(numbers))
+        
+        try:
+            config = self.config_manager.load_config()
+            predefined_sites = config.get('search_sites', {}).get('predefined_sites', {})
+            custom_sites = config.get('search_sites', {}).get('custom_sites', [])
+            
+            total_opened = 0
+            
+            # 为每个番号处理预设网站
+            for num_text in numbers:
+                if predefined_sites.get('supjav', False):
+                    webbrowser.open(f"https://supjav.com/zh/?s={num_text}")
+                    total_opened += 1
+                    
+                if predefined_sites.get('subtitlecat', False):
+                    webbrowser.open(f"https://www.subtitlecat.com/index.php?search={num_text}")
+                    total_opened += 1
+                
+                # 处理自定义网站
+                for custom_site in custom_sites:
+                    if (custom_site.get('enabled', False) and 
+                        custom_site.get('name') and 
+                        custom_site.get('url_template')):
+                        try:
+                            if self.search_site_manager.handle_custom_site(
+                                custom_site['url_template'], num_text):
+                                total_opened += 1
+                        except Exception as e:
+                            print(f"打开自定义网站 {custom_site['name']} 时出错: {e}")
+            
+            # 处理JavDB（在线程中异步处理，避免阻塞）
+            if predefined_sites.get('javdb', False):
+                def search_javdb_batch():
+                    search_engine = SearchEngine()
+                    for num_text in numbers:
+                        try:
+                            detail_url = search_engine.search_javdb(num_text)
+                            if detail_url:
+                                webbrowser.open(detail_url)
+                            else:
+                                search_url = f"https://javdb.com/search?q={num_text}&f=all"
+                                webbrowser.open(search_url)
+                        except Exception as e:
+                            print(f"JavDB批量搜索 {num_text} 失败: {str(e)}")
+                
+                threading.Thread(target=search_javdb_batch, daemon=True).start()
+            
+            # 显示状态信息
+            self.status_bar.showMessage(
+                f"已复制 {len(numbers)} 个番号到剪贴板，共打开 {total_opened} 个搜索页面", 5000
+            )
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"批量搜索失败: {str(e)}")
 
     def copy_number_to_clipboard(self):
         """复制番号到剪贴板"""
