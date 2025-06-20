@@ -634,6 +634,20 @@ class NFOEditorQt5(NFOEditorQt):
                 rating_widget, event
             )
 
+        # 为所有文本框设置小键盘Enter作为保存快捷键
+        for field_name, widget in self.fields_entries.items():
+            if isinstance(widget, QTextEdit):
+                # 直接重写keyPressEvent方法
+                original_keyPressEvent = widget.keyPressEvent
+                def make_keyPressEvent(original_func):
+                    def new_keyPressEvent(event):
+                        if event.key() == Qt.Key_Enter:  # 小键盘Enter直接保存
+                            self.save_changes()
+                            return
+                        original_func(event)
+                    return new_keyPressEvent
+                widget.keyPressEvent = make_keyPressEvent(original_keyPressEvent)
+
         # 连接保存按钮
         save_button = None
         for btn in self.findChildren(QPushButton):
@@ -690,7 +704,6 @@ class NFOEditorQt5(NFOEditorQt):
     def setup_shortcuts(self):
         """设置快捷键"""
         QShortcut(QKeySequence("F5"), self, self.load_files_in_folder)
-        QShortcut(QKeySequence("Ctrl+S"), self, self.save_changes)
         QShortcut(QKeySequence("Ctrl+Right"), self, self.start_move_thread)
 
     def keyPressEvent(self, event):
@@ -1494,9 +1507,9 @@ class NFOEditorQt5(NFOEditorQt):
                     elem.text.strip() if elem is not None and elem.text else ""
                 )
                 if current_value != original_value:
-                    print(f"字段 {field} 发生更改:")
-                    print(f"原值: '{original_value}'")
-                    print(f"新值: '{current_value}'")
+                    # print(f"字段 {field} 发生更改:")
+                    # print(f"原值: '{original_value}'")
+                    # print(f"新值: '{current_value}'")
                     return True
 
             # 检查演员列表
@@ -1600,17 +1613,23 @@ class NFOEditorQt5(NFOEditorQt):
             self.thumb_label.setText("文件夹内无thumb图片")
 
     def load_image(self, image_path, label):
-        """加载图片到label"""
+        """加载图片到label，始终填充整个label"""
         try:
             pixmap = QPixmap(image_path)
             if pixmap.isNull():
                 label.setText("加载图片失败")
                 return
 
-            # 根据label大小调整图片
+            # 获取label的固定大小
+            label_size = label.size()
+            
+            # 缩放图片填充整个label
             scaled_pixmap = pixmap.scaled(
-                label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                label_size, 
+                Qt.KeepAspectRatio, 
+                Qt.SmoothTransformation
             )
+            
             label.setPixmap(scaled_pixmap)
 
         except Exception as e:

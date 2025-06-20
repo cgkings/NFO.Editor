@@ -42,7 +42,7 @@ class NFOEditorQt(QMainWindow):
         self.screen_dpi = self.screen().logicalDotsPerInch()
         self.scale_factor = self.screen_dpi / 96.0
 
-        self.setWindowTitle("大锤 NFO Editor Qt v9.6.8")
+        self.setWindowTitle("大锤 NFO Editor Qt v9.6.9")
         self.resize(1280, 800)
 
         # 初始化状态栏
@@ -396,85 +396,81 @@ class NFOEditorQt(QMainWindow):
     def create_editor_panel(self):
         content = QWidget()
         grid = QGridLayout(content)
-        grid.setContentsMargins(
-            int(5 * self.scale_factor),
-            int(5 * self.scale_factor),
-            int(5 * self.scale_factor),
-            int(5 * self.scale_factor),
-        )
+        
+        # 简单的边距控制
+        left_margin = int(10 * self.scale_factor)
+        right_margin = int(20 * self.scale_factor)
+        
+        grid.setContentsMargins(left_margin, int(5 * self.scale_factor), right_margin, int(5 * self.scale_factor))
         grid.setSpacing(int(2 * self.scale_factor))
 
-        # Image preview section - 减小图片预览区域的高度
+        # 创建各区域
         image_frame = self.create_image_preview()
         grid.addWidget(image_frame, 0, 0)
 
-        # Fields section
         fields_frame = self.create_fields_section()
         grid.addWidget(fields_frame, 1, 0)
 
-        # Operations section
         operations_frame = self.create_operations_section()
         grid.addWidget(operations_frame, 2, 0)
 
-        # 设置垂直拉伸比例，让字段区域获得更多空间
-        grid.setRowStretch(0, 2)  # 图片预览区域
-        grid.setRowStretch(1, 4)  # 字段区域
-        grid.setRowStretch(2, 1)  # 操作按钮区域
+        # 简单的行拉伸
+        grid.setRowStretch(0, 2)
+        grid.setRowStretch(1, 4)
+        grid.setRowStretch(2, 1)
 
         return content
 
     def create_image_preview(self):
         frame = QFrame()
         grid = QGridLayout(frame)
-        grid.setContentsMargins(0, 0, 0, 0)  # 移除左边距
+        grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(int(2 * self.scale_factor))
 
-        # 保持与字段区域相同的标签宽度和对齐方式
+        # 图片标签 - 固定宽度
         image_label = QLabel("图片:")
         image_label.setFixedWidth(int(50 * self.scale_factor))
         image_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         grid.addWidget(image_label, 0, 0)
 
-        # 创建水平布局来容纳两个图片框
+        # 图片容器
         image_container = QWidget()
         image_layout = QHBoxLayout(image_container)
-        image_layout.setContentsMargins(
-            int(2 * self.scale_factor), 0, 0, 0
-        )  # 添加小边距使其与文本框对齐
+        image_layout.setContentsMargins(int(2 * self.scale_factor), 0, 0, 0)
         image_layout.setSpacing(int(10 * self.scale_factor))
 
-        # Poster frame
+        # 计算初始尺寸
+        sizes = self.calculate_dynamic_sizes()
+
+        # Poster frame - 固定大小确保稳定性
         poster_frame = QFrame()
-        poster_size = QSize(int(180 * self.scale_factor), int(270 * self.scale_factor))
-        poster_frame.setFixedSize(poster_size)
+        poster_frame.setFixedSize(sizes['poster_width'], sizes['poster_height'])
         poster_frame.setStyleSheet("border: 1px solid #A0A0A0")
         poster_layout = QGridLayout(poster_frame)
         poster_layout.setContentsMargins(0, 0, 0, 0)
 
         self.poster_label = QLabel("封面图 (poster)")
         self.poster_label.setAlignment(Qt.AlignCenter)
-        self.poster_label.setFixedSize(poster_size)
+        self.poster_label.setFixedSize(sizes['poster_width'], sizes['poster_height'])
         poster_layout.addWidget(self.poster_label, 0, 0)
 
-        # Thumb frame
+        # Thumb frame - 固定大小确保稳定性
         thumb_frame = QFrame()
-        thumb_size = QSize(int(402 * self.scale_factor), int(270 * self.scale_factor))
-        thumb_frame.setFixedSize(thumb_size)
+        thumb_frame.setFixedSize(sizes['thumb_width'], sizes['thumb_height'])
         thumb_frame.setStyleSheet("border: 1px solid #A0A0A0")
         thumb_layout = QGridLayout(thumb_frame)
         thumb_layout.setContentsMargins(0, 0, 0, 0)
 
         self.thumb_label = QLabel("缩略图 (thumb)")
         self.thumb_label.setAlignment(Qt.AlignCenter)
-        self.thumb_label.setFixedSize(thumb_size)
+        self.thumb_label.setFixedSize(sizes['thumb_width'], sizes['thumb_height'])
         thumb_layout.addWidget(self.thumb_label, 0, 0)
 
-        # 将两个图片框添加到水平布局中
+        # 添加到布局
         image_layout.addWidget(poster_frame)
         image_layout.addWidget(thumb_frame)
         image_layout.addStretch()
 
-        # 将水平布局容器添加到主网格
         grid.addWidget(image_container, 0, 1)
 
         self.poster_label.mousePressEvent = lambda e: self.open_image_and_crop("fanart")
@@ -498,8 +494,8 @@ class NFOEditorQt(QMainWindow):
             "rating": ("评分", 1.5),
         }
 
-        # 设置文本框宽度
-        text_width = int(590 * self.scale_factor)
+        # 获取动态尺寸
+        sizes = self.calculate_dynamic_sizes()
 
         for field, (label_text, height) in fields.items():
             field_frame = QFrame()
@@ -507,7 +503,7 @@ class NFOEditorQt(QMainWindow):
             field_layout.setContentsMargins(0, 0, 0, 0)
             field_layout.setSpacing(int(5 * self.scale_factor))
 
-            # 标签
+            # 标签 - 固定宽度保持对齐
             label = QLabel(f"{label_text}:")
             label.setFixedWidth(int(50 * self.scale_factor))
             label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -525,15 +521,16 @@ class NFOEditorQt(QMainWindow):
                 entry = QLabel()
                 entry.setCursor(Qt.PointingHandCursor)
                 entry.setStyleSheet("color: blue; text-decoration: underline;")
-                entry.setFixedWidth(int(text_width * 0.6))
+                entry.setMinimumWidth(int(sizes['text_width'] * 0.6))
+                entry.setMaximumWidth(int(sizes['text_max_width'] * 0.6))
                 num_layout.addWidget(entry)
                 
-                # 添加复制按钮
+                # 按钮固定尺寸
                 self.copy_num_button = QPushButton("📋")
                 self.copy_num_button.setFixedSize(int(30 * self.scale_factor), int(30 * self.scale_factor))
                 self.copy_num_button.setToolTip("复制番号")
                 num_layout.addWidget(self.copy_num_button)
-                # 添加播放预告片按钮 - 新增代码
+                
                 self.play_trailer_button = QPushButton("🎬")
                 self.play_trailer_button.setFixedSize(int(30 * self.scale_factor), int(30 * self.scale_factor))
                 self.play_trailer_button.setToolTip("播放预告片")
@@ -558,12 +555,12 @@ class NFOEditorQt(QMainWindow):
             else:
                 entry = QTextEdit()
                 entry.setFixedHeight(int(22 * self.scale_factor * height))
-                entry.setFixedWidth(text_width)
+                entry.setMinimumWidth(sizes['text_width'])
+                entry.setMaximumWidth(sizes['text_max_width'])
                 entry.setTabChangesFocus(True)
                 field_layout.addWidget(entry)
                 self.fields_entries[field] = entry
 
-            # 使用整数值的stretch
             field_layout.addStretch(1)
             layout.addWidget(field_frame)
 
@@ -602,6 +599,64 @@ class NFOEditorQt(QMainWindow):
 
         return frame
 
+    def calculate_dynamic_sizes(self):
+        """根据窗口大小计算动态尺寸"""
+        # 获取编辑区域的可用宽度
+        available_width = self.width() - 600  # 减去左侧文件树和目标树的大概宽度
+        available_height = self.height() - 200  # 减去顶部按钮和底部操作区域
+        
+        # 计算缩放比例
+        base_width = 800  # 基础宽度
+        base_height = 600  # 基础高度
+        
+        width_scale = max(1.0, available_width / base_width)
+        height_scale = max(1.0, available_height / base_height)
+        
+        # 使用较小的缩放比例，保持比例协调
+        scale = min(width_scale, height_scale)
+        
+        return {
+            'poster_width': int(180 * self.scale_factor * scale),
+            'poster_height': int(270 * self.scale_factor * scale),
+            'thumb_width': int(402 * self.scale_factor * scale),
+            'thumb_height': int(270 * self.scale_factor * scale),
+            'text_width': int(590 * self.scale_factor * scale),
+            'text_max_width': int(800 * self.scale_factor * scale)
+        }
+
+    def resizeEvent(self, event):
+        """窗口大小改变时重新调整布局"""
+        super().resizeEvent(event)
+        if hasattr(self, 'poster_label') and hasattr(self, 'thumb_label'):
+            self.update_layout_sizes()
+
+    def update_layout_sizes(self):
+        """更新布局尺寸"""
+        sizes = self.calculate_dynamic_sizes()
+        
+        # 更新图片框大小
+        if hasattr(self, 'poster_label'):
+            poster_frame = self.poster_label.parent()
+            poster_frame.setFixedSize(sizes['poster_width'], sizes['poster_height'])
+            self.poster_label.setFixedSize(sizes['poster_width'], sizes['poster_height'])
+        
+        if hasattr(self, 'thumb_label'):
+            thumb_frame = self.thumb_label.parent()
+            thumb_frame.setFixedSize(sizes['thumb_width'], sizes['thumb_height'])
+            self.thumb_label.setFixedSize(sizes['thumb_width'], sizes['thumb_height'])
+        
+        # 更新文本框大小
+        for field, widget in self.fields_entries.items():
+            if field != "num":
+                widget.setMinimumWidth(sizes['text_width'])
+                widget.setMaximumWidth(sizes['text_max_width'])
+            else:
+                widget.setMinimumWidth(int(sizes['text_width'] * 0.6))
+                widget.setMaximumWidth(int(sizes['text_max_width'] * 0.6))
+
+        # 自动刷新当前显示的图片
+        if self.show_images_checkbox.isChecked() and self.current_file_path:
+            self.display_image()
 
 if __name__ == "__main__":
     # 设置高DPI支持
