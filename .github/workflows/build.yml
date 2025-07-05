@@ -182,7 +182,7 @@ jobs:
           "cg_dedupe.exe",
           "cg_photo_wall.exe",
           "mapping_actor.xml",
-          "series_mapping.xml",
+          "series_mapping.xml"
         )
         
         foreach ($file in $requiredFiles) {
