@@ -171,6 +171,7 @@ jobs:
         # 移动额外资源文件
         Copy-Item -Path "Img" -Destination "dist/NFOTools/" -Recurse -Force
         Copy-Item -Path "mapping_actor.xml" -Destination "dist/NFOTools/" -Force
+        Copy-Item -Path "series_mapping.xml" -Destination "dist/NFOTools/" -Force
 
     - name: 检查构建结果
       shell: pwsh
