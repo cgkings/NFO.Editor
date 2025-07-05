@@ -91,7 +91,6 @@ jobs:
           "--icon", "chuizi.ico",
           "--add-data", "*.ico;.",
           "--add-data", "mapping_actor.xml;.",
-          "--add-data", "series_mapping.xml;.",
           "--add-data", "Img;Img",
           "--hidden-import", "win32com.shell.shellcon",
           "--hidden-import", "win32wnet",
@@ -130,7 +129,6 @@ jobs:
           "--icon", "chuizi.ico",
           "--add-data", "chuizi.ico;.",
           "--add-data", "mapping_actor.xml;.",
-          "--add-data", "series_mapping.xml;.",
           "-y",
           "cg_rename.py"
         )
