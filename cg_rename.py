@@ -20,9 +20,9 @@ class Config:
     DEFAULT_FOLDER_FORMAT = "filename smart_actor"
     SUPPORTED_NFO_EXTENSIONS = ['.nfo']
     INVALID_FILENAME_CHARS = r'[\\/:*?"<>|]'
-    APP_VERSION = "v9.7.1"
+    APP_VERSION = "v9.7.2"
     WINDOW_MIN_SIZE = (900, 900)
-    # 新增日志配置
+    # 日志配置
     LOG_FOLDER = "log"
     LOG_DATE_FORMAT = "%Y%m%d_%H%M%S"
     LOG_FILE_FORMAT = "rename-{}.log"
@@ -75,6 +75,60 @@ class Config:
         QPushButton:pressed { background-color: #0D47A1; }
     """
 
+# 公共工具类
+class PathUtils:
+    """路径处理工具类"""
+    
+    @staticmethod
+    def get_application_paths() -> Tuple[Path, Path]:
+        """获取应用程序路径"""
+        if getattr(sys, "frozen", False):
+            exe_dir = Path(sys.executable).parent
+            base_path = Path(sys._MEIPASS)
+        else:
+            exe_dir = base_path = Path(__file__).parent
+        return exe_dir, base_path
+
+class XMLUtils:
+    """XML处理工具类"""
+    
+    @staticmethod
+    def find_first_valid_text(root: ET.Element, xpath_list: List[str]) -> str:
+        """从xpath列表中查找第一个有效的文本值"""
+        for xpath in xpath_list:
+            element = root.find(xpath)
+            if element is not None and element.text:
+                return element.text.strip()
+        return ""
+    
+    @staticmethod
+    def insert_element_before_reference(root: ET.Element, new_element: ET.Element, 
+                                      reference_tags: List[str]) -> bool:
+        """
+        在参考标签前插入元素 - 简化策略
+        
+        Args:
+            root: 根元素
+            new_element: 要插入的新元素
+            reference_tags: 参考标签列表（按优先级排序）
+        
+        Returns:
+            bool: 是否成功插入到指定位置
+        """
+        # 按优先级查找参考元素
+        for ref_tag in reference_tags:
+            ref_elements = root.findall(f'.//{ref_tag}')
+            if ref_elements:
+                # 找到第一个参考元素，在其前插入
+                first_ref = ref_elements[0]
+                insert_position = list(root).index(first_ref)
+                root.insert(insert_position, new_element)
+                return True
+        
+        # 没有找到任何参考元素，添加到末尾
+        root.append(new_element)
+        return False
+
 class LogManager:
     """日志管理器"""
     
@@ -87,14 +141,8 @@ class LogManager:
         """设置日志记录器"""
         try:
             # 确定日志目录
-            if getattr(sys, "frozen", False):
-                # 打包后的exe文件
-                base_dir = Path(sys.executable).parent
-            else:
-                # 开发环境
-                base_dir = Path(__file__).parent
-            
-            log_dir = base_dir / Config.LOG_FOLDER
+            exe_dir, base_path = PathUtils.get_application_paths()
+            log_dir = exe_dir / Config.LOG_FOLDER
             log_dir.mkdir(exist_ok=True)
             
             # 生成日志文件名
@@ -168,7 +216,7 @@ class LogManager:
 
 @dataclass
 class NFOFields:
-    """NFO文件字段数据类 - 精简版"""
+    """NFO文件字段数据类"""
     # 基础字段
     title: str = ""
     number: str = ""
@@ -192,11 +240,110 @@ class NFOFields:
     definition: str = ""
     four_k: str = ""
 
+# 映射加载器基类
+class BaseMappingLoader:
+    """映射加载器基类"""
+    
+    def __init__(self, filename: str, display_name: str):
+        self.filename = filename
+        self.display_name = display_name
+        self._mapping_cache = None
+        self._file_path_cache = None
+    
+    def find_mapping_file(self) -> Optional[str]:
+        """查找映射文件"""
+        if self._file_path_cache is not None:
+            return self._file_path_cache
+        
+        exe_dir, base_path = PathUtils.get_application_paths()
+        
+        # 优先查找外部配置文件
+        external_mapping = exe_dir / self.filename
+        if external_mapping.exists():
+            self._file_path_cache = str(external_mapping)
+            return self._file_path_cache
+        
+        # 查找内置配置文件
+        internal_mapping = base_path / self.filename
+        if internal_mapping.exists():
+            self._file_path_cache = str(internal_mapping)
+            return self._file_path_cache
+        
+        self._file_path_cache = None
+        return None
+    
+    def load_mapping(self, mapping_file: str = None) -> Dict[str, str]:
+        """从XML文件加载映射"""
+        if self._mapping_cache is not None and mapping_file is None:
+            return self._mapping_cache
+        
+        if mapping_file is None:
+            mapping_file = self.find_mapping_file()
+            if not mapping_file:
+                return {}
+        
+        try:
+            self._mapping_cache = self._parse_mapping_file(mapping_file)
+            return self._mapping_cache
+        except Exception as e:
+            raise Exception(f"加载{self.display_name}映射文件失败: {e}")
+    
+    def _parse_mapping_file(self, mapping_file: str) -> Dict[str, str]:
+        """解析映射文件 - 子类需要实现"""
+        raise NotImplementedError("子类需要实现此方法")
+    
+    def get_file_type(self) -> str:
+        """获取文件类型标识"""
+        file_path = self.find_mapping_file()
+        if not file_path:
+            return "未找到"
+        
+        exe_dir, _ = PathUtils.get_application_paths()
+        return "外部" if file_path.startswith(str(exe_dir)) and self.filename in file_path else "内置"
+
+class ActorMappingLoader(BaseMappingLoader):
+    """演员映射加载器"""
+    
+    def __init__(self):
+        super().__init__("mapping_actor.xml", "演员")
+    
+    def _parse_mapping_file(self, mapping_file: str) -> Dict[str, str]:
+        """解析演员映射文件"""
+        mapping = {}
+        context = ET.iterparse(mapping_file, events=("start",))
+        for event, elem in context:
+            if elem.tag == "a":
+                zh_cn = elem.get("zh_cn")
+                if zh_cn:
+                    keywords = elem.get("keyword", "").strip(",").split(",")
+                    for keyword in (k.strip() for k in keywords if k.strip()):
+                        mapping[keyword] = zh_cn
+            elem.clear()
+        return mapping
+
+class SeriesMappingLoader(BaseMappingLoader):
+    """系列映射加载器"""
+    
+    def __init__(self):
+        super().__init__("series_mapping.xml", "系列")
+    
+    def _parse_mapping_file(self, mapping_file: str) -> Dict[str, str]:
+        """解析系列映射文件"""
+        mapping = {}
+        context = ET.iterparse(mapping_file, events=("start",))
+        for event, elem in context:
+            if elem.tag == "map":
+                code = elem.get("code")
+                series = elem.get("series")
+                if code and series:
+                    mapping[code.strip()] = series.strip()
+            elem.clear()
+        return mapping
 
 class NFOParser:
-    """NFO文件解析器 - 精简版"""
+    """NFO文件解析器"""
     
-    # 精简的字段映射配置
+    # 字段映射配置
     FIELD_MAPPINGS = {
         'title': ['.//title'],
         'number': ['.//num', './/id', './/number'],
@@ -270,7 +417,7 @@ class NFOParser:
             fields.smart_actor = self._generate_smart_actor(actors)
     
     def _generate_smart_actor(self, actors: List[str]) -> str:
-        """生成智能演员显示 - 更加智能的逻辑"""
+        """生成智能演员显示"""
         count = len(actors)
         if count == 0:
             return ""
@@ -284,43 +431,32 @@ class NFOParser:
             return f"{actors[0]},{actors[1]},{actors[2]}等演员"
     
     def _find_first_valid_text(self, root: ET.Element, xpath_list: List[str]) -> str:
-        """从xpath列表中查找第一个有效的文本值"""
-        for xpath in xpath_list:
-            element = root.find(xpath)
-            if element is not None and element.text:
-                return element.text.strip()
-        return ""
-
+        """使用公共工具方法"""
+        return XMLUtils.find_first_valid_text(root, xpath_list)
 
 class NFOModifier:
-    """NFO文件修改器 - 规范化增强版"""
+    """NFO文件修改器"""
     
     def __init__(self, actor_mapping: Dict[str, str], series_mapping: Optional[Dict[str, str]] = None):
         self.actor_mapping = actor_mapping
         self.series_mapping = series_mapping or {}
         
-        # 标准字段顺序（符合NFO规范）
-        self.standard_field_order = [
-            'plot', 'outline', 'originalplot', 'tagline',
-            'premiered', 'releasedate', 'release', 
-            'num', 'title', 'originaltitle', 'sorttitle',
-            'mpaa', 'customrating', 'countrycode',
-            'actor', 'director', 'rating', 'criticrating', 'votes',
-            'year', 'runtime',
-            'set', 'series',  # series 放在 set 之后（关键修复）
-            'studio', 'maker', 'publisher', 'label',
-            'tag', 'genre',
-            'poster', 'cover', 'trailer', 'website', 'javdbid'
-        ]
+        # 简化的位置参考 - 定义关键的参考标签
+        self.position_references = {
+            'series': ['studio', 'maker', 'publisher', 'label', 'tag', 'genre'],  # series在studio前
+            'set': ['studio', 'maker', 'publisher', 'label', 'tag', 'genre'],     # set紧跟series
+            'tag': ['genre', 'poster', 'cover'],                                   # tag在genre前
+            'genre': ['poster', 'cover', 'trailer']                               # genre在poster前
+        }
     
     def modify_nfo_file(self, nfo_path: str) -> Tuple[bool, List[str], Dict[str, int], Dict[str, any]]:
-        """修改NFO文件中的演员名称和系列信息，并规范化结构"""
+        """修改NFO文件中的演员名称和系列信息"""
         try:
             tree = ET.parse(nfo_path)
             root = tree.getroot()
             
             stats = {'actor': 0, 'tag': 0, 'genre': 0, 'series': 0, 'set': 0}
-            detailed_logs = {}  # 存储详细修改信息
+            detailed_logs = {}
             modified = False
             all_actors = []
             
@@ -340,7 +476,7 @@ class NFOModifier:
                         stats[element_type] = count
                         detailed_logs[f'{element_type}_changes'] = changes
             
-            # 2. 处理系列信息（修复版）
+            # 2. 处理系列信息
             if self.series_mapping:
                 series_modified, series_stats, series_logs = self._modify_series_with_log(root)
                 if series_modified:
@@ -365,7 +501,7 @@ class NFOModifier:
     def _modify_elements_with_log(self, root: ET.Element, xpath: str, is_actor: bool) -> Tuple[bool, List[str], int, List[str]]:
         """修改元素并记录详细变化"""
         modified, actors, count = False, [], 0
-        changes = []  # 记录具体变化
+        changes = []
         
         for element in root.findall(xpath):
             if is_actor:
@@ -393,7 +529,7 @@ class NFOModifier:
         return modified, actors, count, changes
     
     def _modify_series_with_log(self, root: ET.Element) -> Tuple[bool, Dict[str, int], Dict[str, str]]:
-        """增强的系列修改功能 - 带详细日志"""
+        """修改系列信息"""
         stats = {'series': 0, 'set': 0, 'tag': 0, 'genre': 0}
         logs = {}
         modified = False
@@ -415,7 +551,7 @@ class NFOModifier:
             stats['series'] = 1
             logs['series_change'] = series_change
         
-        # 2. 修复 set 字段（规范结构）
+        # 2. 修复 set 字段
         set_change = self._update_set_field_with_log(root, expected_series)
         if set_change:
             modified = True
@@ -439,16 +575,21 @@ class NFOModifier:
         return modified, stats, logs
     
     def _update_series_field_with_log(self, root: ET.Element, expected_series: str) -> Optional[str]:
-        """更新 series 字段并记录变化"""
+        """更新 series 字段"""
         series_element = root.find('.//series')
         
         if series_element is None:
             # 创建新的 series 元素
             series_element = ET.Element('series')
             series_element.text = expected_series
-            # 先添加到末尾，稍后会通过规范化调整位置
-            root.append(series_element)
-            return f"空 → {expected_series}"
+            
+            # 简单策略：在studio前插入
+            positioned = XMLUtils.insert_element_before_reference(
+                root, series_element, self.position_references['series']
+            )
+            
+            position_info = "studio前" if positioned else "末尾"
+            return f"空 → {expected_series} ({position_info})"
         else:
             # 更新现有 series 元素
             current_series = series_element.text or ""
@@ -460,7 +601,7 @@ class NFOModifier:
         return None
     
     def _update_set_field_with_log(self, root: ET.Element, expected_series: str) -> Optional[str]:
-        """更新 set 字段（修复结构问题）并记录变化"""
+        """更新 set 字段"""
         set_element = root.find('.//set')
         
         if set_element is None:
@@ -468,14 +609,20 @@ class NFOModifier:
             set_element = ET.Element('set')
             name_element = ET.SubElement(set_element, 'name')
             name_element.text = expected_series
-            root.append(set_element)
-            return f"空 → {expected_series}"
+            
+            # 简单策略：在studio前插入（紧跟series）
+            positioned = XMLUtils.insert_element_before_reference(
+                root, set_element, self.position_references['set']
+            )
+            
+            position_info = "series后" if positioned else "末尾"
+            return f"空 → {expected_series} ({position_info})"
         else:
             # 修复现有 set 元素结构
             name_element = set_element.find('name')
             
             if name_element is None:
-                # 如果 set 直接包含文本，转换为规范结构
+                # 转换为规范结构
                 old_text = set_element.text or "空"
                 set_element.text = None
                 name_element = ET.SubElement(set_element, 'name')
@@ -492,7 +639,7 @@ class NFOModifier:
         return None
     
     def _update_series_in_tags_with_log(self, root: ET.Element, expected_series: str) -> Optional[str]:
-        """联动更新 tag 字段中的系列信息"""
+        """联动更新 tag 字段"""
         series_tag = f"系列: {expected_series}"
         
         # 查找现有的系列标签
@@ -504,14 +651,20 @@ class NFOModifier:
                     return f"{old_value} → {series_tag}"
                 return None
         
-        # 如果没有系列标签，创建新的
+        # 没有系列标签，创建新的
         new_tag = ET.Element('tag')
         new_tag.text = series_tag
-        root.append(new_tag)
-        return f"空 → {series_tag}"
+        
+        # 简单策略：在genre前插入
+        positioned = XMLUtils.insert_element_before_reference(
+            root, new_tag, self.position_references['tag']
+        )
+        
+        position_info = "genre前" if positioned else "末尾"
+        return f"空 → {series_tag} ({position_info})"
     
     def _update_series_in_genres_with_log(self, root: ET.Element, expected_series: str) -> Optional[str]:
-        """联动更新 genre 字段中的系列信息"""
+        """联动更新 genre 字段"""
         series_genre = f"系列: {expected_series}"
         
         # 查找现有的系列类型
@@ -523,14 +676,20 @@ class NFOModifier:
                     return f"{old_value} → {series_genre}"
                 return None
         
-        # 如果没有系列类型，创建新的
+        # 没有系列类型，创建新的
         new_genre = ET.Element('genre')
         new_genre.text = series_genre
-        root.append(new_genre)
-        return f"空 → {series_genre}"
+        
+        # 简单策略：在poster前插入
+        positioned = XMLUtils.insert_element_before_reference(
+            root, new_genre, self.position_references['genre']
+        )
+        
+        position_info = "poster前" if positioned else "末尾"
+        return f"空 → {series_genre} ({position_info})"
     
     def _normalize_nfo_structure_with_log(self, root: ET.Element) -> Tuple[bool, List[str]]:
-        """规范化NFO文件结构并记录变化"""
+        """规范化NFO文件结构"""
         logs = []
         modified = False
         
@@ -546,8 +705,8 @@ class NFOModifier:
             modified = True
             logs.extend(set_fixes)
         
-        # 3. 重新排序所有元素
-        reorder_result = self._reorder_elements_with_log(root)
+        # 3. 简单重排序 - 只移动明显错位的元素
+        reorder_result = self._simple_reorder_with_log(root)
         if reorder_result:
             modified = True
             logs.append(reorder_result)
@@ -555,88 +714,93 @@ class NFOModifier:
         return modified, logs
     
     def _fix_actor_elements_with_log(self, root: ET.Element) -> List[str]:
-        """修复 actor 元素结构并记录"""
+        """修复 actor 元素结构"""
         logs = []
-        count = 0
+        fixed_count = 0
         
         for actor in root.findall('.//actor'):
+            actor_fixed = False
+            
+            # 修复 name 子元素
             name_element = actor.find('name')
             if name_element is None and actor.text:
-                # 如果 actor 直接包含文本，转换为 name 子元素
                 name_element = ET.SubElement(actor, 'name')
                 name_element.text = actor.text.strip()
                 actor.text = None
-                count += 1
+                actor_fixed = True
             
             # 确保有 type 子元素
             type_element = actor.find('type')
             if type_element is None:
                 type_element = ET.SubElement(actor, 'type')
                 type_element.text = 'Actor'
+                actor_fixed = True
+            
+            if actor_fixed:
+                fixed_count += 1
         
-        if count > 0:
-            logs.append(f"修复actor元素结构: {count}个")
+        if fixed_count > 0:
+            logs.append(f"修复actor元素结构: {fixed_count}个")
         
         return logs
     
     def _fix_set_elements_with_log(self, root: ET.Element) -> List[str]:
-        """修复 set 元素结构并记录"""
+        """修复 set 元素结构"""
         logs = []
-        count = 0
+        fixed_count = 0
         
         for set_elem in root.findall('.//set'):
             name_element = set_elem.find('name')
             if name_element is None and set_elem.text:
-                # 如果 set 直接包含文本，转换为 name 子元素
-                name_element = ET.SubElement(set_elem, 'name')
-                name_element.text = set_elem.text.strip()
+                original_text = set_elem.text.strip()
                 set_elem.text = None
-                count += 1
+                name_element = ET.SubElement(set_elem, 'name')
+                name_element.text = original_text
+                fixed_count += 1
         
-        if count > 0:
-            logs.append(f"修复set元素结构: {count}个")
+        if fixed_count > 0:
+            logs.append(f"修复set元素结构: {fixed_count}个")
         
         return logs
     
-    def _reorder_elements_with_log(self, root: ET.Element) -> Optional[str]:
-        """按标准顺序重新排列元素并记录"""
-        original_order = [elem.tag for elem in root]
+    def _simple_reorder_with_log(self, root: ET.Element) -> Optional[str]:
+        """简单重排序 - 只处理明显错位的关键元素"""
+        moved_count = 0
         
-        # 按标准顺序重新排列元素
-        all_elements = list(root)
-        ordered_elements = []
-        remaining_elements = all_elements.copy()
+        # 确保series在studio前
+        series_elements = root.findall('.//series')
+        studio_elements = root.findall('.//studio')
         
-        # 按标准顺序添加元素
-        for field_name in self.standard_field_order:
-            matching_elements = [elem for elem in remaining_elements if elem.tag == field_name]
-            ordered_elements.extend(matching_elements)
-            for elem in matching_elements:
-                remaining_elements.remove(elem)
+        if series_elements and studio_elements:
+            series_pos = list(root).index(series_elements[0])
+            studio_pos = list(root).index(studio_elements[0])
+            
+            if series_pos > studio_pos:
+                # series在studio后面，需要移动
+                root.remove(series_elements[0])
+                root.insert(studio_pos, series_elements[0])
+                moved_count += 1
         
-        # 添加不在标准顺序中的元素
-        ordered_elements.extend(remaining_elements)
+        # 确保set在series后
+        set_elements = root.findall('.//set')
+        if series_elements and set_elements:
+            series_pos = list(root).index(series_elements[0])
+            set_pos = list(root).index(set_elements[0])
+            
+            if set_pos < series_pos:
+                # set在series前面，需要移动
+                root.remove(set_elements[0])
+                root.insert(series_pos + 1, set_elements[0])
+                moved_count += 1
         
-        # 重新构建 root
-        root.clear()
-        for elem in ordered_elements:
-            root.append(elem)
-        
-        # 检查是否有变化
-        new_order = [elem.tag for elem in root]
-        if original_order != new_order:
-            return f"元素重排序: {len(all_elements)}个元素"
+        if moved_count > 0:
+            return f"关键元素重排序: {moved_count}个"
         
         return None
     
     def _find_first_valid_text(self, root: ET.Element, xpath_list: List[str]) -> str:
-        """从xpath列表中查找第一个有效的文本值"""
-        for xpath in xpath_list:
-            element = root.find(xpath)
-            if element is not None and element.text:
-                return element.text.strip()
-        return ""
-
+        """使用公共工具方法"""
+        return XMLUtils.find_first_valid_text(root, xpath_list)
 
 class FolderRenamer:
     """文件夹重命名器"""
@@ -651,7 +815,7 @@ class FolderRenamer:
         
         result = self.format_string
         
-        # 获取所有字段（排除私有属性）
+        # 获取所有字段
         field_dict = {
             name: getattr(fields, name) 
             for name in dir(fields) 
@@ -693,11 +857,10 @@ class FolderRenamer:
         """清理文件名中的非法字符"""
         return re.sub(Config.INVALID_FILENAME_CHARS, "_", filename)
 
-
 class RenameWorker(QThread):
     """重命名工作线程"""    
     progressUpdated = pyqtSignal(int, int)
-    logUpdated = pyqtSignal(str)  # UI显示日志（仅显示有修改的操作）
+    logUpdated = pyqtSignal(str)
     finished = pyqtSignal()
     error = pyqtSignal(str)
 
@@ -764,13 +927,13 @@ class RenameWorker(QThread):
                 folder_path = os.path.join(root, folder)
                 nfo_path = self._find_nfo_file(folder_path)
                 
-                if nfo_path and Path(nfo_path).parent == Path(folder_path):
+                if nfo_path:
                     folders_with_nfo.append((folder_path, nfo_path))
         
         return folders_with_nfo
     
     def _process_single_folder(self, folder_path: str, nfo_path: str, current: int, total: int):
-        """处理单个文件夹 - 优化日志版"""
+        """处理单个文件夹"""
         folder_name = Path(folder_path).name
         nfo_name = Path(nfo_path).name
         
@@ -811,7 +974,7 @@ class RenameWorker(QThread):
         self.progressUpdated.emit(current, total)
     
     def _modify_nfo_info_optimized(self, nfo_path: str, nfo_name: str) -> Tuple[bool, List[str]]:
-        """修改NFO文件信息 - 优化版"""
+        """修改NFO文件信息"""
         try:
             modified, new_actors, stats, detailed_logs = self.nfo_modifier.modify_nfo_file(nfo_path)
             
@@ -864,7 +1027,7 @@ class RenameWorker(QThread):
             return False, []
     
     def _rename_folder_if_needed_optimized(self, folder_path: str, nfo_fields: NFOFields, folder_name: str) -> bool:
-        """根据需要重命名文件夹 - 优化版"""
+        """根据需要重命名文件夹"""
         try:
             expected_name = self.folder_renamer.generate_folder_name(nfo_fields)
             
@@ -888,102 +1051,17 @@ class RenameWorker(QThread):
                 return str(file_path)
         return None
 
-
-class ActorMappingLoader:
-    """演员映射加载器"""
-    
-    @staticmethod
-    def find_mapping_file() -> Optional[str]:
-        """查找映射文件"""
-        # 确定基础路径
-        if getattr(sys, "frozen", False):
-            exe_dir = Path(sys.executable).parent
-            base_path = Path(sys._MEIPASS)
-        else:
-            exe_dir = base_path = Path(__file__).parent
-        
-        # 优先查找外部配置文件
-        external_mapping = exe_dir / "mapping_actor.xml"
-        if external_mapping.exists():
-            return str(external_mapping)
-        
-        # 查找内置配置文件
-        internal_mapping = base_path / "mapping_actor.xml"
-        return str(internal_mapping) if internal_mapping.exists() else None
-    
-    @staticmethod
-    def load_mapping(mapping_file: str) -> Dict[str, str]:
-        """从XML文件加载演员映射"""
-        mapping = {}
-        
-        try:
-            context = ET.iterparse(mapping_file, events=("start",))
-            for event, elem in context:
-                if elem.tag == "a":
-                    zh_cn = elem.get("zh_cn")
-                    if zh_cn:
-                        keywords = elem.get("keyword", "").strip(",").split(",")
-                        for keyword in (k.strip() for k in keywords if k.strip()):
-                            mapping[keyword] = zh_cn
-                elem.clear()
-        
-        except Exception as e:
-            raise Exception(f"加载映射文件失败: {e}")
-        
-        return mapping
-
-
-class SeriesMappingLoader:
-    """系列映射加载器"""
-    
-    @staticmethod
-    def find_series_mapping_file() -> Optional[str]:
-        """查找系列映射文件"""
-        # 确定基础路径
-        if getattr(sys, "frozen", False):
-            exe_dir = Path(sys.executable).parent
-            base_path = Path(sys._MEIPASS)
-        else:
-            exe_dir = base_path = Path(__file__).parent
-        
-        # 优先查找外部配置文件
-        external_mapping = exe_dir / "series_mapping.xml"
-        if external_mapping.exists():
-            return str(external_mapping)
-        
-        # 查找内置配置文件
-        internal_mapping = base_path / "series_mapping.xml"
-        return str(internal_mapping) if internal_mapping.exists() else None
-    
-    @staticmethod
-    def load_series_mapping(mapping_file: str) -> Dict[str, str]:
-        """从XML文件加载系列映射"""
-        mapping = {}
-        
-        try:
-            context = ET.iterparse(mapping_file, events=("start",))
-            for event, elem in context:
-                if elem.tag == "map":
-                    code = elem.get("code")
-                    series = elem.get("series")
-                    if code and series:
-                        mapping[code.strip()] = series.strip()
-                elem.clear()
-        
-        except Exception as e:
-            raise Exception(f"加载系列映射文件失败: {e}")
-        
-        return mapping
-
-
 class RenameToolGUI(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
+        # 使用新的加载器
+        self.actor_loader = ActorMappingLoader()
+        self.series_loader = SeriesMappingLoader()
+        
         self.actor_mapping = {}
         self.series_mapping = {}
-        self.mapping_file_path = None
-        self.series_mapping_file_path = None
         self.worker = None
+        
         self.init_ui()
         self.load_mappings()
 
@@ -1010,16 +1088,13 @@ class RenameToolGUI(QMainWindow):
     def _setup_icon(self):
         """设置窗口图标"""
         try:
-            if getattr(sys, "frozen", False):
-                application_path = sys._MEIPASS
-            else:
-                application_path = os.path.dirname(os.path.abspath(__file__))
+            exe_dir, base_path = PathUtils.get_application_paths()
             
-            icon_path = os.path.join(application_path, "chuizi.ico")
-            if os.path.exists(icon_path):
-                icon = QIcon(icon_path)
+            icon_path = base_path / "chuizi.ico"
+            if icon_path.exists():
+                icon = QIcon(str(icon_path))
                 for size in [16, 32, 64, 128]:
-                    icon.addFile(icon_path, QSize(size, size))
+                    icon.addFile(str(icon_path), QSize(size, size))
                 self.setWindowIcon(icon)
         except Exception as e:
             print(f"图标设置失败: {e}")
@@ -1082,7 +1157,7 @@ class RenameToolGUI(QMainWindow):
         # 第一行：演员映射选项
         first_row = QHBoxLayout()
         self.modify_actors_cb = QCheckBox("修改演员信息（应用演员映射）")
-        self.modify_actors_cb.setChecked(True)  # 默认选中
+        self.modify_actors_cb.setChecked(True)
         first_row.addWidget(self.modify_actors_cb)
         first_row.addStretch()
         layout.addLayout(first_row)
@@ -1090,7 +1165,7 @@ class RenameToolGUI(QMainWindow):
         # 第二行：系列映射选项
         second_row = QHBoxLayout()
         self.modify_series_cb = QCheckBox("修改系列信息（应用系列映射）")
-        self.modify_series_cb.setChecked(True)  # 默认选中
+        self.modify_series_cb.setChecked(True)
         second_row.addWidget(self.modify_series_cb)
         second_row.addStretch()
         layout.addLayout(second_row)
@@ -1098,7 +1173,7 @@ class RenameToolGUI(QMainWindow):
         # 第三行：重命名文件夹选项
         third_row = QHBoxLayout()
         self.rename_folders_cb = QCheckBox("同时重命名文件夹")
-        self.rename_folders_cb.setChecked(True)  # 默认选中
+        self.rename_folders_cb.setChecked(True)
         third_row.addWidget(self.rename_folders_cb)
         third_row.addStretch()
         layout.addLayout(third_row)
@@ -1204,45 +1279,48 @@ class RenameToolGUI(QMainWindow):
         self.load_actor_mapping()
         self.load_series_mapping()
     
+    def _load_mapping_with_ui_update(self, loader: BaseMappingLoader, 
+                                   mapping_attr: str, label_attr: str, 
+                                   item_name: str) -> bool:
+        """通用映射加载方法"""
+        try:
+            mapping_file_path = loader.find_mapping_file()
+            if mapping_file_path:
+                mapping = loader.load_mapping(mapping_file_path)
+                setattr(self, mapping_attr, mapping)
+                
+                success_msg = f"成功加载 {len(mapping)} 个{item_name}映射关系"
+                self.log_text.append(success_msg)
+                
+                # 更新路径显示
+                file_type = loader.get_file_type()
+                label_text = f"{loader.display_name}映射 ({file_type}): {mapping_file_path}"
+                getattr(self, label_attr).setText(label_text)
+                
+                return True
+            else:
+                not_found_msg = f"未找到{item_name}映射配置文件"
+                getattr(self, label_attr).setText(not_found_msg)
+                self.log_text.append(f"警告：{not_found_msg}")
+                return False
+                
+        except Exception as e:
+            error_msg = f"{loader.display_name}映射: 配置文件加载失败"
+            getattr(self, label_attr).setText(error_msg)
+            self.log_text.append(f"加载{item_name}映射文件出错: {e}")
+            return False
+    
     def load_actor_mapping(self):
         """加载演员映射"""
-        try:
-            self.mapping_file_path = ActorMappingLoader.find_mapping_file()
-            if self.mapping_file_path:
-                self.actor_mapping = ActorMappingLoader.load_mapping(self.mapping_file_path)
-                self.log_text.append(f"成功加载 {len(self.actor_mapping)} 个演员映射关系")
-                
-                # 更新映射文件路径显示
-                if "mapping_actor.xml" in self.mapping_file_path and sys.executable not in self.mapping_file_path:
-                    self.mapping_label.setText(f"演员映射 (外部): {self.mapping_file_path}")
-                else:
-                    self.mapping_label.setText(f"演员映射 (内置): {self.mapping_file_path}")
-            else:
-                self.mapping_label.setText("演员映射: 未找到配置文件")
-                self.log_text.append("警告：未找到演员映射配置文件")
-        except Exception as e:
-            self.mapping_label.setText("演员映射: 配置文件加载失败")
-            self.log_text.append(f"加载演员映射文件出错: {e}")
+        self._load_mapping_with_ui_update(
+            self.actor_loader, "actor_mapping", "mapping_label", "演员"
+        )
     
     def load_series_mapping(self):
         """加载系列映射"""
-        try:
-            self.series_mapping_file_path = SeriesMappingLoader.find_series_mapping_file()
-            if self.series_mapping_file_path:
-                self.series_mapping = SeriesMappingLoader.load_series_mapping(self.series_mapping_file_path)
-                self.log_text.append(f"成功加载 {len(self.series_mapping)} 个系列映射关系")
-                
-                # 更新系列映射文件路径显示
-                if "series_mapping.xml" in self.series_mapping_file_path and sys.executable not in self.series_mapping_file_path:
-                    self.series_mapping_label.setText(f"系列映射 (外部): {self.series_mapping_file_path}")
-                else:
-                    self.series_mapping_label.setText(f"系列映射 (内置): {self.series_mapping_file_path}")
-            else:
-                self.series_mapping_label.setText("系列映射: 未找到配置文件")
-                self.log_text.append("提示：未找到系列映射配置文件，可通过javdb爬虫生成")
-        except Exception as e:
-            self.series_mapping_label.setText("系列映射: 配置文件加载失败")
-            self.log_text.append(f"加载系列映射文件出错: {e}")
+        self._load_mapping_with_ui_update(
+            self.series_loader, "series_mapping", "series_mapping_label", "系列"
+        )
    
     def browse_folder(self):
         """浏览文件夹"""
@@ -1261,8 +1339,8 @@ class RenameToolGUI(QMainWindow):
             return
         
         # 检查是否至少有一个映射文件可用
-        has_actor_mapping = self.modify_actors_cb.isChecked() and self.mapping_file_path and os.path.exists(self.mapping_file_path)
-        has_series_mapping = self.modify_series_cb.isChecked() and self.series_mapping_file_path and os.path.exists(self.series_mapping_file_path)
+        has_actor_mapping = self.modify_actors_cb.isChecked() and bool(self.actor_mapping)
+        has_series_mapping = self.modify_series_cb.isChecked() and bool(self.series_mapping)
         
         if not has_actor_mapping and not has_series_mapping and not self.rename_folders_cb.isChecked():
             QMessageBox.critical(self, "错误", "请至少选择一项操作：修改演员信息、修改系列信息或重命名文件夹")
@@ -1325,14 +1403,13 @@ class RenameToolGUI(QMainWindow):
         self.log_text.append(f"处理出错: {error_message}")
 
     def update_ui_log(self, message: str):
-        """更新UI日志 - 只显示有变化的操作"""
+        """更新UI日志"""
         if message:
             self.log_text.append(message)
             
             # 确保最新日志可见
             scroll_bar = self.log_text.verticalScrollBar()
             scroll_bar.setValue(scroll_bar.maximum())
-
 
 def start_rename_process(directory: Optional[str] = None):
     """启动重命名程序"""
@@ -1351,13 +1428,11 @@ def start_rename_process(directory: Optional[str] = None):
     window.show()
     sys.exit(app.exec_())
 
-
 def create_rename_worker(directory: str, actor_mapping: Dict[str, str], 
                         rename_folders: bool, folder_format: str = "",
                         series_mapping: Optional[Dict[str, str]] = None) -> RenameWorker:
     """便利函数：创建RenameWorker实例，保持向后兼容性"""
     return RenameWorker(directory, actor_mapping, rename_folders, folder_format, series_mapping)
-
 
 if __name__ == "__main__":
     try:
