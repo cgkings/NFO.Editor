@@ -42,7 +42,7 @@ class NFOEditorQt(QMainWindow):
         self.screen_dpi = self.screen().logicalDotsPerInch()
         self.scale_factor = self.screen_dpi / 96.0
 
-        self.setWindowTitle("大锤 NFO Editor Qt v9.7.0")
+        self.setWindowTitle("大锤 NFO Editor v9.7.1")
         self.resize(1280, 800)
 
         # 初始化状态栏
@@ -442,7 +442,12 @@ class NFOEditorQt(QMainWindow):
         # 计算初始尺寸
         sizes = self.calculate_dynamic_sizes()
 
-        # Poster frame - 固定大小确保稳定性
+        # Poster frame with resolution label - 使用垂直布局
+        poster_container = QWidget()
+        poster_container_layout = QVBoxLayout(poster_container)
+        poster_container_layout.setContentsMargins(0, 0, 0, 0)
+        poster_container_layout.setSpacing(int(2 * self.scale_factor))
+        
         poster_frame = QFrame()
         poster_frame.setFixedSize(sizes['poster_width'], sizes['poster_height'])
         poster_frame.setStyleSheet("border: 1px solid #A0A0A0")
@@ -453,8 +458,22 @@ class NFOEditorQt(QMainWindow):
         self.poster_label.setAlignment(Qt.AlignCenter)
         self.poster_label.setFixedSize(sizes['poster_width'], sizes['poster_height'])
         poster_layout.addWidget(self.poster_label, 0, 0)
+        
+        # 添加分辨率标签
+        self.poster_resolution_label = QLabel("分辨率: 未知")
+        self.poster_resolution_label.setAlignment(Qt.AlignCenter)
+        self.poster_resolution_label.setStyleSheet("color: gray; font-size: 9pt;")
+        self.poster_resolution_label.setFixedHeight(int(16 * self.scale_factor))
+        
+        poster_container_layout.addWidget(poster_frame)
+        poster_container_layout.addWidget(self.poster_resolution_label)
 
-        # Thumb frame - 固定大小确保稳定性
+        # Thumb frame with resolution label - 使用垂直布局
+        thumb_container = QWidget()
+        thumb_container_layout = QVBoxLayout(thumb_container)
+        thumb_container_layout.setContentsMargins(0, 0, 0, 0)
+        thumb_container_layout.setSpacing(int(2 * self.scale_factor))
+        
         thumb_frame = QFrame()
         thumb_frame.setFixedSize(sizes['thumb_width'], sizes['thumb_height'])
         thumb_frame.setStyleSheet("border: 1px solid #A0A0A0")
@@ -465,10 +484,19 @@ class NFOEditorQt(QMainWindow):
         self.thumb_label.setAlignment(Qt.AlignCenter)
         self.thumb_label.setFixedSize(sizes['thumb_width'], sizes['thumb_height'])
         thumb_layout.addWidget(self.thumb_label, 0, 0)
+        
+        # 添加分辨率标签
+        self.thumb_resolution_label = QLabel("分辨率: 未知")
+        self.thumb_resolution_label.setAlignment(Qt.AlignCenter)
+        self.thumb_resolution_label.setStyleSheet("color: gray; font-size: 9pt;")
+        self.thumb_resolution_label.setFixedHeight(int(16 * self.scale_factor))
+        
+        thumb_container_layout.addWidget(thumb_frame)
+        thumb_container_layout.addWidget(self.thumb_resolution_label)
 
         # 添加到布局
-        image_layout.addWidget(poster_frame)
-        image_layout.addWidget(thumb_frame)
+        image_layout.addWidget(poster_container)
+        image_layout.addWidget(thumb_container)
         image_layout.addStretch()
 
         grid.addWidget(image_container, 0, 1)

@@ -1581,6 +1581,11 @@ class NFOEditorQt5(NFOEditorQt):
         if hasattr(self, "thumb_label"):
             self.thumb_label.clear()
             self.thumb_label.setText("缩略图 (thumb)")
+        # 清除分辨率标签
+        if hasattr(self, "poster_resolution_label"):
+            self.poster_resolution_label.setText("分辨率: 未知")
+        if hasattr(self, "thumb_resolution_label"):
+            self.thumb_resolution_label.setText("分辨率: 未知")
 
     def display_image(self):
         """显示图片"""
@@ -1602,22 +1607,38 @@ class NFOEditorQt5(NFOEditorQt):
 
         # 显示poster图片
         if poster_files:
-            self.load_image(os.path.join(folder, poster_files[0]), self.poster_label)
+            poster_path = os.path.join(folder, poster_files[0])
+            self.load_image(poster_path, self.poster_label, self.poster_resolution_label)
         else:
             self.poster_label.setText("文件夹内无poster图片")
+            self.poster_resolution_label.setText("分辨率: 未知")
 
         # 显示thumb图片
         if thumb_files:
-            self.load_image(os.path.join(folder, thumb_files[0]), self.thumb_label)
+            thumb_path = os.path.join(folder, thumb_files[0])
+            self.load_image(thumb_path, self.thumb_label, self.thumb_resolution_label)
         else:
             self.thumb_label.setText("文件夹内无thumb图片")
+            self.thumb_resolution_label.setText("分辨率: 未知")
 
-    def load_image(self, image_path, label):
-        """加载图片到label，始终填充整个label"""
+    def load_image(self, image_path, label, resolution_label=None):
+        """加载图片到label，始终填充整个label，并显示分辨率"""
         try:
+            # 使用PIL获取原始图片尺寸
+            with Image.open(image_path) as img:
+                original_width, original_height = img.size
+                
+            # 更新分辨率标签
+            if resolution_label:
+                resolution_text = f"分辨率: {original_width} × {original_height}"
+                resolution_label.setText(resolution_text)
+            
+            # 使用QPixmap加载图片用于显示
             pixmap = QPixmap(image_path)
             if pixmap.isNull():
                 label.setText("加载图片失败")
+                if resolution_label:
+                    resolution_label.setText("分辨率: 加载失败")
                 return
 
             # 获取label的固定大小
@@ -1634,6 +1655,36 @@ class NFOEditorQt5(NFOEditorQt):
 
         except Exception as e:
             label.setText(f"加载图片失败: {str(e)}")
+            if resolution_label:
+                resolution_label.setText("分辨率: 加载失败")
+
+    def update_layout_sizes(self):
+        """更新布局尺寸 - 需要在NFO_Editor_ui.py中修改此方法"""
+        sizes = self.calculate_dynamic_sizes()
+        
+        # 更新图片框大小
+        if hasattr(self, 'poster_label'):
+            poster_frame = self.poster_label.parent()
+            poster_frame.setFixedSize(sizes['poster_width'], sizes['poster_height'])
+            self.poster_label.setFixedSize(sizes['poster_width'], sizes['poster_height'])
+        
+        if hasattr(self, 'thumb_label'):
+            thumb_frame = self.thumb_label.parent()
+            thumb_frame.setFixedSize(sizes['thumb_width'], sizes['thumb_height'])
+            self.thumb_label.setFixedSize(sizes['thumb_width'], sizes['thumb_height'])
+        
+        # 更新文本框大小
+        for field, widget in self.fields_entries.items():
+            if field != "num":
+                widget.setMinimumWidth(sizes['text_width'])
+                widget.setMaximumWidth(sizes['text_max_width'])
+            else:
+                widget.setMinimumWidth(int(sizes['text_width'] * 0.6))
+                widget.setMaximumWidth(int(sizes['text_max_width'] * 0.6))
+
+        # 自动刷新当前显示的图片
+        if self.show_images_checkbox.isChecked() and self.current_file_path:
+            self.display_image()
 
     def sort_files(self):
         """排序文件列表"""
