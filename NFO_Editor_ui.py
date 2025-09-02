@@ -42,7 +42,7 @@ class NFOEditorQt(QMainWindow):
         self.screen_dpi = self.screen().logicalDotsPerInch()
         self.scale_factor = self.screen_dpi / 96.0
 
-        self.setWindowTitle("大锤 NFO Editor v9.7.1")
+        self.setWindowTitle("大锤 NFO Editor v9.7.3")
         self.resize(1280, 800)
 
         # 初始化状态栏
