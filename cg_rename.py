@@ -20,7 +20,7 @@ class Config:
     DEFAULT_FOLDER_FORMAT = "filename smart_actor"
     SUPPORTED_NFO_EXTENSIONS = ['.nfo']
     INVALID_FILENAME_CHARS = r'[\\/:*?"<>|]'
-    APP_VERSION = "v9.7.2"
+    APP_VERSION = "v9.7.5"
     WINDOW_MIN_SIZE = (900, 900)
     # 日志配置
     LOG_FOLDER = "log"

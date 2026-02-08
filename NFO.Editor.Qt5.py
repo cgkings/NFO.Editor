@@ -1,3 +1,4 @@
+
 import os
 import shutil
 import sys
@@ -29,6 +30,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QGroupBox,
     QCheckBox,
+    QProgressBar,
 )
 from PyQt5.QtCore import (
     Qt,
@@ -44,6 +46,209 @@ import winshell
 import json
 import requests
 from bs4 import BeautifulSoup
+
+
+# ================ 异步加载和缓存机制 ================
+
+class NFOCache:
+    """NFO文件缓存管理器"""
+    
+    def __init__(self):
+        self.cache = {}
+        self.file_paths = []
+    
+    def get(self, path):
+        return self.cache.get(path)
+    
+    def set(self, path, data):
+        self.cache[path] = data
+        if path not in self.file_paths:
+            self.file_paths.append(path)
+    
+    def remove(self, path):
+        if path in self.cache:
+            del self.cache[path]
+        if path in self.file_paths:
+            self.file_paths.remove(path)
+    
+    def clear(self):
+        self.cache.clear()
+        self.file_paths.clear()
+    
+    def get_all_paths(self):
+        return self.file_paths.copy()
+    
+    def size(self):
+        return len(self.cache)
+
+
+class LoadFilesThread(QThread):
+    """异步加载NFO文件的线程"""
+    
+    progress = pyqtSignal(int, int, str)
+    item_ready = pyqtSignal(object, dict)
+    finished_signal = pyqtSignal(int)
+    error = pyqtSignal(str)
+    
+    def __init__(self, folder_path, batch_size=100):
+        super().__init__()
+        self.folder_path = folder_path
+        self.batch_size = batch_size
+        self.is_running = True
+    
+    def run(self):
+        try:
+            nfo_files = []
+            for root, dirs, files in os.walk(self.folder_path):
+                if not self.is_running:
+                    return
+                for file in files:
+                    if file.endswith(".nfo"):
+                        nfo_files.append(os.path.join(root, file))
+            
+            total = len(nfo_files)
+            if total == 0:
+                self.finished_signal.emit(0)
+                return
+            
+            for i, nfo_path in enumerate(nfo_files, 1):
+                if not self.is_running:
+                    return
+                
+                try:
+                    cache_data = self._parse_nfo(nfo_path)
+                    relative_path = os.path.relpath(nfo_path, self.folder_path)
+                    parts = relative_path.split(os.sep)
+                    
+                    if len(parts) > 1:
+                        first_level = os.sep.join(parts[:-2]) if len(parts) > 2 else ""
+                        second_level = parts[-2]
+                        nfo_file = parts[-1]
+                    else:
+                        first_level = ""
+                        second_level = ""
+                        nfo_file = parts[-1]
+                    
+                    tree_item = QTreeWidgetItem([first_level, second_level, nfo_file])
+                    self.item_ready.emit(tree_item, {nfo_path: cache_data})
+                    
+                    file_name = os.path.basename(nfo_path)
+                    self.progress.emit(i, total, file_name)
+                
+                except Exception as e:
+                    print(f"解析文件失败 {nfo_path}: {str(e)}")
+                    continue
+            
+            self.finished_signal.emit(total)
+            
+        except Exception as e:
+            self.error.emit(f"加载过程出错: {str(e)}")
+    
+    def _parse_nfo(self, nfo_path):
+        tree = ET.parse(nfo_path)
+        root = tree.getroot()
+        
+        data = {
+            'path': nfo_path,
+            'num': '',
+            'title': '',
+            'plot': '',
+            'series': '',
+            'rating': 0.0,
+            'release': '',
+            'actors': [],
+            'tags': [],
+        }
+        
+        for field in ['num', 'title', 'plot', 'series']:
+            elem = root.find(field)
+            if elem is not None and elem.text:
+                data[field] = elem.text.strip()
+        
+        rating_elem = root.find('rating')
+        if rating_elem is not None and rating_elem.text:
+            try:
+                data['rating'] = float(rating_elem.text.strip())
+            except ValueError:
+                data['rating'] = 0.0
+        
+        release_elem = root.find('release')
+        if release_elem is not None and release_elem.text:
+            data['release'] = release_elem.text.strip()
+        
+        actors = []
+        for actor in root.findall('actor'):
+            name_elem = actor.find('name')
+            if name_elem is not None and name_elem.text:
+                actors.append(name_elem.text.strip())
+        data['actors'] = actors
+        
+        tags = []
+        for tag in root.findall('tag'):
+            if tag is not None and tag.text:
+                tags.append(tag.text.strip())
+        data['tags'] = tags
+        
+        return data
+    
+    def stop(self):
+        self.is_running = False
+
+
+def parse_single_nfo(nfo_path):
+    try:
+        tree = ET.parse(nfo_path)
+        root = tree.getroot()
+        
+        data = {
+            'path': nfo_path,
+            'num': '',
+            'title': '',
+            'plot': '',
+            'series': '',
+            'rating': 0.0,
+            'release': '',
+            'actors': [],
+            'tags': [],
+        }
+        
+        for field in ['num', 'title', 'plot', 'series']:
+            elem = root.find(field)
+            if elem is not None and elem.text:
+                data[field] = elem.text.strip()
+        
+        rating_elem = root.find('rating')
+        if rating_elem is not None and rating_elem.text:
+            try:
+                data['rating'] = float(rating_elem.text.strip())
+            except ValueError:
+                data['rating'] = 0.0
+        
+        release_elem = root.find('release')
+        if release_elem is not None and release_elem.text:
+            data['release'] = release_elem.text.strip()
+        
+        actors = []
+        for actor in root.findall('actor'):
+            name_elem = actor.find('name')
+            if name_elem is not None and name_elem.text:
+                actors.append(name_elem.text.strip())
+        data['actors'] = actors
+        
+        tags = []
+        for tag in root.findall('tag'):
+            if tag is not None and tag.text:
+                tags.append(tag.text.strip())
+        data['tags'] = tags
+        
+        return data
+        
+    except Exception as e:
+        print(f"解析NFO文件失败 {nfo_path}: {str(e)}")
+        return None
+
+# ================ 结束 ================
+
 
 from NFO_Editor_ui import NFOEditorQt
 
@@ -518,6 +723,20 @@ class NFOEditorQt5(NFOEditorQt):
         self.move_thread = None
         self.file_watcher = QFileSystemWatcher()
 
+        # ===== 新增：缓存和异步加载 =====
+        self.nfo_cache = NFOCache()
+        self.load_thread = None
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumWidth(300)
+        self.progress_bar.hide()
+        self.status_bar.addPermanentWidget(self.progress_bar)
+        
+        self.reload_timer = QTimer()
+        self.reload_timer.setSingleShot(True)
+        self.reload_timer.timeout.connect(self._delayed_reload)
+        # ===== 新增结束 =====
+
         # 添加配置
         self.config_manager = ConfigManager()
         
@@ -858,75 +1077,101 @@ class NFOEditorQt5(NFOEditorQt):
         main_grid.setColumnStretch(1, 0)
 
         # 更新状态栏信息
-        self.status_bar.showMessage("目标目录已清除")
-
+        self.status_bar.showMessage("目标目录已清除")    
     def load_files_in_folder(self, auto_select=True):
-        """加载文件夹中的NFO文件"""
+        """加载文件夹中的NFO文件 - 异步版本"""
         if not self.folder_path:
             return
 
-        # 保存当前选中的项目信息
-        current_selection = None
+        current_selection_path = None
         if not auto_select:
             selected_items = self.file_tree.selectedItems()
-            if selected_items:
-                item = selected_items[0]
-                current_selection = [item.text(i) for i in range(3)]
+            if selected_items and self.current_file_path:
+                current_selection_path = self.current_file_path
+
+        if self.load_thread is not None and self.load_thread.isRunning():
+            self.load_thread.stop()
+            self.load_thread.wait()
 
         self.file_tree.clear()
         self.nfo_files = []
 
-        try:
-            for root, dirs, files in os.walk(self.folder_path):
-                for file in files:
-                    if file.endswith(".nfo"):
-                        nfo_path = os.path.join(root, file)
-                        self.nfo_files.append(nfo_path)
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+        self.status_bar.showMessage("正在加载文件...")
 
-                        relative_path = os.path.relpath(nfo_path, self.folder_path)
-                        parts = relative_path.split(os.sep)
+        self.load_thread = LoadFilesThread(self.folder_path, batch_size=100)
+        
+        self.load_thread.progress.connect(self._on_load_progress)
+        self.load_thread.item_ready.connect(self._on_item_ready)
+        self.load_thread.finished_signal.connect(
+            lambda count: self._on_load_finished(count, auto_select, current_selection_path)
+        )
+        self.load_thread.error.connect(self._on_load_error)
+        
+        self.load_thread.start()
 
-                        if len(parts) > 1:
-                            first_level = (
-                                os.sep.join(parts[:-2]) if len(parts) > 2 else ""
-                            )
-                            second_level = parts[-2]
-                            nfo_file = parts[-1]
-                        else:
-                            first_level = ""
-                            second_level = ""
-                            nfo_file = parts[-1]
+    def _on_load_progress(self, current, total, filename):
+        """加载进度更新"""
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current)
+        
+        if current % 100 == 0 or current == total:
+            self.status_bar.showMessage(f"正在加载: {current}/{total} - {filename}")
 
-                        item = QTreeWidgetItem([first_level, second_level, nfo_file])
-                        self.file_tree.addTopLevelItem(item)
+    def _on_item_ready(self, tree_item, cache_data):
+        """单个项目准备就绪"""
+        self.file_tree.addTopLevelItem(tree_item)
+        
+        for path, data in cache_data.items():
+            self.nfo_cache.set(path, data)
+            self.nfo_files.append(path)
 
-            # 选择逻辑优化
-            if auto_select and self.file_tree.topLevelItemCount() > 0:
-                # 初次加载时选中第一项
-                first_item = self.file_tree.topLevelItem(0)
-                self.file_tree.setCurrentItem(first_item)
-                self.on_file_select()
-            elif current_selection and self.file_tree.topLevelItemCount() > 0:
-                # 尝试恢复之前的选择
-                selection_restored = False
-                for i in range(self.file_tree.topLevelItemCount()):
-                    item = self.file_tree.topLevelItem(i)
-                    if [item.text(j) for j in range(3)] == current_selection:
-                        self.file_tree.setCurrentItem(item)
-                        selection_restored = True
-                        break
+    def _on_load_finished(self, count, auto_select, selection_path):
+        """加载完成"""
+        self.progress_bar.hide()
+        
+        total_folders = len(set(os.path.dirname(f) for f in self.nfo_files))
+        status_msg = f"加载完成: {count} 个NFO文件 ({total_folders} 个文件夹) - 目录: {self.folder_path}"
+        self.status_bar.showMessage(status_msg)
+        
+        if auto_select and self.file_tree.topLevelItemCount() > 0:
+            first_item = self.file_tree.topLevelItem(0)
+            self.file_tree.setCurrentItem(first_item)
+            self.on_file_select()
+        elif selection_path:
+            self._restore_selection(selection_path)
+        
+        if self.load_thread:
+            self.load_thread.deleteLater()
+            self.load_thread = None
+
+    def _restore_selection(self, target_path):
+        """根据路径恢复选择"""
+        for i in range(self.file_tree.topLevelItemCount()):
+            item = self.file_tree.topLevelItem(i)
+            values = [item.text(j) for j in range(3)]
+            
+            if values[2]:
+                item_path = (
+                    os.path.join(self.folder_path, values[0], values[1], values[2])
+                    if values[1]
+                    else os.path.join(self.folder_path, values[0], values[2])
+                )
                 
-                # 如果无法恢复原选择，则清除选择状态
-                if not selection_restored:
-                    self.file_tree.clearSelection()
+                if os.path.normpath(item_path) == os.path.normpath(target_path):
+                    self.file_tree.setCurrentItem(item)
+                    self.file_tree.scrollToItem(item)
+                    return
+        
+        self.file_tree.clearSelection()
 
-            # 更新状态栏信息
-            total_folders = len(set(os.path.dirname(f) for f in self.nfo_files))
-            status_msg = f"目录: {self.folder_path} (共加载 {total_folders} 个文件夹)"
-            self.status_bar.showMessage(status_msg)
+    def _on_load_error(self, error_msg):
+        """加载错误"""
+        self.progress_bar.hide()
+        self.status_bar.showMessage(f"加载失败: {error_msg}")
+        QMessageBox.critical(self, "错误", error_msg)
 
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"加载文件失败: {str(e)}")
 
     def on_file_select(self):
         """文件选择响应函数"""
@@ -1553,18 +1798,27 @@ class NFOEditorQt5(NFOEditorQt):
 
         except Exception as e:
             print(f"检查更改状态时出错: {str(e)}")
-            return False
-
+            return False    
     def on_file_changed(self, path):
-        """文件变化响应"""
+        """文件变化响应 - 更新缓存"""
         if path == self.current_file_path:
+            cache_data = parse_single_nfo(path)
+            if cache_data:
+                self.nfo_cache.set(path, cache_data)
+            
             self.load_nfo_fields()
 
     def on_directory_changed(self, path):
-        """目录变化响应"""
+        """目录变化响应 - 防抖动版本"""
         if path == self.folder_path:
-            # 目录变化时不自动选择第一项，保持当前选择状态
+            self.reload_timer.start(500)
+
+    def _delayed_reload(self):
+        """延迟重新加载（防抖动）"""
+        if self.folder_path:
             self.load_files_in_folder(auto_select=False)
+
+
 
     def toggle_image_display(self):
         """切换图片显示状态"""
@@ -1692,67 +1946,73 @@ class NFOEditorQt5(NFOEditorQt):
         if self.show_images_checkbox.isChecked() and self.current_file_path:
             self.display_image()
 
+
     def sort_files(self):
-        """排序文件列表"""
+        """排序文件列表 - 使用缓存版本"""
         if not self.sorting_group.checkedButton():
             return
-
+        
+        if self.nfo_cache.size() == 0:
+            return
+        
         sort_by = self.sorting_group.checkedButton().text()
-        items = []
-
-        # 收集所有项目
+        
+        items_with_data = []
+        
         for i in range(self.file_tree.topLevelItemCount()):
             item = self.file_tree.topLevelItem(i)
             values = [item.text(j) for j in range(3)]
-            items.append((values, item))
-
-        # 定义排序键函数
+            
+            if values[2]:
+                nfo_path = (
+                    os.path.join(self.folder_path, values[0], values[1], values[2])
+                    if values[1]
+                    else os.path.join(self.folder_path, values[0], values[2])
+                )
+                
+                cache_data = self.nfo_cache.get(nfo_path)
+                if cache_data:
+                    items_with_data.append((values, item, cache_data))
+        
         def get_sort_key(item_tuple):
-            values, _ = item_tuple
-            if values[2]:  # 如果有NFO文件
+            """获取排序键 - 确保类型一致"""
+            values, tree_item, cache_data = item_tuple
+            
+            if "演员" in sort_by:
+                # 返回字符串
+                return ", ".join(sorted(cache_data.get('actors', [])))
+            elif "系列" in sort_by:
+                # 返回字符串
+                return cache_data.get('series', '')
+            elif "评分" in sort_by:
+                # 返回浮点数，确保始终是数字
                 try:
-                    nfo_path = (
-                        os.path.join(self.folder_path, values[0], values[1], values[2])
-                        if values[1]
-                        else os.path.join(self.folder_path, values[0], values[2])
-                    )
-
-                    tree = ET.parse(nfo_path)
-                    root = tree.getroot()
-
-                    if "演员" in sort_by:
-                        actors = [
-                            actor.find("name").text.strip()
-                            for actor in root.findall("actor")
-                            if actor.find("name") is not None
-                        ]
-                        return ", ".join(sorted(actors))
-                    elif "系列" in sort_by:
-                        series = root.find("series")
-                        return series.text.strip() if series is not None else ""
-                    elif "评分" in sort_by:
-                        rating = root.find("rating")
-                        return float(rating.text) if rating is not None else 0
-                    else:  # 日期
-                        release = root.find("release")
-                        return (
-                            release.text if release is not None and release.text else ""
-                        )
-                except:
-                    return ""
-            return ""
-
-        # 排序
-        items.sort(key=get_sort_key, reverse=True)
-
-        # 重新添加到树
+                    rating = cache_data.get('rating', 0.0)
+                    return float(rating) if rating else 0.0
+                except (ValueError, TypeError):
+                    return 0.0
+            else:  # 日期
+                # 返回字符串，空值用 '0000-00-00' 确保排在最后
+                release = cache_data.get('release', '')
+                return release if release else '0000-00-00'
+        
+        try:
+            items_with_data.sort(key=get_sort_key, reverse=True)
+        except Exception as e:
+            print(f"排序出错: {str(e)}")
+            QMessageBox.warning(self, "警告", f"排序失败: {str(e)}")
+            return
+        
         self.file_tree.clear()
-        for values, item in items:
+        for values, item, cache_data in items_with_data:
             new_item = QTreeWidgetItem(values)
             self.file_tree.addTopLevelItem(new_item)
+        
+        self.status_bar.showMessage(f"已按 {sort_by} 排序", 3000)
+
 
     def apply_filter(self):
-        """应用筛选"""
+        """应用筛选 - 使用缓存版本"""
         if not self.folder_path:
             return
 
@@ -1760,109 +2020,82 @@ class NFOEditorQt5(NFOEditorQt):
         condition = self.condition_combo.currentText()
         filter_text = self.filter_entry.text().strip()
 
+        if not filter_text:
+            self.load_files_in_folder()
+            return
+
         self.file_tree.clear()
-
-        try:
-            # 如果没有筛选文本，显示所有文件
-            if not filter_text:
-                self.load_files_in_folder()
-                return
-
-            # 遍历 NFO 文件
-            matches = []
-            for nfo_file in self.nfo_files:
-                try:
-                    tree = ET.parse(nfo_file)
-                    root = tree.getroot()
-
-                    # 获取字段值
-                    value = ""
-                    if field == "标题":
-                        elem = root.find("title")
-                        value = (
-                            elem.text.strip() if elem is not None and elem.text else ""
-                        )
-                    elif field == "标签":
-                        tags = [
-                            tag.text.strip()
-                            for tag in root.findall("tag")
-                            if tag is not None and tag.text
-                        ]
-                        value = ", ".join(tags)
-                    elif field == "演员":
-                        actors = [
-                            actor.find("name").text.strip()
-                            for actor in root.findall("actor")
-                            if actor.find("name") is not None
-                            and actor.find("name").text
-                        ]
-                        value = ", ".join(actors)
-                    elif field == "系列":
-                        elem = root.find("series")
-                        value = (
-                            elem.text.strip() if elem is not None and elem.text else ""
-                        )
-                    elif field == "评分":
-                        elem = root.find("rating")
-                        value = (
-                            elem.text.strip() if elem is not None and elem.text else "0"
-                        )
-
-                    # 判断是否匹配
-                    match = False
-                    if field == "评分":
-                        try:
-                            current_value = float(value)
-                            filter_value = float(filter_text)
-                            if condition == "大于":
-                                match = current_value > filter_value
-                            elif condition == "小于":
-                                match = current_value < filter_value
-                        except ValueError:
-                            continue
-                    else:
-                        if condition == "包含":
-                            match = filter_text.lower() in value.lower()
-                        elif condition == "不包含":
-                            match = filter_text.lower() not in value.lower()
-
-                    # 如果匹配，添加到匹配列表
-                    if match:
-                        matches.append(nfo_file)
-
-                except ET.ParseError:
-                    print(f"解析文件失败: {nfo_file}")
-                    continue
-                except Exception as e:
-                    print(f"处理文件出错 {nfo_file}: {str(e)}")
-                    continue
-
-            # 添加匹配的文件到树中
-            for nfo_file in matches:
-                relative_path = os.path.relpath(nfo_file, self.folder_path)
-                parts = relative_path.split(os.sep)
-
-                if len(parts) > 1:
-                    first_level = os.sep.join(parts[:-2]) if len(parts) > 2 else ""
-                    second_level = parts[-2]
-                    nfo_name = parts[-1]
+        
+        matched_paths = []
+        
+        for nfo_path in self.nfo_files:
+            cache_data = self.nfo_cache.get(nfo_path)
+            if not cache_data:
+                continue
+            
+            try:
+                value = ""
+                if field == "标题":
+                    value = cache_data.get('title', '')
+                elif field == "标签":
+                    value = ", ".join(cache_data.get('tags', []))
+                elif field == "演员":
+                    value = ", ".join(cache_data.get('actors', []))
+                elif field == "系列":
+                    value = cache_data.get('series', '')
+                elif field == "评分":
+                    # 确保评分是数字
+                    rating = cache_data.get('rating', 0.0)
+                    try:
+                        value = str(float(rating) if rating else 0.0)
+                    except (ValueError, TypeError):
+                        value = "0.0"
+                
+                match = False
+                if field == "评分":
+                    try:
+                        current_value = float(value)
+                        filter_value = float(filter_text)
+                        if condition == "大于":
+                            match = current_value > filter_value
+                        elif condition == "小于":
+                            match = current_value < filter_value
+                    except ValueError:
+                        # 如果转换失败，跳过这个文件
+                        continue
                 else:
-                    first_level = ""
-                    second_level = ""
-                    nfo_name = parts[-1]
-
-                item = QTreeWidgetItem([first_level, second_level, nfo_name])
-                self.file_tree.addTopLevelItem(item)
-
-            # 更新状态栏信息
-            matched_count = len(matches)
-            total_count = len(self.nfo_files)
-            self.status_bar.showMessage(
-                f"筛选结果: 匹配 {matched_count} / 总计 {total_count}"
-            )  # 使用 self.status_bar
-
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"筛选过程出错: {str(e)}")
+                    if condition == "包含":
+                        match = filter_text.lower() in value.lower()
+                    elif condition == "不包含":
+                        match = filter_text.lower() not in value.lower()
+                
+                if match:
+                    matched_paths.append(nfo_path)
+                    
+            except Exception as e:
+                # 单个文件筛选失败不影响整体
+                print(f"筛选文件 {nfo_path} 时出错: {str(e)}")
+                continue
+        
+        for nfo_path in matched_paths:
+            relative_path = os.path.relpath(nfo_path, self.folder_path)
+            parts = relative_path.split(os.sep)
+            
+            if len(parts) > 1:
+                first_level = os.sep.join(parts[:-2]) if len(parts) > 2 else ""
+                second_level = parts[-2]
+                nfo_name = parts[-1]
+            else:
+                first_level = ""
+                second_level = ""
+                nfo_name = parts[-1]
+            
+            item = QTreeWidgetItem([first_level, second_level, nfo_name])
+            self.file_tree.addTopLevelItem(item)
+        
+        matched_count = len(matched_paths)
+        total_count = len(self.nfo_files)
+        self.status_bar.showMessage(f"筛选结果: 匹配 {matched_count} / 总计 {total_count}")
 
     def batch_filling(self):
         """批量填充"""
@@ -2431,16 +2664,24 @@ class NFOEditorQt5(NFOEditorQt):
             try:
                 values = [item.text(i) for i in range(3)]
                 if values[2]:  # If NFO file exists
-                    folder_path = os.path.dirname(
+                    # 构建NFO文件路径
+                    nfo_path = (
                         os.path.join(self.folder_path, values[0], values[1], values[2])
                         if values[1]
                         else os.path.join(self.folder_path, values[0], values[2])
                     )
+                    
+                    folder_path = os.path.dirname(nfo_path)
 
                     if os.path.exists(folder_path):
                         # Move to recycle bin instead of permanent deletion
                         winshell.delete_file(folder_path)
                         deleted_count += 1
+                        
+                        # V3修复：删除文件后清理缓存
+                        self.nfo_cache.remove(nfo_path)
+                        if nfo_path in self.nfo_files:
+                            self.nfo_files.remove(nfo_path)
 
                     # Remove the item from the tree
                     root = self.file_tree.invisibleRootItem()
@@ -2693,12 +2934,14 @@ class NFOEditorQt5(NFOEditorQt):
         """恢复复制按钮的原始状态"""
         if hasattr(self, 'copy_num_button'):
             self.copy_num_button.setText("📋")
-            self.copy_num_button.setToolTip("复制番号")
-
+            self.copy_num_button.setToolTip("复制番号")    
     def closeEvent(self, event):
-        """程序关闭时的基础清理"""
+        """程序关闭时的清理"""
         try:
-            # 停止文件监控
+            if hasattr(self, 'load_thread') and self.load_thread and self.load_thread.isRunning():
+                self.load_thread.stop()
+                self.load_thread.wait(2000)
+            
             if hasattr(self, 'file_watcher'):
                 directories = self.file_watcher.directories()
                 files = self.file_watcher.files()
@@ -2707,10 +2950,12 @@ class NFOEditorQt5(NFOEditorQt):
                 if files:
                     self.file_watcher.removePaths(files)
             
-            # 简单的线程清理
             if hasattr(self, 'move_thread') and self.move_thread and self.move_thread.isRunning():
-                self.move_thread.terminate()  # 简单但有效
-                self.move_thread.wait(1000)   # 等待1秒
+                self.move_thread.stop()
+                self.move_thread.wait(2000)
+            
+            if hasattr(self, 'nfo_cache'):
+                self.nfo_cache.clear()
             
         except Exception as e:
             print(f"清理资源时出错: {e}")

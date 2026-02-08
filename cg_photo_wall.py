@@ -40,9 +40,8 @@ from enum import Enum
 
 
 class LoadStage(Enum):
-    SCANNING = 1  # 扫描NFO阶段
-    PREPARING = 2  # 准备UI阶段
-    LOADING = 3  # 加载图片阶段
+    SCANNING = 1
+    LOADING = 2
 
 
 class BluePalette(QPalette):
@@ -65,10 +64,10 @@ class BluePalette(QPalette):
 
 
 class ImageLoadManager(QObject):
-    """图片加载管理器"""
+    """优化的图片加载管理器"""
 
-    progress_updated = pyqtSignal(int, int)  # 当前进度, 总数
-    image_loaded = pyqtSignal(str, QLabel, QPixmap)  # 图片路径, 标签对象, 图片对象
+    progress_updated = pyqtSignal(int, int)
+    image_loaded = pyqtSignal(str, QLabel, QPixmap)
 
     def __init__(self, max_workers=None):
         super().__init__()
@@ -81,7 +80,7 @@ class ImageLoadManager(QObject):
         self.loaded_images = 0
         self.is_running = True
 
-    def load_image(self, image_path, label):
+    def load_image(self, image_path, label, target_width, target_height):
         """加载单个图片"""
         try:
             if not self.is_running:
@@ -89,11 +88,11 @@ class ImageLoadManager(QObject):
 
             reader = QImageReader(image_path)
             if reader.canRead():
-                target_size = label.size()
                 original_size = reader.size()
 
-                width_ratio = target_size.width() / original_size.width()
-                height_ratio = target_size.height() / original_size.height()
+                # 使用传入的固定尺寸计算缩放比例
+                width_ratio = target_width / original_size.width()
+                height_ratio = target_height / original_size.height()
                 scale_ratio = min(width_ratio, height_ratio)
 
                 new_width = int(original_size.width() * scale_ratio)
@@ -113,15 +112,17 @@ class ImageLoadManager(QObject):
             print(f"加载图片失败 {image_path}: {str(e)}")
         return False
 
-    def add_images(self, image_paths_and_labels):
-        """添加要加载的图片路径和标签对列表"""
+    def add_images(self, image_paths_and_labels, target_width, target_height):
+        """添加要加载的图片"""
         self.total_images = len(image_paths_and_labels)
         self.loaded_images = 0
         futures = []
         for path, label in image_paths_and_labels:
             if not self.is_running:
                 break
-            future = self.executor.submit(self.load_image, path, label)
+            future = self.executor.submit(
+                self.load_image, path, label, target_width, target_height
+            )
             futures.append(future)
         return futures
 
@@ -159,7 +160,7 @@ class PosterContainer(QFrame):
 
 
 class PhotoWallDialog(QDialog):
-    """优化后的照片墙对话框"""
+    """优化后的照片墙对话框 - 简化版"""
 
     update_image = pyqtSignal(QLabel, QPixmap)
 
@@ -170,9 +171,8 @@ class PhotoWallDialog(QDialog):
         self.all_posters = []
         self._sort_keys = {}
 
-        # 新增：存储所有创建的框体和映射关系
+        # UI容器列表
         self.poster_containers = []
-        self.data_to_container_map = {}
 
         # 优化窗口大小改变处理
         self.resize_timer = QTimer()
@@ -191,6 +191,9 @@ class PhotoWallDialog(QDialog):
         self.is_loading = False
         self.settings = QSettings("NFOEditor", "PhotoWall")
 
+        # UI刷新计数器（每N个容器刷新一次界面）
+        self.ui_refresh_interval = 50
+
         self.init_ui()
 
         # 加载目录
@@ -203,7 +206,7 @@ class PhotoWallDialog(QDialog):
 
     def init_ui(self):
         """初始化UI"""
-        self.setWindowTitle("大锤 照片墙 v9.5.9")
+        self.setWindowTitle("大锤 照片墙 v9.7.5")
         self.setStyleSheet(
             """
             QDialog {
@@ -322,13 +325,13 @@ class PhotoWallDialog(QDialog):
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setFormat("加载进度: %v/%m")
         self.progress_bar.setMinimumWidth(200)
-        self.progress_bar.hide()  # 初始隐藏
+        self.progress_bar.hide()
         status_layout.addWidget(self.progress_bar)
 
         # 取消按钮
         self.cancel_button = QPushButton("取消加载")
         self.cancel_button.clicked.connect(self.cancel_loading)
-        self.cancel_button.hide()  # 初始隐藏
+        self.cancel_button.hide()
         status_layout.addWidget(self.cancel_button)
 
         # 状态标签
@@ -346,9 +349,7 @@ class PhotoWallDialog(QDialog):
         )
         status_layout.addWidget(self.status_label)
 
-        # 添加弹性空间
         status_layout.addStretch()
-
         layout.addLayout(status_layout)
 
         # 设置窗口图标
@@ -444,7 +445,6 @@ class PhotoWallDialog(QDialog):
         filter_button.clicked.connect(self.apply_filter)
         layout.addWidget(filter_button)
 
-        # 添加弹性空间
         layout.addStretch()
 
         # 连接信号
@@ -463,46 +463,39 @@ class PhotoWallDialog(QDialog):
         available_width = self.scroll.viewport().width()
         spacing = int(15 * self.dpi_scale)
 
-        # 设置为8列
         columns = 8
-
-        # 根据可用宽度计算海报宽度，考虑间距
         poster_width = (available_width - (columns + 1) * spacing) // columns
-        # 按照电影海报的标准比例 2:3 计算高度
         poster_height = int(poster_width * 1.5)
         title_height = int(70 * self.dpi_scale)
 
         return columns, poster_width, poster_height, title_height
 
     def load_posters(self, folder_path):
-        """优化后的海报加载函数"""
+        """流式加载海报 - 边扫描边显示"""
         if not folder_path or not os.path.exists(folder_path):
             return
 
         # 清理现有数据
-        self.all_posters.clear()
-        self._sort_keys.clear()
-        self.poster_containers.clear()
-        self.data_to_container_map.clear()
+        self.clear_all_data()
 
-        # 显示进度条
         self.progress_bar.show()
         self.cancel_button.show()
         self.is_loading = True
 
-        try:
-            # 第一阶段: 扫描文件
-            poster_nfo_pairs = []
-            total_dirs = sum([len(dirs) for _, dirs, _ in os.walk(folder_path)])
-            current_dir = 0
+        # 计算网格尺寸
+        columns, poster_width, poster_height, title_height = (
+            self.calculate_grid_dimensions()
+        )
 
-            # 扫描文件获取所有NFO和海报对
+        try:
+            # 扫描所有文件
+            poster_nfo_pairs = []
+            self.progress_bar.setFormat("扫描文件中...")
+            self.update_status(0, None, LoadStage.SCANNING)
+
             for root, dirs, files in os.walk(folder_path):
                 if not self.is_loading:
                     return
-
-                current_dir += 1
-                self.update_progress(current_dir, total_dirs, LoadStage.SCANNING)
 
                 poster_file = None
                 nfo_file = None
@@ -514,45 +507,63 @@ class PhotoWallDialog(QDialog):
                         poster_file = os.path.join(root, file)
                     elif file.lower().endswith(".nfo"):
                         nfo_file = os.path.join(root, file)
+
                 if poster_file and nfo_file:
                     poster_nfo_pairs.append((poster_file, nfo_file, root))
 
-            # 第二阶段: 创建空UI框体
             total_items = len(poster_nfo_pairs)
             if total_items == 0:
+                self.update_status(0)
+                self.progress_bar.hide()
+                self.cancel_button.hide()
+                self.is_loading = False
                 return
 
-            # 计算网格尺寸并创建框体
-            columns, poster_width, poster_height, title_height = (
-                self.calculate_grid_dimensions()
-            )
-            self.create_empty_containers(
-                total_items, poster_width, poster_height, title_height
-            )
+            # 开始创建容器和加载数据
+            self.progress_bar.setFormat("加载影片: %v/%m")
+            self.progress_bar.setMaximum(total_items)
 
-            # 第三阶段: 解析NFO并填充数据
+            image_load_queue = []  # 图片加载队列
+
             for index, (poster_file, nfo_file, root) in enumerate(poster_nfo_pairs):
                 if not self.is_loading:
                     return
 
                 try:
+                    # 解析NFO
                     nfo_data = self.parse_nfo(nfo_file)
                     folder_name = os.path.basename(root)
+
+                    # 添加到数据列表
                     self.all_posters.append((poster_file, folder_name, nfo_data))
                     self._update_sort_keys(nfo_data, len(self.all_posters) - 1)
 
-                    # 更新对应容器的内容
-                    self.update_container_content(index, poster_file, nfo_data)
+                    # 立即创建并显示容器
+                    container_info = self.create_single_container(
+                        index, poster_file, nfo_data, poster_width, poster_height, title_height, columns
+                    )
 
-                    # 更新进度
-                    self.update_progress(index + 1, total_items, LoadStage.PREPARING)
-                    QApplication.processEvents()
+                    if container_info:
+                        self.poster_containers.append(container_info)
+                        image_load_queue.append((poster_file, container_info["poster_label"]))
+
+                    # 定期刷新UI（避免卡顿）
+                    if (index + 1) % self.ui_refresh_interval == 0:
+                        self.progress_bar.setValue(index + 1)
+                        self.update_status(index + 1, total_items, LoadStage.LOADING)
+                        QApplication.processEvents()
 
                 except Exception as e:
-                    print(f"处理NFO文件失败 {nfo_file}: {str(e)}")
+                    print(f"处理文件失败 {nfo_file}: {str(e)}")
 
-            # 第四阶段: 加载图片
-            self.load_poster_images()
+            # 最后一次更新进度
+            self.progress_bar.setValue(total_items)
+            self.update_status(total_items, total_items, LoadStage.LOADING)
+
+            # 开始异步加载图片
+            if image_load_queue:
+                self.progress_bar.setFormat("加载图片: %v/%m")
+                self.image_manager.add_images(image_load_queue, poster_width, poster_height)
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载海报失败: {str(e)}")
@@ -560,181 +571,87 @@ class PhotoWallDialog(QDialog):
             self.progress_bar.hide()
             self.cancel_button.hide()
 
-    def _update_sort_keys(self, nfo_data, index):
-        """更新排序键"""
-        # 处理评分排序键 - 修复评分转换
+    def create_single_container(self, index, poster_file, nfo_data, poster_width, poster_height, title_height, columns):
+        """创建单个容器并显示"""
         try:
-            rating_str = nfo_data.get("rating", "0")
-            # 确保空字符串或None时使用0
-            rating_key = float(rating_str if rating_str and rating_str.strip() else "0")
-        except (ValueError, TypeError):
-            rating_key = 0.0
+            row = index // columns
+            col = index % columns
 
-        if "评分" not in self._sort_keys:
-            self._sort_keys["评分"] = []
-        # 使用元组确保相同评分时保持稳定排序
-        self._sort_keys["评分"].append(
-            (rating_key, index, len(self._sort_keys.get("评分", [])))
-        )
+            # 创建容器
+            container = PosterContainer(
+                poster_width, poster_height, title_height, self.dpi_scale
+            )
+            container_layout = container.layout
 
-        # 其他排序键的处理...
-        actors = nfo_data.get("actors", [])
-        actors_key = actors[0] if actors else ""
-        if "演员" not in self._sort_keys:
-            self._sort_keys["演员"] = []
-        self._sort_keys["演员"].append(
-            (actors_key, index, len(self._sort_keys.get("演员", [])))
-        )
-
-        series_key = nfo_data.get("series") or ""
-        if "系列" not in self._sort_keys:
-            self._sort_keys["系列"] = []
-        self._sort_keys["系列"].append(
-            (series_key, index, len(self._sort_keys.get("系列", [])))
-        )
-
-        release = nfo_data.get("release", "")
-        try:
-            from datetime import datetime
-
-            date_key = datetime.strptime(release, "%Y-%m-%d")
-        except:
-            date_key = datetime.min
-
-        if "日期" not in self._sort_keys:
-            self._sort_keys["日期"] = []
-        self._sort_keys["日期"].append(
-            (date_key, index, len(self._sort_keys.get("日期", [])))
-        )
-
-    def create_empty_containers(
-        self, total_items, poster_width, poster_height, title_height
-    ):
-        """创建所有空的海报容器"""
-        # 清除现有内容
-        while self.grid.count():
-            item = self.grid.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        self.poster_containers.clear()
-        columns = 8  # 固定列数
-
-        for index in range(total_items):
-            try:
-                # 计算位置
-                row = index // columns
-                col = index % columns
-
-                # 创建容器
-                container = PosterContainer(
-                    poster_width, poster_height, title_height, self.dpi_scale
-                )
-                container_layout = container.layout
-
-                # 创建海报图片标签
-                poster_label = QLabel()
-                poster_label.setObjectName(f"poster_{row}_{col}")
-                poster_label.setAlignment(Qt.AlignCenter)
-                poster_label.setFixedSize(poster_width, poster_height)
-                poster_label.setCursor(Qt.PointingHandCursor)
-                poster_label.setStyleSheet(
-                    """
-                        QLabel {
-                            background-color: rgb(18, 18, 18);
-                            border-top-left-radius: 4px;
-                            border-top-right-radius: 4px;
-                        }
-                    """
-                )
-
-                # 创建标题区域
-                title_widget = QWidget()
-                title_widget.setFixedSize(poster_width, title_height)
-                title_widget.setCursor(Qt.PointingHandCursor)
-
-                title_layout = QVBoxLayout(title_widget)
-                title_layout.setSpacing(int(2 * self.dpi_scale))
-                title_layout.setContentsMargins(
-                    int(10 * self.dpi_scale),
-                    int(5 * self.dpi_scale),
-                    int(10 * self.dpi_scale),
-                    int(5 * self.dpi_scale),
-                )
-
-                # 创建标题标签
-                title_label = QLabel()
-                title_label.setStyleSheet(
-                    f"""
-                        QLabel {{
-                            color: rgb(240, 240, 240);
-                            font-size: {int(13 * self.dpi_scale)}px;
-                            font-weight: bold;
-                        }}
-                    """
-                )
-                title_label.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
-                title_label.setWordWrap(True)
-                title_label.setFixedHeight(int(title_height * 0.6))
-
-                # 创建信息标签
-                info_label = QLabel()
-                info_label.setStyleSheet(
-                    f"""
-                        QLabel {{
-                            color: rgb(180, 180, 180);
-                            font-size: {int(12 * self.dpi_scale)}px;
-                        }}
-                    """
-                )
-                info_label.setAlignment(Qt.AlignCenter)
-
-                # 组装布局
-                title_layout.addWidget(title_label)
-                title_layout.addWidget(info_label)
-                container_layout.addWidget(poster_label)
-                container_layout.addWidget(title_widget)
-
-                # 添加到网格
-                self.grid.addWidget(container, row, col)
-
-                # 保存框体信息
-                container_info = {
-                    "container": container,
-                    "poster_label": poster_label,
-                    "title_label": title_label,
-                    "info_label": info_label,
-                    "row": row,
-                    "col": col,
+            # 创建海报图片标签
+            poster_label = QLabel()
+            poster_label.setObjectName(f"poster_{row}_{col}")
+            poster_label.setAlignment(Qt.AlignCenter)
+            poster_label.setFixedSize(poster_width, poster_height)
+            poster_label.setCursor(Qt.PointingHandCursor)
+            poster_label.setStyleSheet(
+                """
+                QLabel {
+                    background-color: rgb(18, 18, 18);
+                    border-top-left-radius: 4px;
+                    border-top-right-radius: 4px;
                 }
-                self.poster_containers.append(container_info)
+                """
+            )
 
-            except Exception as e:
-                print(f"创建容器失败，索引 {index}: {str(e)}")
+            # 创建标题区域
+            title_widget = QWidget()
+            title_widget.setFixedSize(poster_width, title_height)
+            title_widget.setCursor(Qt.PointingHandCursor)
 
-    def update_container_content(self, index, poster_file, nfo_data):
-        """更新容器内容 - 修复版本"""
-        if index >= len(self.poster_containers):
-            return
+            title_layout = QVBoxLayout(title_widget)
+            title_layout.setSpacing(int(2 * self.dpi_scale))
+            title_layout.setContentsMargins(
+                int(10 * self.dpi_scale),
+                int(5 * self.dpi_scale),
+                int(10 * self.dpi_scale),
+                int(5 * self.dpi_scale),
+            )
 
-        try:
-            container_info = self.poster_containers[index]
-            if not container_info:
-                print(f"容器信息不存在，索引 {index}")
-                return
+            # 标题标签
+            title_label = QLabel()
+            title_label.setStyleSheet(
+                f"""
+                QLabel {{
+                    color: rgb(240, 240, 240);
+                    font-size: {int(13 * self.dpi_scale)}px;
+                    font-weight: bold;
+                }}
+                """
+            )
+            title_label.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+            title_label.setWordWrap(True)
+            title_label.setFixedHeight(int(title_height * 0.6))
 
-            if not all(
-                key in container_info
-                for key in ["title_label", "info_label", "poster_label"]
-            ):
-                print(f"容器信息不完整，索引 {index}")
-                return
+            # 信息标签
+            info_label = QLabel()
+            info_label.setStyleSheet(
+                f"""
+                QLabel {{
+                    color: rgb(180, 180, 180);
+                    font-size: {int(12 * self.dpi_scale)}px;
+                }}
+                """
+            )
+            info_label.setAlignment(Qt.AlignCenter)
 
-            # 更新标题
+            title_layout.addWidget(title_label)
+            title_layout.addWidget(info_label)
+            container_layout.addWidget(poster_label)
+            container_layout.addWidget(title_widget)
+
+            # 添加到网格
+            self.grid.addWidget(container, row, col)
+
+            # 更新文本内容
             title = nfo_data.get("title", "")
-            container_info["title_label"].setText(title)
+            title_label.setText(title)
 
-            # 更新信息
             info_parts = []
             if year := nfo_data.get("year"):
                 info_parts.append(year)
@@ -748,25 +665,95 @@ class PhotoWallDialog(QDialog):
                 if actors and isinstance(actors, list):
                     info_parts.append(actors[0])
 
-            container_info["info_label"].setText(" · ".join(info_parts))
+            info_label.setText(" · ".join(info_parts))
 
-            # 绑定事件处理
+            # 确保所有组件都可见
+            poster_label.show()
+            title_label.show()
+            info_label.show()
+            title_widget.show()
+            container.show()
+
+            # 绑定事件
             poster_path = os.path.dirname(poster_file)
             if poster_path and os.path.exists(poster_path):
-                container_info["poster_label"].mousePressEvent = (
-                    lambda e, p=poster_path: self.play_video(p)
-                )
-                container_info["title_label"].parent().mousePressEvent = (
-                    lambda e, p=poster_path: self.select_in_editor(p)
-                )
-            else:
-                print(f"海报路径无效 {poster_file}")
+                poster_label.mousePressEvent = lambda e, p=poster_path: self.play_video(p)
+                title_widget.mousePressEvent = lambda e, p=poster_path: self.select_in_editor(p)
 
-            # 更新映射关系
-            self.data_to_container_map[index] = container_info
+            # 返回容器信息
+            container_info = {
+                "container": container,
+                "poster_label": poster_label,
+                "title_label": title_label,
+                "info_label": info_label,
+                "row": row,
+                "col": col,
+            }
+
+            return container_info
 
         except Exception as e:
-            print(f"更新容器内容失败，索引 {index}: {str(e)}")
+            print(f"创建容器失败，索引 {index}: {str(e)}")
+            return None
+
+    def clear_all_data(self):
+        """清空所有数据"""
+        # 清空容器
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        self.all_posters.clear()
+        self._sort_keys.clear()
+        self.poster_containers.clear()
+        self.parse_nfo.cache_clear()
+
+    def _update_sort_keys(self, nfo_data, index):
+        """更新排序键"""
+        # 处理评分排序键
+        try:
+            rating_str = nfo_data.get("rating", "0")
+            rating_key = float(rating_str if rating_str and rating_str.strip() else "0")
+        except (ValueError, TypeError):
+            rating_key = 0.0
+
+        if "评分" not in self._sort_keys:
+            self._sort_keys["评分"] = []
+        self._sort_keys["评分"].append((rating_key, index, len(self._sort_keys.get("评分", []))))
+
+        # 演员
+        actors = nfo_data.get("actors", [])
+        actors_key = actors[0] if actors else ""
+        if "演员" not in self._sort_keys:
+            self._sort_keys["演员"] = []
+        self._sort_keys["演员"].append(
+            (actors_key, index, len(self._sort_keys.get("演员", [])))
+        )
+
+        # 系列
+        series_key = nfo_data.get("series") or ""
+        if "系列" not in self._sort_keys:
+            self._sort_keys["系列"] = []
+        self._sort_keys["系列"].append(
+            (series_key, index, len(self._sort_keys.get("系列", [])))
+        )
+
+        # 日期
+        release = nfo_data.get("release", "")
+        try:
+            from datetime import datetime
+
+            date_key = datetime.strptime(release, "%Y-%m-%d")
+        except:
+            from datetime import datetime
+            date_key = datetime.min
+
+        if "日期" not in self._sort_keys:
+            self._sort_keys["日期"] = []
+        self._sort_keys["日期"].append(
+            (date_key, index, len(self._sort_keys.get("日期", [])))
+        )
 
     def play_video(self, folder_path):
         """播放视频文件"""
@@ -813,15 +800,11 @@ class PhotoWallDialog(QDialog):
                 self.parent_window.activateWindow()
                 self.parent_window.raise_()
             else:
-                # 获取当前程序所在目录
                 if getattr(sys, "frozen", False):
-                    # 如果是打包后的 exe
                     current_dir = os.path.dirname(sys.executable)
                 else:
-                    # 如果是 py 脚本
                     current_dir = os.path.dirname(os.path.abspath(__file__))
 
-                # 根据当前程序运行方式选择对应的编辑器程序
                 is_py = os.path.splitext(sys.argv[0])[1].lower() == ".py"
                 editor_name = "NFO.Editor.Qt5.py" if is_py else "NFO.Editor.Qt5.exe"
                 editor_path = os.path.join(current_dir, editor_name)
@@ -831,7 +814,6 @@ class PhotoWallDialog(QDialog):
                     return
 
                 if is_py:
-                    # 如果是 .py 文件，使用 Python 解释器启动
                     args = [sys.executable]
                     if sys.platform == "win32":
                         pythonw = os.path.join(
@@ -849,7 +831,6 @@ class PhotoWallDialog(QDialog):
                         ]
                     )
                 else:
-                    # 如果是 .exe 文件，直接启动
                     args = [
                         editor_path,
                         "--base-path",
@@ -863,52 +844,11 @@ class PhotoWallDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"启动编辑器失败: {str(e)}")
 
-    def load_poster_images(self):
-        """加载海报图片 - 修复版本"""
-        if not self.poster_containers or not self.all_posters:
-            return
-
-        image_paths_and_labels = []
-        failed_images = []
-
-        for index, (poster_file, _, _) in enumerate(self.all_posters):
-            if index < len(self.poster_containers):
-                if os.path.exists(poster_file):
-                    container_info = self.poster_containers[index]
-                    image_paths_and_labels.append(
-                        (poster_file, container_info["poster_label"])
-                    )
-                else:
-                    failed_images.append(poster_file)
-                    # 如果图片不存在，设置一个默认的占位图
-                    if index < len(self.poster_containers):
-                        container_info = self.poster_containers[index]
-                        container_info["poster_label"].setText("图片未找到")
-                        container_info["poster_label"].setStyleSheet(
-                            """
-                            QLabel {
-                                background-color: rgb(30, 30, 30);
-                                color: rgb(150, 150, 150);
-                                border-top-left-radius: 4px;
-                                border-top-right-radius: 4px;
-                            }
-                        """
-                        )
-
-        if failed_images:
-            print(f"以下图片未找到: {failed_images}")
-
-        if image_paths_and_labels:
-            self.progress_bar.setFormat("加载图片: %v/%m")
-            self.image_manager.add_images(image_paths_and_labels)
-
     def disable_sorting_controls(self):
         """禁用排序和筛选相关的控件"""
-        # 禁用排序按钮
         for button in self.sorting_group.buttons():
             button.setEnabled(False)
 
-        # 禁用筛选控件
         if hasattr(self, "field_combo"):
             self.field_combo.setEnabled(False)
         if hasattr(self, "condition_combo"):
@@ -918,11 +858,9 @@ class PhotoWallDialog(QDialog):
 
     def enable_sorting_controls(self):
         """启用排序和筛选相关的控件"""
-        # 启用排序按钮
         for button in self.sorting_group.buttons():
             button.setEnabled(True)
 
-        # 启用筛选控件
         if hasattr(self, "field_combo"):
             self.field_combo.setEnabled(True)
         if hasattr(self, "condition_combo"):
@@ -931,7 +869,7 @@ class PhotoWallDialog(QDialog):
             self.filter_entry.setEnabled(True)
 
     def sort_posters(self):
-        """带进度显示的排序函数"""
+        """修复后的排序函数 - 只移动容器位置，不重新加载图片"""
         if not self.sorting_group.checkedButton():
             return
 
@@ -941,136 +879,100 @@ class PhotoWallDialog(QDialog):
             return
 
         try:
-            # 禁用UI控件,阻止重复操作
             self.disable_sorting_controls()
-            self.is_loading = True  # 添加加载状态标记
 
-            # 显示进度条
-            self.progress_bar.setFormat(f"正在{sort_by}排序: %v/%m")
+            self.progress_bar.setFormat(f"正在{sort_by}排序...")
             self.progress_bar.setValue(0)
+            self.progress_bar.setMaximum(100)
             self.progress_bar.show()
-            self.cancel_button.show()
 
-            # 记录当前可见性和位置信息
-            visibility_states = {}
-            grid_positions = {}
-            for index, container_info in enumerate(self.poster_containers):
-                if container_info and "container" in container_info:
-                    visibility_states[index] = container_info["container"].isVisible()
-                    pos = self.grid.getItemPosition(
-                        self.grid.indexOf(container_info["container"])
-                    )
-                    grid_positions[index] = pos
+            QApplication.processEvents()
 
-            # 排序
+            # 1. 排序索引（纯内存操作，极快）
             sort_tuples = self._sort_keys[sort_by]
             reverse = sort_by in ["评分", "日期"]
-            sorted_tuples = sorted(
-                sort_tuples, key=lambda x: (x[0] or "", x[2]), reverse=reverse
-            )
+
+            if sort_by == "评分":
+                sorted_tuples = sorted(
+                    sort_tuples,
+                    key=lambda x: (
+                        x[0] if x[0] is not None else -float("inf"),
+                        x[2],
+                    ),
+                    reverse=reverse,
+                )
+            else:
+                sorted_tuples = sorted(
+                    sort_tuples, key=lambda x: (x[0] or "", x[2]), reverse=reverse
+                )
+
             sorted_indices = [t[1] for t in sorted_tuples]
+            self.progress_bar.setValue(30)
+            QApplication.processEvents()
 
-            # 创建临时数据存储
-            temp_posters = self.all_posters.copy()
-            temp_containers = self.poster_containers.copy()
+            # 2. 重新排列数据（不动UI）
+            new_posters = [self.all_posters[i] for i in sorted_indices]
+            new_containers = [self.poster_containers[i] for i in sorted_indices]
 
-            # 设置进度条最大值(可见项目数)
-            visible_total = sum(1 for i in visibility_states.values() if i)
-            self.progress_bar.setMaximum(visible_total)
-            progress = 0
+            self.all_posters = new_posters
+            self.poster_containers = new_containers
+            self.progress_bar.setValue(60)
+            QApplication.processEvents()
 
-            # 更新数据和UI
-            visible_count = 0
+            # 3. 只移动容器位置（图片和标题都跟随容器移动）
             columns = 8
-            for new_index, original_index in enumerate(sorted_indices):
-                if not self.is_loading:  # 检查是否被取消
-                    break
+            total = len(self.poster_containers)
 
-                if original_index < len(temp_posters) and new_index < len(
-                    temp_containers
-                ):
-                    # 更新数据
-                    self.all_posters[new_index] = temp_posters[original_index]
-                    self.poster_containers[new_index] = temp_containers[original_index]
+            for new_index, container_info in enumerate(self.poster_containers):
+                row = new_index // columns
+                col = new_index % columns
 
-                    container_info = self.poster_containers[new_index]
-                    if container_info and "container" in container_info:
-                        # 更新容器内容
-                        poster_file, _, nfo_data = self.all_posters[new_index]
+                # 只移动容器，里面的内容（图片+标题）保持不变
+                self.grid.removeWidget(container_info["container"])
+                self.grid.addWidget(container_info["container"], row, col)
 
-                        # 更新文本信息
-                        title = nfo_data.get("title", "")
-                        container_info["title_label"].setText(title)
+                # 定期更新UI
+                if new_index % 500 == 0:
+                    progress = 60 + int((new_index / total) * 40)
+                    self.progress_bar.setValue(progress)
+                    QApplication.processEvents()
 
-                        info_parts = []
-                        if year := nfo_data.get("year"):
-                            info_parts.append(year)
-                        if rating := nfo_data.get("rating"):
-                            try:
-                                rating_float = float(rating)
-                                info_parts.append(f"★{rating_float:.1f}")
-                            except (ValueError, TypeError):
-                                pass
-                        if actors := nfo_data.get("actors"):
-                            if actors and isinstance(actors, list):
-                                info_parts.append(actors[0])
-                        container_info["info_label"].setText(" · ".join(info_parts))
-
-                        # 更新图片
-                        if visibility_states.get(original_index, True):
-                            # 如果之前是可见的，计算新位置
-                            row = visible_count // columns
-                            col = visible_count % columns
-                            self.grid.removeWidget(container_info["container"])
-                            self.grid.addWidget(container_info["container"], row, col)
-                            container_info["container"].show()
-                            visible_count += 1
-
-                            # 重新加载图片
-                            reader = QImageReader(poster_file)
-                            if reader.canRead():
-                                target_size = container_info["poster_label"].size()
-                                original_size = reader.size()
-                                width_ratio = (
-                                    target_size.width() / original_size.width()
-                                )
-                                height_ratio = (
-                                    target_size.height() / original_size.height()
-                                )
-                                scale_ratio = min(width_ratio, height_ratio)
-                                new_width = int(original_size.width() * scale_ratio)
-                                new_height = int(original_size.height() * scale_ratio)
-                                reader.setScaledSize(QSize(new_width, new_height))
-                                image = reader.read()
-                                if not image.isNull():
-                                    pixmap = QPixmap.fromImage(image)
-                                    container_info["poster_label"].setPixmap(pixmap)
-
-                            # 更新进度
-                            progress += 1
-                            self.progress_bar.setValue(progress)
-                            QApplication.processEvents()  # 允许UI更新
-                        else:
-                            container_info["container"].hide()
-
-            # 重建排序键
+            # 4. 重建排序键
             self._sort_keys.clear()
             for index, (_, _, nfo_data) in enumerate(self.all_posters):
                 self._update_sort_keys(nfo_data, index)
 
+            self.progress_bar.setValue(100)
+            self.update_status(len(self.all_posters))
+            
+            # 验证容器结构（调试用）
+            self.verify_container_structure()
+
         except Exception as e:
             print(f"排序失败: {str(e)}")
-            QMessageBox.warning(self, "警告", "排序过程中发生错误")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.warning(self, "警告", f"排序过程中发生错误: {str(e)}")
         finally:
-            # 隐藏进度条
             self.progress_bar.hide()
-            self.cancel_button.hide()
-            # 恢复UI控件
             self.enable_sorting_controls()
-            self.is_loading = False  # 重置加载状态
+    
+    def verify_container_structure(self):
+        """验证容器结构完整性（调试用）"""
+        missing_titles = 0
+        for i, container_info in enumerate(self.poster_containers[:5]):  # 只检查前5个
+            if container_info:
+                has_title = container_info["title_label"].text() != ""
+                title_visible = container_info["title_label"].isVisible()
+                if not has_title or not title_visible:
+                    missing_titles += 1
+                    print(f"容器 {i}: 标题={'有' if has_title else '无'}, 可见={'是' if title_visible else '否'}")
+        
+        if missing_titles > 0:
+            print(f"警告：发现 {missing_titles} 个容器标题不可见！")
 
     def apply_filter(self):
-        """修复后的筛选函数 - 确保结果连续显示"""
+        """筛选函数 - 只改变容器位置，保持内部结构"""
         field = self.field_combo.currentText()
         condition = self.condition_combo.currentText()
         filter_text = self.filter_entry.text().strip()
@@ -1079,21 +981,20 @@ class PhotoWallDialog(QDialog):
             visible_count = 0
             columns = 8
 
-            # 如果没有筛选条件，显示所有内容
             if not filter_text:
+                # 显示所有容器
                 for index, container_info in enumerate(self.poster_containers):
                     if container_info and "container" in container_info:
-                        # 计算新的网格位置
                         row = visible_count // columns
                         col = visible_count % columns
-
-                        # 移动到正确位置并显示
-                        self.grid.removeWidget(container_info["container"])
-                        self.grid.addWidget(container_info["container"], row, col)
-                        container_info["container"].show()
+                        
+                        container = container_info["container"]
+                        self.grid.removeWidget(container)
+                        self.grid.addWidget(container, row, col)
+                        container.show()
                         visible_count += 1
             else:
-                # 应用筛选条件
+                # 根据条件筛选
                 for index, (_, _, nfo_data) in enumerate(self.all_posters):
                     if index >= len(self.poster_containers):
                         continue
@@ -1121,28 +1022,26 @@ class PhotoWallDialog(QDialog):
                             filter_value = float(filter_text)
                             if condition == "大于":
                                 match = current_value > filter_value
-                            else:  # 小于
+                            else:
                                 match = current_value < filter_value
                         except ValueError:
                             match = False
                     else:
                         if condition == "包含":
                             match = filter_text.lower() in value.lower()
-                        else:  # 不包含
+                        else:
                             match = filter_text.lower() not in value.lower()
 
+                    container = container_info["container"]
                     if match:
-                        # 计算新的网格位置
                         row = visible_count // columns
                         col = visible_count % columns
-
-                        # 移动到正确位置并显示
-                        self.grid.removeWidget(container_info["container"])
-                        self.grid.addWidget(container_info["container"], row, col)
-                        container_info["container"].show()
+                        self.grid.removeWidget(container)
+                        self.grid.addWidget(container, row, col)
+                        container.show()
                         visible_count += 1
                     else:
-                        container_info["container"].hide()
+                        container.hide()
 
             self.update_status(visible_count)
 
@@ -1159,22 +1058,13 @@ class PhotoWallDialog(QDialog):
         else:
             self.condition_combo.addItems(["包含", "不包含"])
 
-    def update_progress(self, current, total, stage=None):
+    def update_progress(self, current, total):
         """更新进度条"""
-        if stage:
-            if stage == LoadStage.SCANNING:
-                self.progress_bar.setFormat("扫描文件: %v/%m")
-            elif stage == LoadStage.PREPARING:
-                self.progress_bar.setFormat("准备显示: %v/%m")
-            else:
-                self.progress_bar.setFormat("加载图片: %v/%m")
-
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(current)
-        self.update_status(current, total, stage)
 
     def update_status(self, count, total=None, stage=None, cancelled=False):
-        """更新状态栏 - 修复版本"""
+        """更新状态栏"""
         if cancelled:
             self.status_label.setText(f"已取消加载，已加载 {count}/{total} 个影片")
             return
@@ -1185,21 +1075,21 @@ class PhotoWallDialog(QDialog):
             stage_text = ""
             if stage == LoadStage.SCANNING:
                 stage_text = "扫描文件"
-            elif stage == LoadStage.PREPARING:
-                stage_text = "准备显示"
             elif stage == LoadStage.LOADING:
-                stage_text = "加载图片"
+                stage_text = "加载影片"
 
             if stage_text:
                 self.status_label.setText(f"{stage_text}: {count}/{total}")
 
     def update_image_label(self, path, label, pixmap):
-        """更新图片标签"""
+        """更新图片标签 - 只更新图片，保持标题显示"""
         try:
             if label and not label.isHidden():
+                # 只设置图片，不影响容器的其他部分
                 label.setPixmap(pixmap)
+                # 确保图片标签可见
+                label.show()
 
-            # 检查是否所有图片都已加载完成
             if (
                 self.image_manager.loaded_images >= self.image_manager.total_images
                 and self.is_loading
@@ -1207,73 +1097,48 @@ class PhotoWallDialog(QDialog):
                 self.progress_bar.hide()
                 self.cancel_button.hide()
                 self.is_loading = False
+                self.update_status(len(self.all_posters))
         except Exception as e:
             print(f"更新图片标签失败: {str(e)}")
 
     def on_resize(self, event):
         """窗口大小改变事件处理"""
         super().resizeEvent(event)
-        self.resize_timer.start(150)  # 延迟处理以避免频繁重绘
+        self.resize_timer.start(150)
 
     def handle_resize(self):
-        """处理窗口大小改变 - 修复版本"""
+        """处理窗口大小改变"""
         if not self.poster_containers:
             return
 
         try:
-            # 重新计算网格尺寸
             columns, poster_width, poster_height, title_height = (
                 self.calculate_grid_dimensions()
             )
             spacing = int(15 * self.dpi_scale)
 
-            # 计算每行的宽度
-            row_width = columns * poster_width + (columns - 1) * spacing
-
-            # 更新网格布局的间距
-            self.grid.setSpacing(spacing)
-
-            # 更新所有容器的大小
             for index, container_info in enumerate(self.poster_containers):
-                if not container_info:  # 增加空值检查
+                if not container_info:
                     continue
 
-                # 计算新的位置
                 row = index // columns
                 col = index % columns
 
                 try:
-                    # 更新容器大小
                     container = container_info["container"]
                     container.setFixedSize(poster_width, poster_height + title_height)
 
-                    # 更新海报标签大小
                     poster_label = container_info["poster_label"]
                     poster_label.setFixedSize(poster_width, poster_height)
 
-                    # 更新标题区域大小
                     title_widget = container_info["title_label"].parent()
                     title_widget.setFixedSize(poster_width, title_height)
-                    title_widget.layout().setContentsMargins(
-                        int(10 * self.dpi_scale),
-                        int(5 * self.dpi_scale),
-                        int(10 * self.dpi_scale),
-                        int(5 * self.dpi_scale),
-                    )
 
-                    # 更新网格位置
+                    self.grid.removeWidget(container)
                     self.grid.addWidget(container, row, col)
 
                 except Exception as e:
                     print(f"更新容器 {index} 失败: {str(e)}")
-
-            # 更新内容区域的大小
-            total_items = len(self.poster_containers)
-            total_rows = (total_items + columns - 1) // columns
-            content_height = (
-                total_rows * (poster_height + title_height) + (total_rows - 1) * spacing
-            )
-            self.content_widget.setMinimumSize(row_width, content_height)
 
         except Exception as e:
             print(f"处理窗口大小改变失败: {str(e)}")
@@ -1288,11 +1153,10 @@ class PhotoWallDialog(QDialog):
 
         if folder_selected:
             self.folder_path = folder_selected
-            # 保存当前选择的目录
             self.settings.setValue("last_directory", folder_selected)
             self.load_posters(folder_selected)
 
-    @lru_cache(maxsize=100)
+    @lru_cache(maxsize=1000)
     def parse_nfo(self, nfo_path):
         """解析NFO文件（带缓存）"""
         try:
@@ -1354,28 +1218,17 @@ class PhotoWallDialog(QDialog):
             )
 
     def closeEvent(self, event):
-        """关闭窗口时清理资源 - 完整修复版本"""
+        """关闭窗口时清理资源"""
         try:
-            # 取消正在进行的加载和排序
             if self.is_loading:
                 self.cancel_loading()
 
-            # 停止图片加载
             if hasattr(self, "image_manager"):
                 self.image_manager.stop()
-                self.image_manager.executor.shutdown(wait=True)  # 确保完全停止
+                self.image_manager.executor.shutdown(wait=True)
 
-            # 清理容器引用
-            self.poster_containers.clear()
-            self.data_to_container_map.clear()
+            self.clear_all_data()
 
-            # 清理排序数据
-            self._sort_keys.clear()
-
-            # 清理缓存
-            self.parse_nfo.cache_clear()
-
-            # 保存设置
             if self.folder_path and os.path.exists(self.folder_path):
                 self.settings.setValue("last_directory", self.folder_path)
 
@@ -1386,7 +1239,6 @@ class PhotoWallDialog(QDialog):
 
 
 def main():
-    # 在创建 QApplication 之前设置高DPI属性
     if hasattr(Qt, "AA_EnableHighDpiScaling"):
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
     if hasattr(Qt, "AA_UseHighDpiPixmaps"):
@@ -1394,16 +1246,13 @@ def main():
 
     app = QApplication(sys.argv)
 
-    # 设置蓝色主题
     app.setPalette(BluePalette())
     app.setStyle("Fusion")
 
-    # 设置全局字体
     font = app.font()
     font.setFamily("Microsoft YaHei UI")
     app.setFont(font)
 
-    # 解析命令行参数
     folder_path = None
     if len(sys.argv) > 1:
         folder_path = sys.argv[1]
