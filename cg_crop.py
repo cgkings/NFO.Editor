@@ -17,7 +17,7 @@ from PyQt5.QtGui import QIcon, QImage, QImageReader, QPixmap, QPainter, QPen, QT
 # ================================ 配置管理 ================================
 class CropConfig:
     """裁剪工具配置中心"""
-    APP_VERSION = "v9.7.5"
+    APP_VERSION = "v9.7.6"
     APP_TITLE = "大锤 EMBY海报裁剪工具"
     WINDOW_SIZE = (1200, 680)
     IMAGE_DISPLAY_SIZE = (800, 538)
