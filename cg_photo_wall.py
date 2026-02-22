@@ -177,7 +177,9 @@ class PhotoWallDialog(QDialog):
 
     def __init__(self, folder_path=None, parent=None):
         super().__init__(parent)
-        self.parent_window = parent
+        # parent_window 与 Qt parent 解耦：Qt parent 决定对象树归属，
+        # parent_window 仅用于回调编辑器，通过 set_editor() 单独注入。
+        self.parent_window = None
         self.folder_path = folder_path
         self.all_posters = []
         self._sort_keys = {}
@@ -228,9 +230,17 @@ class PhotoWallDialog(QDialog):
             if last_dir and os.path.exists(last_dir):
                 self.folder_path = last_dir
 
+    def set_editor(self, editor):
+        """注入编辑器引用（与 Qt parent 完全解耦，仅用于回调定位）。
+        由 NFO.Editor.Qt5 在创建本窗口后调用：
+            dialog = PhotoWallDialog(path, None)
+            dialog.set_editor(self)
+        """
+        self.parent_window = editor
+
     def init_ui(self):
         """初始化UI"""
-        self.setWindowTitle("大锤 照片墙 v9.7.6")
+        self.setWindowTitle("大锤 照片墙 v9.7.7")
         self.setStyleSheet(
             """
             QDialog {
@@ -1040,6 +1050,10 @@ class PhotoWallDialog(QDialog):
         try:
             if self.parent_window:
                 self.parent_window.select_folder_in_tree(folder_path)
+                # 还原最小化，然后激活到前台（平级窗口可正常置顶）
+                self.parent_window.setWindowState(
+                    self.parent_window.windowState() & ~Qt.WindowMinimized | Qt.WindowActive
+                )
                 self.parent_window.activateWindow()
                 self.parent_window.raise_()
             else:
@@ -1048,39 +1062,42 @@ class PhotoWallDialog(QDialog):
                 else:
                     current_dir = os.path.dirname(os.path.abspath(__file__))
 
-                is_py = os.path.splitext(sys.argv[0])[1].lower() == ".py"
-                editor_name = "NFO.Editor.Qt5.py" if is_py else "NFO.Editor.Qt5.exe"
-                editor_path = os.path.join(current_dir, editor_name)
+                is_py = not getattr(sys, "frozen", False)
 
-                if not os.path.exists(editor_path):
-                    QMessageBox.critical(self, "错误", f"找不到编辑器程序{editor_name}")
+                # 按优先顺序探测编辑器文件名（下划线版 / 点分隔版）
+                if is_py:
+                    candidates = ["NFO_Editor_Qt5.py", "NFO.Editor.Qt5.py"]
+                else:
+                    candidates = ["NFO_Editor_Qt5.exe", "NFO.Editor.Qt5.exe"]
+
+                editor_path = None
+                for name in candidates:
+                    p = os.path.join(current_dir, name)
+                    if os.path.exists(p):
+                        editor_path = p
+                        break
+
+                if not editor_path:
+                    QMessageBox.critical(
+                        self, "错误",
+                        f"找不到编辑器程序，已查找：{', '.join(candidates)}"
+                    )
                     return
 
+                extra_args = [
+                    "--base-path", os.path.dirname(folder_path),
+                    "--select-folder", folder_path,
+                ]
+
                 if is_py:
-                    args = [sys.executable]
+                    python_exe = sys.executable
                     if sys.platform == "win32":
-                        pythonw = os.path.join(
-                            os.path.dirname(sys.executable), "pythonw.exe"
-                        )
+                        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
                         if os.path.exists(pythonw):
-                            args = [pythonw]
-                    args.extend(
-                        [
-                            editor_path,
-                            "--base-path",
-                            os.path.dirname(folder_path),
-                            "--select-folder",
-                            folder_path,
-                        ]
-                    )
+                            python_exe = pythonw
+                    args = [python_exe, editor_path] + extra_args
                 else:
-                    args = [
-                        editor_path,
-                        "--base-path",
-                        os.path.dirname(folder_path),
-                        "--select-folder",
-                        folder_path,
-                    ]
+                    args = [editor_path] + extra_args
 
                 subprocess.Popen(args)
 

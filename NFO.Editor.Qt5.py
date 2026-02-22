@@ -680,6 +680,7 @@ class NFOEditorQt5(NFOEditorQt):
         self.selected_index_cache = None
         self.move_thread = None
         self.file_watcher = QFileSystemWatcher()
+        self._pending_select_folder = None   # 命令行 --select-folder 的延迟选择路径
 
         # 缓存和异步加载
         self.nfo_cache = NFOCache()
@@ -1037,6 +1038,12 @@ class NFOEditorQt5(NFOEditorQt):
             self.on_file_select()
         elif selection_path:
             self._restore_selection(selection_path)
+
+        # 处理命令行 --select-folder 的延迟选择（加载完成后再定位，避免异步时序问题）
+        if self._pending_select_folder:
+            pending = self._pending_select_folder
+            self._pending_select_folder = None
+            self.select_folder_in_tree(pending)
 
         if self.load_thread:
             self.load_thread.deleteLater()
@@ -2486,7 +2493,10 @@ class NFOEditorQt5(NFOEditorQt):
                 QMessageBox.warning(self, "警告", "请先选择NFO目录")
                 return
 
-            dialog = PhotoWallDialog(self.folder_path, self)
+            # parent 传 None：照片墙成为独立顶级窗口，与编辑器平级，
+            # 互相 activateWindow/raise_ 均可正常置顶，不受 Qt 父子层级限制。
+            dialog = PhotoWallDialog(self.folder_path, None)
+            dialog.set_editor(self)      # 单独注入编辑器引用，仅用于回调定位
             dialog.setAttribute(Qt.WA_DeleteOnClose)
             dialog.show()
 
@@ -2622,9 +2632,12 @@ def main():
 
     if args.base_path and os.path.exists(args.base_path):
         window.folder_path = args.base_path
-        window.load_files_in_folder()
+        # 先把待选路径存入 _pending_select_folder，
+        # load_files_in_folder 是异步的，实际选择在 _on_load_finished 回调里执行，
+        # 避免文件树尚未加载完毕时就调用 select_folder_in_tree 导致找不到目标项。
         if args.select_folder:
-            window.select_folder_in_tree(args.select_folder)
+            window._pending_select_folder = args.select_folder
+        window.load_files_in_folder()
 
     window.show()
     sys.exit(app.exec_())
