@@ -965,7 +965,7 @@ class NFOEditorQt5(NFOEditorQt):
 
     def load_files_in_folder(self, auto_select=True, show_progress=True):
         """加载文件夹中的NFO文件 - 异步版本
-        
+
         show_progress=False 时静默重载，不显示/隐藏进度条（用于移动后的自动刷新）
         """
         if not self.folder_path:
@@ -2054,17 +2054,12 @@ class NFOEditorQt5(NFOEditorQt):
                         video_path = video_base + ext
                         if os.path.exists(video_path):
                             if ext == ".strm":
-                                try:
-                                    with open(video_path, "r", encoding="utf-8") as f:
-                                        strm_url = f.readline().strip()
-                                    if strm_url:
-                                        subprocess.Popen(["mpvnet", strm_url])
-                                    else:
-                                        QMessageBox.critical(self, "错误", "STRM文件内容为空或无效")
-                                except Exception as e:
-                                    QMessageBox.critical(self, "错误", f"读取STRM文件失败: {str(e)}")
+                                self._play_strm(video_path)
                             else:
-                                subprocess.Popen(["mpvnet", video_path])
+                                try:
+                                    subprocess.Popen(["mpvnet", video_path])
+                                except OSError as e:
+                                    QMessageBox.critical(self, "错误", f"启动 mpvnet 失败: {e}")
                             return
 
                     QMessageBox.warning(self, "警告", "未找到匹配的视频文件")
@@ -2097,19 +2092,18 @@ class NFOEditorQt5(NFOEditorQt):
             if trailer_files:
                 trailer_path = trailer_files[0]
                 if trailer_path.lower().endswith(".strm"):
-                    try:
-                        with open(trailer_path, "r", encoding="utf-8") as f:
-                            strm_url = f.readline().strip()
-                        if strm_url:
-                            subprocess.Popen(["mpvnet", strm_url])
-                            self.status_bar.showMessage(f"正在播放预告片: {os.path.basename(trailer_path)}", 3000)
-                        else:
-                            QMessageBox.critical(self, "错误", "STRM文件内容为空或无效")
-                    except Exception as e:
-                        QMessageBox.critical(self, "错误", f"读取STRM文件失败: {str(e)}")
+                    if self._play_strm(trailer_path):
+                        self.status_bar.showMessage(
+                            f"正在播放预告片: {os.path.basename(trailer_path)}", 3000
+                        )
                 else:
-                    subprocess.Popen(["mpvnet", trailer_path])
-                    self.status_bar.showMessage(f"正在播放预告片: {os.path.basename(trailer_path)}", 3000)
+                    try:
+                        subprocess.Popen(["mpvnet", trailer_path])
+                        self.status_bar.showMessage(
+                            f"正在播放预告片: {os.path.basename(trailer_path)}", 3000
+                        )
+                    except OSError as e:
+                        QMessageBox.critical(self, "错误", f"启动 mpvnet 失败: {e}")
             else:
                 search_engine = SearchEngine()
 
@@ -2143,6 +2137,65 @@ class NFOEditorQt5(NFOEditorQt):
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"播放预告片失败: {str(e)}")
+
+    # ================================================================
+    #  STRM 播放辅助 - 自动附加同名字幕
+    # ================================================================
+
+    def _play_strm(self, strm_path: str) -> bool:
+        """读取 STRM 并调用 mpvnet 播放，自动附加同目录下的同名字幕文件。
+
+        字幕匹配规则：文件名以 <strm_stem> 开头，且紧跟 "." 或到达末尾，
+        扩展名为常见字幕格式。
+        例如 JUR-687-破解-C.strm 可匹配：
+            JUR-687-破解-C.srt
+            JUR-687-破解-C.chs.srt
+            JUR-687-破解-C.zh.ass
+        不会匹配：
+            JUR-687-破解-CD.srt（紧跟字符不是 "."）
+            JUR-687-破解-C-commentary.srt（紧跟字符不是 "."）
+
+        返回 True 表示成功启动播放，False 表示出错已弹窗提示。
+        """
+        SUBTITLE_EXTS = (".srt", ".ass", ".ssa", ".vtt", ".sup")
+
+        try:
+            with open(strm_path, "r", encoding="utf-8") as f:
+                strm_url = f.readline().strip()
+        except OSError as e:
+            QMessageBox.critical(self, "错误", f"读取 STRM 文件失败: {e}")
+            return False
+
+        if not strm_url:
+            QMessageBox.critical(self, "错误", "STRM 文件内容为空或无效")
+            return False
+
+        folder = os.path.dirname(strm_path)
+        # base_name 不含任何扩展名，如 "JUR-687-破解-C"
+        base_name = os.path.splitext(os.path.basename(strm_path))[0]
+
+        cmd = ["mpvnet", strm_url]
+        try:
+            for entry in os.scandir(folder):
+                name = entry.name
+                # 扩展名必须是字幕格式（大小写不敏感）
+                if not name.lower().endswith(SUBTITLE_EXTS):
+                    continue
+                # base_name 后紧跟 "." 才算匹配，防止前缀相同但文件名不同的文件误入
+                # 例如 "JUR-687-破解-C." 开头才匹配，"JUR-687-破解-CD." 不匹配
+                rest = name[len(base_name):]
+                if name.startswith(base_name) and rest.startswith("."):
+                    cmd.append(f"--sub-file={entry.path}")
+        except OSError as e:
+            # 扫描失败不影响播放，仅打印日志
+            print(f"扫描字幕文件失败: {e}")
+
+        try:
+            subprocess.Popen(cmd)
+            return True
+        except OSError as e:
+            QMessageBox.critical(self, "错误", f"启动 mpvnet 失败: {e}")
+            return False
 
     # ================================================================
     #  番号搜索
