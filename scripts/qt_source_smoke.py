@@ -19,6 +19,38 @@ os.environ["LOCALAPPDATA"] = _temp_root.name
 repo_root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo_root))
 
+_required_source_files = (
+    "nfo_editor.py",
+    "nfo_editor_ui.py",
+    "nfo_editor_events.py",
+    "nfo_utils.py",
+    "cg_crop.py",
+    "cg_dedupe.py",
+    "cg_photo_wall.py",
+    "cg_rename.py",
+)
+
+
+def _exact_file_exists(relative: str) -> bool:
+    target = repo_root / relative
+    parent = target.parent
+    if not parent.is_dir():
+        return False
+    return any(child.name == target.name and child.is_file() for child in parent.iterdir())
+
+
+_missing_source_files = [
+    relative for relative in _required_source_files
+    if not _exact_file_exists(relative)
+]
+if _missing_source_files:
+    raise SystemExit(
+        "Qt source smoke test cannot start because files are missing or use "
+        "the wrong filename casing: "
+        + ", ".join(_missing_source_files)
+        + ". Run scripts/fix_source_filename_case.ps1, commit, and push."
+    )
+
 from PySide6.QtCore import QCoreApplication  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 

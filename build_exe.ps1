@@ -1,5 +1,11 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+Write-Host "Validating repository source layout..."
+python scripts/check_source_layout.py
+if ($LASTEXITCODE -ne 0) {
+    throw "Required source files are missing. See the list above."
+}
 
 Write-Host "Creating virtual environment..."
 if (-not (Test-Path ".venv")) {

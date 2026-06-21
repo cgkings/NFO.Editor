@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$OutputRoot = "dist/NFOTools"
 )
@@ -10,6 +10,12 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $repoRoot
 
 try {
+    Write-Host "Validating repository source layout..."
+    & python "scripts/check_source_layout.py"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Required source files are missing. See the list above."
+    }
+
     $outputPath = Join-Path $repoRoot $OutputRoot
     $mainDist = Join-Path $repoRoot "dist/NFOEditor"
     $standaloneDist = Join-Path $repoRoot "dist/standalone"

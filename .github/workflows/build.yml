@@ -5,6 +5,8 @@ on:
     branches:
       - main
       - master
+      - QT6
+      - qt6
     tags:
       - "v*"
   pull_request:
@@ -39,8 +41,75 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v7
         with:
+          ref: ${{ github.ref }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Show selected ref and checked-out revision
+        shell: pwsh
+        run: |
+          Write-Host "event_name = ${{ github.event_name }}"
+          Write-Host "github.ref = ${{ github.ref }}"
+          Write-Host "github.ref_name = ${{ github.ref_name }}"
+          Write-Host "github.sha = ${{ github.sha }}"
+          Write-Host "workspace = $env:GITHUB_WORKSPACE"
+          git rev-parse --show-toplevel
+          git rev-parse HEAD
+          git branch --show-current
+          git status --short
+          Write-Host "Tracked root files:"
+          git ls-files | Sort-Object
+
+      - name: Validate exact repository paths
+        shell: pwsh
+        run: |
+          $requiredFiles = @(
+            "nfo_editor.py",
+            "nfo_editor_ui.py",
+            "nfo_editor_events.py",
+            "nfo_utils.py",
+            "cg_crop.py",
+            "cg_dedupe.py",
+            "cg_photo_wall.py",
+            "cg_rename.py",
+            "nfo_editor.spec",
+            "requirements.txt",
+            "requirements-build.txt",
+            "scripts/check_source_layout.py",
+            "scripts/qt_source_smoke.py",
+            "scripts/build_windows.ps1",
+            "scripts/check_windows_artifact.ps1"
+          )
+
+          $trackedFiles = @(git ls-files | ForEach-Object { $_.Replace("\", "/") })
+          $wrongCaseOrMissing = @(
+            $requiredFiles | Where-Object { -not ($trackedFiles -ccontains $_) }
+          )
+
+          if ($wrongCaseOrMissing.Count -gt 0) {
+            Write-Host "Tracked files with similar spelling:"
+            foreach ($expected in $wrongCaseOrMissing) {
+              $leaf = Split-Path -Leaf $expected
+              $trackedFiles |
+                Where-Object { (Split-Path -Leaf $_) -ieq $leaf } |
+                ForEach-Object { Write-Host "  actual: $_" }
+            }
+
+            Write-Error (
+              "Required files are missing or use incorrect filename casing:`n - " +
+              ($wrongCaseOrMissing -join "`n - ")
+            )
+            throw "Run scripts/fix_source_filename_case.ps1, commit, and push."
+          }
+
+          $rootNames = @(Get-ChildItem -Force | ForEach-Object { $_.Name })
+          if (-not ($rootNames -ccontains "img")) {
+            $actualImg = $rootNames | Where-Object { $_ -ieq "img" }
+            Write-Error "Expected directory exactly 'img'; actual match: $actualImg"
+            throw "Directory filename casing is incorrect."
+          }
+
+          Write-Host "All required paths and filename casing are correct."
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -51,6 +120,11 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             requirements-build.txt
+
+      - name: Run repository layout validator
+        shell: pwsh
+        run: |
+          python scripts/check_source_layout.py
 
       - name: Install runtime and build dependencies
         shell: pwsh
