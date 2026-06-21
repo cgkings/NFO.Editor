@@ -29,7 +29,7 @@ env:
 
 jobs:
   build-windows:
-    name: Build and verify Windows x64 package
+    name: Build five EXEs with one shared PySide6 runtime
     runs-on: windows-latest
     timeout-minutes: 60
     outputs:
@@ -52,13 +52,10 @@ jobs:
           Write-Host "github.ref = ${{ github.ref }}"
           Write-Host "github.ref_name = ${{ github.ref_name }}"
           Write-Host "github.sha = ${{ github.sha }}"
-          Write-Host "workspace = $env:GITHUB_WORKSPACE"
           git rev-parse --show-toplevel
           git rev-parse HEAD
           git branch --show-current
           git status --short
-          Write-Host "Tracked root files:"
-          git ls-files | Sort-Object
 
       - name: Validate exact repository paths
         shell: pwsh
@@ -72,13 +69,9 @@ jobs:
             "cg_dedupe.py",
             "cg_photo_wall.py",
             "cg_rename.py",
-            "nfo_editor.spec",
             "requirements.txt",
             "requirements-build.txt",
-            "scripts/check_source_layout.py",
-            "scripts/qt_source_smoke.py",
-            "scripts/build_windows.ps1",
-            "scripts/check_windows_artifact.ps1"
+            "scripts/qt_source_smoke.py"
           )
 
           $trackedFiles = @(git ls-files | ForEach-Object { $_.Replace("\", "/") })
@@ -99,7 +92,7 @@ jobs:
               "Required files are missing or use incorrect filename casing:`n - " +
               ($wrongCaseOrMissing -join "`n - ")
             )
-            throw "Run scripts/fix_source_filename_case.ps1, commit, and push."
+            throw "Fix the source paths, commit, and push again."
           }
 
           $rootNames = @(Get-ChildItem -Force | ForEach-Object { $_.Name })
@@ -121,11 +114,6 @@ jobs:
             requirements.txt
             requirements-build.txt
 
-      - name: Run repository layout validator
-        shell: pwsh
-        run: |
-          python scripts/check_source_layout.py
-
       - name: Install runtime and build dependencies
         shell: pwsh
         run: |
@@ -139,7 +127,6 @@ jobs:
         run: |
           @'
           import importlib.util
-          import sys
 
           forbidden = ("PyQt5", "PyQt6", "PySide2")
           found = [name for name in forbidden if importlib.util.find_spec(name) is not None]
@@ -153,6 +140,7 @@ jobs:
         run: |
           python -m compileall -q .
           python -m unittest discover -s tests -q
+
           $lintFiles = @(
             "nfo_editor.py",
             "nfo_editor_ui.py",
@@ -177,6 +165,7 @@ jobs:
         shell: pwsh
         run: |
           $shortSha = "${{ github.sha }}".Substring(0, 7)
+
           if ("${{ github.ref_type }}" -eq "tag") {
             $buildName = "${{ github.ref_name }}"
           }
@@ -186,21 +175,367 @@ jobs:
 
           $zipName = "NFOTools-$buildName-windows-x64.zip"
           $artifactName = "NFOTools-$buildName-windows-x64"
+
           "BUILD_NAME=$buildName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
           "build_name=$buildName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "zip_name=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "artifact_name=$artifactName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-      - name: Build PySide6 applications
+      - name: Generate shared-runtime PyInstaller spec
         shell: pwsh
         run: |
-          ./scripts/build_windows.ps1 -OutputRoot "dist/NFOTools"
+          New-Item -ItemType Directory -Path "build" -Force | Out-Null
 
-      - name: Check build contents and launch executables
+          @'
+          # -*- mode: python ; coding: utf-8 -*-
+
+          from __future__ import annotations
+
+          import os
+
+
+          ROOT = os.path.abspath(os.path.join(os.path.dirname(SPEC), ".."))
+
+
+          def source(name):
+              return os.path.join(ROOT, name)
+
+
+          def optional_datas():
+              items = []
+
+              for filename in (
+                  "chuizi.ico",
+                  "cg_crop.ico",
+                  "cg_dedupe.ico",
+                  "cg_photo_wall.ico",
+                  "mapping_actor.xml",
+                  "series_mapping.xml",
+              ):
+                  path = source(filename)
+                  if os.path.isfile(path):
+                      items.append((path, "."))
+
+              image_dir = source("img")
+              if os.path.isdir(image_dir):
+                  items.append((image_dir, "img"))
+
+              return items
+
+
+          EXCLUDES = [
+              "PyQt5",
+              "PyQt6",
+              "PySide2",
+              "numpy",
+              "scipy",
+              "matplotlib",
+              "IPython",
+              "pytest",
+              "tkinter",
+              "jedi",
+          ]
+
+
+          MAIN_HIDDEN_IMPORTS = [
+              "qfluentwidgets",
+              "PIL",
+              "PIL.Image",
+              "PIL._imaging",
+              "bs4",
+              "lxml",
+              "requests",
+              "winshell",
+              "win32api",
+              "win32com",
+              "win32com.client",
+              "win32com.shell",
+              "win32com.shell.shellcon",
+              "pythoncom",
+              "pywintypes",
+              "win32wnet",
+              "nfo_utils",
+              "cg_crop",
+              "cg_rename",
+              "cg_photo_wall",
+              "cg_dedupe",
+          ]
+
+
+          def make_analysis(script_name, hiddenimports=None, datas=None):
+              return Analysis(
+                  [source(script_name)],
+                  pathex=[ROOT],
+                  binaries=[],
+                  datas=datas or [],
+                  hiddenimports=hiddenimports or [],
+                  hookspath=[],
+                  hooksconfig={},
+                  runtime_hooks=[],
+                  excludes=EXCLUDES,
+                  noarchive=False,
+                  optimize=1,
+              )
+
+
+          main_a = make_analysis(
+              "nfo_editor.py",
+              hiddenimports=MAIN_HIDDEN_IMPORTS,
+              datas=optional_datas(),
+          )
+          crop_a = make_analysis(
+              "cg_crop.py",
+              hiddenimports=["nfo_utils"],
+          )
+          rename_a = make_analysis(
+              "cg_rename.py",
+              hiddenimports=["nfo_utils"],
+          )
+          dedupe_a = make_analysis(
+              "cg_dedupe.py",
+              hiddenimports=["nfo_utils"],
+          )
+          photo_a = make_analysis(
+              "cg_photo_wall.py",
+              hiddenimports=["nfo_utils"],
+          )
+
+
+          def make_exe(analysis, name, icon_name=None):
+              pyz = PYZ(analysis.pure)
+
+              icon_path = None
+              if icon_name:
+                  candidate = source(icon_name)
+                  if os.path.isfile(candidate):
+                      icon_path = candidate
+
+              return EXE(
+                  pyz,
+                  analysis.scripts,
+                  [],
+                  exclude_binaries=True,
+                  name=name,
+                  debug=False,
+                  bootloader_ignore_signals=False,
+                  strip=False,
+                  upx=False,
+                  console=False,
+                  icon=icon_path,
+              )
+
+
+          main_exe = make_exe(main_a, "NFOEditor", "chuizi.ico")
+          crop_exe = make_exe(crop_a, "cg_crop", "cg_crop.ico")
+          rename_exe = make_exe(rename_a, "cg_rename", "chuizi.ico")
+          dedupe_exe = make_exe(dedupe_a, "cg_dedupe", "cg_dedupe.ico")
+          photo_exe = make_exe(photo_a, "cg_photo_wall", "cg_photo_wall.ico")
+
+
+          # One shared COLLECT produces five EXEs beside one shared _internal folder.
+          coll = COLLECT(
+              main_exe,
+              crop_exe,
+              rename_exe,
+              dedupe_exe,
+              photo_exe,
+
+              main_a.binaries,
+              main_a.datas,
+
+              crop_a.binaries,
+              crop_a.datas,
+
+              rename_a.binaries,
+              rename_a.datas,
+
+              dedupe_a.binaries,
+              dedupe_a.datas,
+
+              photo_a.binaries,
+              photo_a.datas,
+
+              strip=False,
+              upx=False,
+              upx_exclude=[],
+              name="NFOTools",
+          )
+          '@ | Set-Content -Path "build/shared_runtime.spec" -Encoding utf8
+
+          Write-Host "Generated build/shared_runtime.spec"
+          Get-Content "build/shared_runtime.spec"
+
+      - name: Build five EXEs with one shared runtime
         shell: pwsh
         run: |
-          ./scripts/check_windows_artifact.ps1 -Root "dist/NFOTools" -RunSmokeTests
+          Remove-Item "dist" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "build/pyinstaller-shared" -Recurse -Force -ErrorAction SilentlyContinue
+
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --distpath "dist" `
+            --workpath "build/pyinstaller-shared" `
+            "build/shared_runtime.spec"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "PyInstaller shared-runtime build failed."
+          }
+
+          $outputRoot = "dist/NFOTools"
+          if (-not (Test-Path $outputRoot -PathType Container)) {
+            throw "Shared-runtime output directory was not produced: $outputRoot"
+          }
+
+          $documentationFiles = Get-ChildItem . -File | Where-Object {
+            $_.Name -like "README*.md" -or
+            $_.Name -like "CHANGELOG*.md" -or
+            $_.Name -in @(
+              "ROUND2_DEBUG_REPORT.md",
+              "FIX_REPORT_QT6.md",
+              "BUILD_GITHUB_ACTIONS.md"
+            )
+          }
+
+          foreach ($doc in $documentationFiles) {
+            Copy-Item $doc.FullName $outputRoot -Force
+          }
+
+          Write-Host "Shared-runtime build completed:"
+          Get-ChildItem $outputRoot -Force
+
+      - name: Validate shared runtime and launch all EXEs
+        shell: pwsh
+        run: |
+          $root = (Resolve-Path "dist/NFOTools").Path
+          $internal = Join-Path $root "_internal"
+
+          if (-not (Test-Path $internal -PathType Container)) {
+            throw "The shared _internal runtime directory is missing."
+          }
+
+          $exeNames = @(
+            "NFOEditor.exe",
+            "cg_crop.exe",
+            "cg_rename.exe",
+            "cg_dedupe.exe",
+            "cg_photo_wall.exe"
+          )
+
+          foreach ($exeName in $exeNames) {
+            $exePath = Join-Path $root $exeName
+
+            if (-not (Test-Path $exePath -PathType Leaf)) {
+              throw "Missing executable: $exePath"
+            }
+
+            if ((Get-Item $exePath).Length -lt 100KB) {
+              throw "Executable is unexpectedly small: $exePath"
+            }
+
+            Write-Host "[OK] $exeName"
+          }
+
+          if (Test-Path (Join-Path $root "tools")) {
+            throw "Old per-tool runtime folders still exist. The shared build was not used."
+          }
+
+          $qwindows = @(
+            Get-ChildItem $root -Recurse -File -Filter "qwindows.dll" -ErrorAction SilentlyContinue
+          )
+          if ($qwindows.Count -ne 1) {
+            throw "Expected exactly one shared qwindows.dll, found $($qwindows.Count)."
+          }
+
+          $headlessPlugins = @(
+            Get-ChildItem $root -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -in @("qoffscreen.dll", "qminimal.dll") }
+          )
+          if ($headlessPlugins.Count -lt 1) {
+            throw "Qt offscreen/minimal platform plugin is missing."
+          }
+
+          $qtCoreFiles = @(
+            Get-ChildItem $root -Recurse -File -Filter "Qt6Core.dll" -ErrorAction SilentlyContinue
+          )
+          if ($qtCoreFiles.Count -ne 1) {
+            throw "Expected exactly one shared Qt6Core.dll, found $($qtCoreFiles.Count)."
+          }
+
+          $pythonDlls = @(
+            Get-ChildItem $root -Recurse -File -Filter "python3*.dll" -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '^python3\d+\.dll$' }
+          )
+          if ($pythonDlls.Count -ne 1) {
+            throw "Expected exactly one shared Python runtime DLL, found $($pythonDlls.Count)."
+          }
+
+          $requiredResources = @(
+            "mapping_actor.xml",
+            "series_mapping.xml",
+            "chuizi.ico"
+          )
+          foreach ($resource in $requiredResources) {
+            $found = Get-ChildItem $root -Recurse -File -Filter $resource -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if (-not $found) {
+              throw "Required resource is missing: $resource"
+            }
+          }
+
+          foreach ($forbidden in @("PyQt5", "PyQt6", "PySide2")) {
+            $found = Get-ChildItem $root -Recurse -Force -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -like "*$forbidden*" } |
+              Select-Object -First 1
+            if ($found) {
+              throw "Forbidden Qt binding content found: $($found.FullName)"
+            }
+          }
+
+          $previousPlatform = $env:QT_QPA_PLATFORM
+          $env:QT_QPA_PLATFORM = "offscreen"
+
+          try {
+            foreach ($exeName in $exeNames) {
+              $exePath = Join-Path $root $exeName
+              Write-Host "Starting frozen smoke test: $exeName"
+
+              $process = Start-Process `
+                -FilePath $exePath `
+                -WorkingDirectory $root `
+                -PassThru
+
+              Start-Sleep -Seconds 6
+              $process.Refresh()
+
+              if ($process.HasExited) {
+                throw "$exeName exited during startup smoke test with code $($process.ExitCode)."
+              }
+
+              Stop-Process -Id $process.Id -Force
+              $process.WaitForExit()
+              Write-Host "[OK] $exeName remained alive after startup."
+            }
+          }
+          finally {
+            $env:QT_QPA_PLATFORM = $previousPlatform
+          }
+
+          $allFiles = @(Get-ChildItem $root -Recurse -File)
+          $totalBytes = ($allFiles | Measure-Object Length -Sum).Sum
+
+          if ($totalBytes -lt 20MB) {
+            throw "Artifact directory is unexpectedly small."
+          }
+
+          Write-Host "Shared-runtime validation passed."
+          Write-Host "Files: $($allFiles.Count)"
+          Write-Host "Uncompressed size: $([Math]::Round($totalBytes / 1MB, 2)) MB"
+          Write-Host "qwindows.dll: $($qwindows[0].FullName)"
+          Write-Host "Qt6Core.dll: $($qtCoreFiles[0].FullName)"
+          Write-Host "Python runtime: $($pythonDlls[0].FullName)"
 
       - name: Create release archive and checksum
         shell: pwsh
@@ -208,16 +543,23 @@ jobs:
           if (Test-Path $env:ZIP_NAME) {
             Remove-Item $env:ZIP_NAME -Force
           }
-          Compress-Archive -Path "dist/NFOTools/*" -DestinationPath $env:ZIP_NAME -CompressionLevel Optimal
 
-          $hash = (Get-FileHash -Algorithm SHA256 $env:ZIP_NAME).Hash.ToLowerInvariant()
-          "$hash  $env:ZIP_NAME" | Set-Content -Path "$env:ZIP_NAME.sha256" -Encoding ascii
+          Compress-Archive `
+            -Path "dist/NFOTools/*" `
+            -DestinationPath $env:ZIP_NAME `
+            -CompressionLevel Optimal
 
-          if ((Get-Item $env:ZIP_NAME).Length -lt 1MB) {
+          $zipItem = Get-Item $env:ZIP_NAME
+          if ($zipItem.Length -lt 1MB) {
             throw "Release archive is unexpectedly small."
           }
 
+          $hash = (Get-FileHash -Algorithm SHA256 $env:ZIP_NAME).Hash.ToLowerInvariant()
+          "$hash  $env:ZIP_NAME" |
+            Set-Content -Path "$env:ZIP_NAME.sha256" -Encoding ascii
+
           Write-Host "Archive: $env:ZIP_NAME"
+          Write-Host "Compressed size: $([Math]::Round($zipItem.Length / 1MB, 2)) MB"
           Write-Host "SHA-256: $hash"
 
       - name: Upload verified artifact
@@ -257,6 +599,7 @@ jobs:
         run: |
           set -euo pipefail
           cd release
+
           test -s "$ZIP_NAME"
           test -s "$ZIP_NAME.sha256"
           sha256sum --check "$ZIP_NAME.sha256"
