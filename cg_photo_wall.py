@@ -3,9 +3,8 @@ import sys
 import subprocess
 import xml.etree.ElementTree as ET
 from functools import lru_cache
-from queue import Queue
-from threading import Thread
-from PyQt5.QtWidgets import (
+from threading import Lock
+from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QLabel,
@@ -22,21 +21,20 @@ from PyQt5.QtWidgets import (
     QRadioButton,
     QComboBox,
     QLineEdit,
-    QDesktopWidget,
     QFrame,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QSize, QTimer, QSettings, QThread, QObject
-from PyQt5.QtGui import (
+from PySide6.QtCore import Qt, Signal, QSize, QTimer, QSettings, QObject
+from PySide6.QtGui import (
     QPixmap,
     QIcon,
     QGuiApplication,
     QPalette,
     QColor,
-    QFont,
     QImageReader,
 )
 import concurrent.futures
 from enum import Enum
+from nfo_utils import is_path_within, preferred_image_file, preferred_nfo_file
 
 
 class LoadStage(Enum):
@@ -64,11 +62,11 @@ class BluePalette(QPalette):
 
 
 class ImageLoadManager(QObject):
-    """优化的图片加载管理器"""
+    """高 DPI 图片加载管理器；每次 add_images 使用独立批次计数。"""
 
-    progress_updated = pyqtSignal(int, int)
-    image_loaded = pyqtSignal(str, QLabel, QPixmap)
-    all_done = pyqtSignal()  # 所有任务完成（含失败）时触发
+    progress_updated = Signal(int, int, int)  # batch_id, current, total
+    image_loaded = Signal(int, str, QLabel, object, float)
+    all_done = Signal(int)
 
     def __init__(self, max_workers=None):
         super().__init__()
@@ -76,71 +74,102 @@ class ImageLoadManager(QObject):
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.max_workers
         )
-        self.queue = Queue()
-        self.total_images = 0
-        self.loaded_images = 0   # 成功数
-        self.completed_images = 0  # 成功 + 失败
         self.is_running = True
+        self._lock = Lock()
+        self._next_batch_id = 0
+        self._batches = {}
+        self._futures = set()
 
-    def load_image(self, image_path, label, target_width, target_height):
-        """加载单个图片"""
+    def _mark_done(self, batch_id, success=False):
+        emit_done = False
+        with self._lock:
+            state = self._batches.get(batch_id)
+            if state is None:
+                return
+            if success:
+                state["loaded"] += 1
+            state["completed"] += 1
+            current = state["loaded"]
+            total = state["total"]
+            if state["completed"] >= total and not state["done"]:
+                state["done"] = True
+                emit_done = True
+
+        self.progress_updated.emit(batch_id, current, total)
+        if emit_done:
+            self.all_done.emit(batch_id)
+
+    def load_image(
+        self, batch_id, image_path, label, target_width, target_height, dpr=1.0
+    ):
+        success = False
         try:
             if not self.is_running:
                 return False
 
+            dpr = max(1.0, float(dpr or 1.0))
+            physical_width = max(1, int(round(target_width * dpr)))
+            physical_height = max(1, int(round(target_height * dpr)))
+
             reader = QImageReader(image_path)
+            reader.setAutoTransform(True)
             if reader.canRead():
                 original_size = reader.size()
-
-                width_ratio = target_width / original_size.width()
-                height_ratio = target_height / original_size.height()
-                scale_ratio = min(width_ratio, height_ratio)
-
-                new_width = int(original_size.width() * scale_ratio)
-                new_height = int(original_size.height() * scale_ratio)
-
-                reader.setScaledSize(QSize(new_width, new_height))
+                if original_size.width() > 0 and original_size.height() > 0:
+                    width_ratio = physical_width / original_size.width()
+                    height_ratio = physical_height / original_size.height()
+                    scale_ratio = min(width_ratio, height_ratio)
+                    new_width = max(1, int(round(original_size.width() * scale_ratio)))
+                    new_height = max(1, int(round(original_size.height() * scale_ratio)))
+                    reader.setScaledSize(QSize(new_width, new_height))
 
                 image = reader.read()
-                if not image.isNull():
-                    pixmap = QPixmap.fromImage(image)
-                    self.image_loaded.emit(image_path, label, pixmap)
-                    self.loaded_images += 1
-                    self.completed_images += 1
-                    self.progress_updated.emit(self.loaded_images, self.total_images)
-                    if self.completed_images >= self.total_images:
-                        self.all_done.emit()
+                if self.is_running and not image.isNull():
+                    self.image_loaded.emit(batch_id, image_path, label, image, dpr)
+                    success = True
                     return True
-
-        except Exception as e:
-            print(f"加载图片失败 {image_path}: {str(e)}")
-
-        # 失败也计入完成数
-        self.completed_images += 1
-        self.progress_updated.emit(self.loaded_images, self.total_images)
-        if self.completed_images >= self.total_images:
-            self.all_done.emit()
+        except Exception as exc:
+            print(f"加载图片失败 {image_path}: {exc}")
+        finally:
+            self._mark_done(batch_id, success=success)
         return False
 
-    def add_images(self, image_paths_and_labels, target_width, target_height):
-        """添加要加载的图片"""
-        self.total_images = len(image_paths_and_labels)
-        self.loaded_images = 0
-        self.completed_images = 0
-        futures = []
-        for path, label in image_paths_and_labels:
+    def add_images(self, image_paths_and_labels, target_width, target_height, dpr=1.0):
+        items = list(image_paths_and_labels)
+        with self._lock:
+            self._next_batch_id += 1
+            batch_id = self._next_batch_id
+            self._batches[batch_id] = {
+                "total": len(items), "loaded": 0, "completed": 0, "done": False
+            }
+
+        if not items:
+            self.all_done.emit(batch_id)
+            return batch_id
+
+        for path, label in items:
             if not self.is_running:
                 break
             future = self.executor.submit(
-                self.load_image, path, label, target_width, target_height
+                self.load_image,
+                batch_id, path, label, target_width, target_height, dpr,
             )
-            futures.append(future)
-        return futures
+            with self._lock:
+                self._futures.add(future)
+            future.add_done_callback(self._discard_future)
+        return batch_id
+
+    def _discard_future(self, future):
+        with self._lock:
+            self._futures.discard(future)
 
     def stop(self):
-        """停止加载"""
         self.is_running = False
-        self.executor.shutdown(wait=False)
+        with self._lock:
+            futures = list(self._futures)
+        for future in futures:
+            future.cancel()
+        self.executor.shutdown(wait=False, cancel_futures=True)
 
 
 class PosterContainer(QFrame):
@@ -173,7 +202,7 @@ class PosterContainer(QFrame):
 class PhotoWallDialog(QDialog):
     """优化后的照片墙对话框 - 简化版"""
 
-    update_image = pyqtSignal(QLabel, QPixmap)
+    update_image = Signal(QLabel, QPixmap)
 
     def __init__(self, folder_path=None, parent=None):
         super().__init__(parent)
@@ -181,8 +210,14 @@ class PhotoWallDialog(QDialog):
         # parent_window 仅用于回调编辑器，通过 set_editor() 单独注入。
         self.parent_window = None
         self.folder_path = folder_path
-        self.all_posters = []
+        self.all_posters = []          # 当前墙面正在展示的数据
+        self.master_posters = []       # 全量数据，优先从 NFO Editor 内存缓存接收
+        self.current_wall_source = []  # 当前墙面的筛选基准，例如某个演员/系列下的全部影片
         self._sort_keys = {}
+        self.view_mode = "wall"
+        self.active_category_type = None
+        self.active_category_value = None
+        self._category_index_cache = {}
 
         # UI容器列表
         self.poster_containers = []
@@ -197,10 +232,9 @@ class PhotoWallDialog(QDialog):
         self.dpi_scale = screen.logicalDotsPerInch() / 96.0
 
         # 图片加载管理
-        self.image_manager = ImageLoadManager()
-        self.image_manager.progress_updated.connect(self.update_progress)
-        self.image_manager.image_loaded.connect(self.update_image_label)
-        self.image_manager.all_done.connect(self._on_image_load_all_done)
+        self._pending_image_batches = set()
+        self.image_manager = None
+        self._reset_image_manager()
 
         self.is_loading = False
         self.settings = QSettings("NFOEditor", "PhotoWall")
@@ -220,6 +254,22 @@ class PhotoWallDialog(QDialog):
         self._scroll_timer.setSingleShot(True)
         self._scroll_timer.timeout.connect(self._on_scroll_check)
 
+        # 分类筛选防抖
+        self._category_filter_timer = QTimer()
+        self._category_filter_timer.setSingleShot(True)
+        self._category_filter_timer.timeout.connect(self._refresh_category_view_if_active)
+
+        # 分类页分批渲染，避免一次性创建大量按钮导致界面卡顿
+        self._category_render_timer = QTimer()
+        self._category_render_timer.setSingleShot(True)
+        self._category_render_timer.timeout.connect(self._render_category_chunk)
+        self._category_render_items = []
+        self._category_render_index = 0
+        self._category_render_columns = 6
+        self._category_render_card_w = 140
+        self._category_render_card_h = 64
+        self.CATEGORY_CHUNK_SIZE = 96
+
         self.init_ui()
 
         # 延迟加载：等窗口完成布局（show）后再调用，确保 viewport 宽度正确
@@ -231,12 +281,32 @@ class PhotoWallDialog(QDialog):
                 self.folder_path = last_dir
 
     def set_editor(self, editor):
-        """注入编辑器引用（与 Qt parent 完全解耦，仅用于回调定位）。
-        由 NFO.Editor.Qt5 在创建本窗口后调用：
-            dialog = PhotoWallDialog(path, None)
-            dialog.set_editor(self)
-        """
+        """注入编辑器引用（与 Qt parent 完全解耦，仅用于回调定位）。"""
         self.parent_window = editor
+        return self
+
+
+    def load_from_editor_cache(self, editor):
+        """从 NFO Editor 主窗口加载照片墙数据的兼容入口。
+
+        nfo_editor.py 当前会调用:
+            dialog.load_from_editor_cache(self)
+
+        这里负责注入主窗口引用，并复用主窗口已经加载好的 nfo_cache / nfo_files。
+        """
+        self.set_editor(editor)
+
+        folder_path = getattr(editor, "folder_path", None)
+        if not folder_path:
+            try:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "提示", "主窗口尚未选择 NFO 目录")
+            except Exception:
+                pass
+            return
+
+        self.folder_path = folder_path
+        self.load_posters(folder_path)
 
     def init_ui(self):
         """初始化UI"""
@@ -287,7 +357,7 @@ class PhotoWallDialog(QDialog):
         )
 
         # 获取主屏幕大小
-        screen = QDesktopWidget().availableGeometry()
+        screen = QApplication.primaryScreen().availableGeometry()
         self.resize(int(screen.width() * 0.75), int(screen.height() * 0.75))
 
         # 设置为独立窗口
@@ -447,6 +517,38 @@ class PhotoWallDialog(QDialog):
         select_button.clicked.connect(self.select_folder)
         toolbar_layout.addWidget(select_button)
 
+        self.all_wall_button = QPushButton("全部影片")
+        self.all_wall_button.setMinimumHeight(int(32 * self.dpi_scale))
+        self.all_wall_button.clicked.connect(self.show_all_wall)
+        toolbar_layout.addWidget(self.all_wall_button)
+
+        self.category_button = QPushButton("分类")
+        self.category_button.setMinimumHeight(int(32 * self.dpi_scale))
+        self.category_button.clicked.connect(self.show_category_view)
+        toolbar_layout.addWidget(self.category_button)
+
+        self.category_basis_combo = QComboBox()
+        self.category_basis_combo.addItems(["演员", "系列"])
+        self.category_basis_combo.setFixedWidth(int(80 * self.dpi_scale))
+        self.category_basis_combo.currentIndexChanged.connect(
+            lambda _: self.show_category_view() if self.view_mode == "category" else None
+        )
+        toolbar_layout.addWidget(self.category_basis_combo)
+
+        self.category_filter_entry = QLineEdit()
+        self.category_filter_entry.setPlaceholderText("筛选分类")
+        self.category_filter_entry.setFixedWidth(int(140 * self.dpi_scale))
+        self.category_filter_entry.textChanged.connect(
+            lambda _: self._category_filter_timer.start(250)
+        )
+        toolbar_layout.addWidget(self.category_filter_entry)
+
+        self.active_category_label = QLabel("")
+        self.active_category_label.setStyleSheet(
+            "QLabel { color: #DBEAFE; font-weight: 700; padding: 0 8px; }"
+        )
+        toolbar_layout.addWidget(self.active_category_label)
+
         # 排序和筛选面板
         filter_frame = self.create_filter_panel()
         toolbar_layout.addWidget(filter_frame)
@@ -532,89 +634,221 @@ class PhotoWallDialog(QDialog):
 
         return columns, poster_width, poster_height, title_height
 
+    def _get_device_pixel_ratio(self):
+        try:
+            return max(1.0, float(self.devicePixelRatioF()))
+        except Exception:
+            screen = self.windowHandle().screen() if self.windowHandle() else QGuiApplication.primaryScreen()
+            return max(1.0, float(screen.devicePixelRatio() if screen else 1.0))
+
+    def _reset_image_manager(self):
+        old_manager = getattr(self, "image_manager", None)
+        if old_manager is not None:
+            try:
+                old_manager.progress_updated.disconnect(self.update_progress)
+                old_manager.image_loaded.disconnect(self.update_image_label)
+                old_manager.all_done.disconnect(self._on_image_load_all_done)
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                old_manager.stop()
+            except Exception:
+                pass
+        self._pending_image_batches = set()
+        self.image_manager = ImageLoadManager()
+        self.image_manager.progress_updated.connect(self.update_progress)
+        self.image_manager.image_loaded.connect(self.update_image_label)
+        self.image_manager.all_done.connect(self._on_image_load_all_done)
+
+    def _queue_image_batch(self, queue, width, height):
+        if not queue:
+            return None
+        if not getattr(self.image_manager, "is_running", False):
+            self._reset_image_manager()
+        batch_id = self.image_manager.add_images(
+            queue, width, height, self._get_device_pixel_ratio()
+        )
+        self._pending_image_batches.add(batch_id)
+        return batch_id
+
+    def _clear_grid_widgets(self):
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def _find_poster_for_folder(self, folder_path):
+        try:
+            if not folder_path or not os.path.isdir(folder_path):
+                return None
+            candidates = []
+            for file_name in os.listdir(folder_path):
+                lower = file_name.lower()
+                if lower.endswith((".jpg", ".jpeg", ".png", ".webp")) and "poster" in lower:
+                    full_path = os.path.join(folder_path, file_name)
+                    priority = 0 if lower.endswith(("-poster.jpg", "-poster.jpeg", "-poster.png", "-poster.webp")) else 1
+                    candidates.append((priority, file_name.lower(), full_path))
+            if not candidates:
+                return None
+            candidates.sort()
+            return candidates[0][2]
+        except OSError:
+            return None
+
+    def _normalize_editor_cache_data(self, data):
+        release = str(data.get("release") or "")
+        year = ""
+        if release:
+            year = release.split("-")[0]
+        rating = data.get("rating", "0")
+        if rating is None:
+            rating = "0"
+        actors = data.get("actors") or []
+        if isinstance(actors, str):
+            actors = [a.strip() for a in actors.split(",") if a.strip()]
+        tags = data.get("tags") or []
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(",") if t.strip()]
+        return {
+            "title": data.get("title") or "",
+            "year": year,
+            "series": data.get("series") or "",
+            "rating": str(rating),
+            "actors": actors,
+            "tags": tags,
+            "release": release,
+        }
+
+    def _build_posters_from_editor_cache(self, folder_path):
+        """优先复用主窗口已经加载好的 nfo_cache，避免照片墙再次 os.walk + ET.parse。"""
+        editor = self.parent_window
+        if not editor:
+            return []
+
+        cache = getattr(editor, "nfo_cache", None)
+        nfo_paths = list(getattr(editor, "nfo_files", []) or [])
+        if not cache or not nfo_paths:
+            return []
+
+        posters = []
+        for nfo_path in nfo_paths:
+            try:
+                if not nfo_path or not os.path.exists(nfo_path):
+                    continue
+                if not is_path_within(nfo_path, folder_path):
+                    continue
+                data = cache.get(nfo_path)
+                if not data:
+                    data = self.parse_nfo(nfo_path)
+                nfo_dir = os.path.dirname(nfo_path)
+                poster_file = self._find_poster_for_folder(nfo_dir)
+                if not poster_file:
+                    continue
+                posters.append((
+                    poster_file,
+                    os.path.basename(nfo_dir),
+                    self._normalize_editor_cache_data(data),
+                ))
+            except Exception as e:
+                print(f"从主窗口缓存读取照片墙数据失败 {nfo_path}: {str(e)}")
+        return posters
+
+    def _rebuild_sort_keys_for_current_list(self):
+        self._sort_keys.clear()
+        for index, (_, _, nfo_data) in enumerate(self.all_posters):
+            self._update_sort_keys(nfo_data, index)
+        self._rebuild_series_sort_keys()
+
+    def _render_first_page(self):
+        self.view_mode = "wall"
+        self._reset_image_manager()
+        self._clear_grid_widgets()
+        self.poster_containers.clear()
+        self.displayed_count = 0
+        self.window_start = 0
+        self._load_more_btn.hide()
+        columns, poster_width, poster_height, title_height = self.calculate_grid_dimensions()
+        self._render_page(columns, poster_width, poster_height, title_height)
+
     def load_posters(self, folder_path):
-        """流式加载海报 - 边扫描边显示"""
+        """加载照片墙。
+
+        从主程序打开时，优先复用 NFO Editor 已经加载好的 nfo_cache/nfo_files；
+        只有独立运行或主程序缓存为空时，才退回扫描磁盘和解析 NFO。
+        """
         if not folder_path or not os.path.exists(folder_path):
             return
 
-        # 清理现有数据
+        self.folder_path = folder_path
         self.clear_all_data()
 
         self.progress_bar.show()
         self.cancel_button.show()
         self.is_loading = True
 
-        # 计算网格尺寸
-        columns, poster_width, poster_height, title_height = (
-            self.calculate_grid_dimensions()
-        )
-
         try:
-            # 扫描所有文件
-            poster_nfo_pairs = []
-            self.progress_bar.setFormat("扫描文件中...")
-            self.update_status(0, None, LoadStage.SCANNING)
-
-            for root, dirs, files in os.walk(folder_path):
-                if not self.is_loading:
-                    return
-
-                poster_file = None
-                nfo_file = None
-                for file in files:
-                    if (
-                        file.lower().endswith((".jpg", ".jpeg"))
-                        and "poster" in file.lower()
-                    ):
-                        poster_file = os.path.join(root, file)
-                    elif file.lower().endswith(".nfo"):
-                        nfo_file = os.path.join(root, file)
-
-                if poster_file and nfo_file:
-                    poster_nfo_pairs.append((poster_file, nfo_file, root))
-
-            total_items = len(poster_nfo_pairs)
-            if total_items == 0:
-                self.update_status(0)
-                self.progress_bar.hide()
-                self.cancel_button.hide()
-                self.is_loading = False
-                return
-
-            # 开始创建容器和加载数据
-            self.progress_bar.setFormat("加载影片: %v/%m")
-            self.progress_bar.setMaximum(total_items)
-
-            # ---- 阶段1：解析所有NFO，填充 all_posters（不创建 widget）----
-            for index, (poster_file, nfo_file, root) in enumerate(poster_nfo_pairs):
-                if not self.is_loading:
-                    return
-
-                try:
-                    nfo_data = self.parse_nfo(nfo_file)
-                    folder_name = os.path.basename(root)
-                    self.all_posters.append((poster_file, folder_name, nfo_data))
-                    self._update_sort_keys(nfo_data, len(self.all_posters) - 1)
-
-                    if (index + 1) % self.ui_refresh_interval == 0:
-                        self.progress_bar.setValue(index + 1)
-                        self.update_status(index + 1, total_items, LoadStage.LOADING)
-                        QApplication.processEvents()
-
-                except Exception as e:
-                    print(f"处理文件失败 {nfo_file}: {str(e)}")
-
-            # 最后更新进度
-            self.progress_bar.setValue(total_items)
-            self.update_status(total_items, total_items, LoadStage.LOADING)
+            self.progress_bar.setFormat("读取主程序缓存...")
+            self.update_status(0, None, LoadStage.LOADING)
             QApplication.processEvents()
 
-            # 全量加载后重建系列排序键（需要知道全局计数）
-            self._rebuild_series_sort_keys()
+            cached_posters = self._build_posters_from_editor_cache(folder_path)
+            if cached_posters:
+                self.master_posters = cached_posters
+                source_text = "主程序缓存"
+            else:
+                self.progress_bar.setFormat("扫描文件中...")
+                self.update_status(0, None, LoadStage.SCANNING)
+                QApplication.processEvents()
 
-            # ---- 阶段2：只渲染第一页容器 ----
-            self.displayed_count = 0
-            self._render_page(columns, poster_width, poster_height, title_height)
+                poster_nfo_pairs = []
+                for root, dirs, files in os.walk(folder_path):
+                    if not self.is_loading:
+                        return
+                    dirs.sort(key=str.lower)
+                    preferred_stem = os.path.basename(root)
+                    poster_file = preferred_image_file(root, "poster", preferred_stem)
+                    nfo_file = preferred_nfo_file(root, preferred_stem)
+                    if poster_file and nfo_file:
+                        poster_nfo_pairs.append((poster_file, nfo_file, root))
+
+                total_items = len(poster_nfo_pairs)
+                if total_items == 0:
+                    self.update_status(0)
+                    self.progress_bar.hide()
+                    self.cancel_button.hide()
+                    self.is_loading = False
+                    return
+
+                self.progress_bar.setFormat("加载影片: %v/%m")
+                self.progress_bar.setMaximum(total_items)
+
+                for index, (poster_file, nfo_file, root) in enumerate(poster_nfo_pairs):
+                    if not self.is_loading:
+                        return
+                    try:
+                        nfo_data = self.parse_nfo(nfo_file)
+                        folder_name = os.path.basename(root)
+                        self.master_posters.append((poster_file, folder_name, nfo_data))
+                        if (index + 1) % self.ui_refresh_interval == 0:
+                            self.progress_bar.setValue(index + 1)
+                            self.update_status(index + 1, total_items, LoadStage.LOADING)
+                            QApplication.processEvents()
+                    except Exception as e:
+                        print(f"处理文件失败 {nfo_file}: {str(e)}")
+
+                source_text = "磁盘扫描"
+
+            self.all_posters = self.master_posters.copy()
+            self.current_wall_source = self.master_posters.copy()
+            self._rebuild_sort_keys_for_current_list()
+
+            self.progress_bar.setFormat("准备渲染...")
+            self.progress_bar.setValue(0)
+            QApplication.processEvents()
+
+            self._render_first_page()
+            self.update_status(len(self.all_posters))
+            self.status_label.setText(f"共显示 {len(self.all_posters)} 个影片（来源：{source_text}）")
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载海报失败: {str(e)}")
@@ -679,12 +913,15 @@ class PhotoWallDialog(QDialog):
 
             QTimer.singleShot(30, _fix_scroll)
 
-        # 异步加载这一页的图片
+        # 异步加载这一页的图片。按 DPR 读取物理像素，避免高 DPI 显示模糊。
         if image_load_queue:
+            if not getattr(self.image_manager, "is_running", False):
+                self._reset_image_manager()
             self.progress_bar.setFormat("加载图片: %v/%m")
             self.progress_bar.show()
             self.cancel_button.show()
-            self.image_manager.add_images(image_load_queue, poster_width, poster_height)
+            self.is_loading = True
+            self._queue_image_batch(image_load_queue, poster_width, poster_height)
 
         # 始终隐藏"加载更多"按钮（自动滚动已完全取代手动按钮）
         self._load_more_btn.hide()
@@ -773,7 +1010,9 @@ class PhotoWallDialog(QDialog):
 
             # ---- 5. 异步加载新插入的图片 ----
             if image_load_queue:
-                self.image_manager.add_images(image_load_queue, poster_width, poster_height)
+                if not getattr(self.image_manager, "is_running", False):
+                    self._reset_image_manager()
+                self._queue_image_batch(image_load_queue, poster_width, poster_height)
 
             # 滚动到刚加载内容的末尾（约一页高度处），避免立刻再次触发顶部检测
             QTimer.singleShot(50, lambda: self.scroll.verticalScrollBar().setValue(
@@ -922,18 +1161,21 @@ class PhotoWallDialog(QDialog):
             return None
 
     def clear_all_data(self):
-        """清空所有数据"""
-        # 清空容器
-        while self.grid.count():
-            item = self.grid.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
+        """清空所有数据，并使旧图片加载批次失效。"""
+        self._stop_category_rendering()
+        self._reset_image_manager()
+        self._clear_grid_widgets()
         self.all_posters.clear()
+        self.master_posters.clear()
+        self.current_wall_source.clear()
         self._sort_keys.clear()
+        self._category_index_cache.clear()
         self.poster_containers.clear()
         self.displayed_count = 0
         self.window_start = 0
+        self.view_mode = "wall"
+        self.active_category_type = None
+        self.active_category_value = None
         self.parse_nfo.cache_clear()
 
     def _update_sort_keys(self, nfo_data, index):
@@ -1008,6 +1250,274 @@ class PhotoWallDialog(QDialog):
 
         self._sort_keys["系列"] = rebuilt
 
+    def _collect_categories(self, category_type):
+        """按演员或系列收集分类。返回 [(name, indices)]，默认按影片数量从多到少排序。"""
+        cache_key = (category_type, len(self.master_posters))
+        cached = self._category_index_cache.get("__cache__", {}).get(cache_key)
+        if cached is not None:
+            return cached
+
+        buckets = {}
+        for index, (_, _, nfo_data) in enumerate(self.master_posters):
+            if category_type == "演员":
+                values = nfo_data.get("actors") or []
+                if isinstance(values, str):
+                    values = [v.strip() for v in values.split(",") if v.strip()]
+                if not values:
+                    values = ["(无演员)"]
+            else:
+                value = (nfo_data.get("series") or "").strip()
+                values = [value or "(未分系列)"]
+
+            for value in values:
+                value = str(value).strip() or "(空)"
+                buckets.setdefault(value, []).append(index)
+
+        items = list(buckets.items())
+        # 数量多的排前面；同数量按名称排；空值类放后面
+        items.sort(key=lambda kv: (kv[0].startswith("("), -len(kv[1]), kv[0].lower()))
+
+        self._category_index_cache.setdefault("__cache__", {})[cache_key] = items
+        return items
+
+    def _refresh_category_view_if_active(self):
+        if self.view_mode == "category":
+            self.show_category_view()
+
+    def _category_card_style(self):
+        return """
+            QPushButton {
+                background-color: rgba(255, 255, 255, 248);
+                color: #111827;
+                border: 1px solid #D1D5DB;
+                border-radius: 8px;
+                padding: 6px;
+                font-size: 13px;
+                font-weight: 700;
+                text-align: center;
+            }
+            QPushButton:hover {
+                background-color: #DBEAFE;
+                border: 2px solid #3B82F6;
+                color: #0F172A;
+            }
+            QPushButton:pressed {
+                background-color: #2563EB;
+                border: 2px solid #1D4ED8;
+                color: white;
+                padding-top: 8px;
+                padding-left: 8px;
+            }
+        """
+
+    def _category_card_loading_style(self):
+        return """
+            QPushButton {
+                background-color: #2563EB;
+                color: white;
+                border: 2px solid #1D4ED8;
+                border-radius: 8px;
+                padding: 6px;
+                font-size: 13px;
+                font-weight: 800;
+            }
+        """
+
+    def _stop_category_rendering(self):
+        if hasattr(self, "_category_render_timer"):
+            self._category_render_timer.stop()
+        self._category_render_items = []
+        self._category_render_index = 0
+
+    def _prepare_category_layout_metrics(self):
+        viewport_width = self.scroll.viewport().width()
+        if viewport_width <= 0:
+            viewport_width = max(900, self.width() - 40)
+
+        if viewport_width >= 1500:
+            columns = 10
+        elif viewport_width >= 1300:
+            columns = 9
+        elif viewport_width >= 1100:
+            columns = 8
+        elif viewport_width >= 900:
+            columns = 7
+        else:
+            columns = 5
+
+        spacing = int(10 * self.dpi_scale)
+        card_w = max(120, (viewport_width - (columns + 1) * spacing) // columns)
+        card_h = int(66 * self.dpi_scale)
+        return columns, card_w, card_h
+
+    def _render_category_chunk(self):
+        """分批创建分类卡片，减少点击“分类”时的同步卡顿。"""
+        if self.view_mode != "category":
+            return
+
+        start = self._category_render_index
+        end = min(start + self.CATEGORY_CHUNK_SIZE, len(self._category_render_items))
+        if start >= end:
+            self.progress_bar.hide()
+            self.cancel_button.hide()
+            self.status_label.setText(
+                f"{self.category_basis_combo.currentText()}分类：共 {len(self._category_render_items)} 个分类，"
+                f"影片总数 {len(self.master_posters)}，已按影片数量排序"
+            )
+            return
+
+        columns = self._category_render_columns
+        card_w = self._category_render_card_w
+        card_h = self._category_render_card_h
+
+        for index in range(start, end):
+            name, indices = self._category_render_items[index]
+            row = index // columns
+            col = index % columns
+
+            count = len(indices)
+            button = QPushButton(f"{name}\n{count} 部")
+            button.setFixedSize(card_w, card_h)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setToolTip(f"{self.category_basis_combo.currentText()}: {name}，共 {count} 部影片")
+            button.setStyleSheet(self._category_card_style())
+            button.clicked.connect(
+                lambda checked=False, b=button, ct=self.category_basis_combo.currentText(), n=name:
+                    self._on_category_card_clicked(b, ct, n)
+            )
+            self.grid.addWidget(button, row, col)
+
+        self._category_render_index = end
+        self.progress_bar.setMaximum(max(1, len(self._category_render_items)))
+        self.progress_bar.setValue(end)
+        self.status_label.setText(
+            f"正在渲染分类：{end}/{len(self._category_render_items)}"
+        )
+
+        if end < len(self._category_render_items):
+            self._category_render_timer.start(0)
+        else:
+            self.progress_bar.hide()
+            self.cancel_button.hide()
+            self.status_label.setText(
+                f"{self.category_basis_combo.currentText()}分类：共 {len(self._category_render_items)} 个分类，"
+                f"影片总数 {len(self.master_posters)}，已按影片数量排序"
+            )
+
+    def _on_category_card_clicked(self, button, category_type, category_value):
+        """分类卡片点击后立即给视觉反馈，再打开对应影片墙。"""
+        try:
+            button.setText(f"{category_value}\n正在打开...")
+            button.setStyleSheet(self._category_card_loading_style())
+            button.setEnabled(False)
+            self.status_label.setText(f"正在打开 {category_type}「{category_value}」...")
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+        QTimer.singleShot(
+            0,
+            lambda ct=category_type, cv=category_value: self.show_category_wall(ct, cv)
+        )
+
+    def show_category_view(self):
+        """显示分类列表。分类支持按演员/系列切换，也支持分类名称筛选。"""
+        if not self.master_posters:
+            QMessageBox.warning(self, "提示", "请先加载照片墙数据")
+            return
+
+        self._stop_category_rendering()
+        self.view_mode = "category"
+        self.active_category_type = None
+        self.active_category_value = None
+        self.is_loading = False
+
+        # 分类页不需要停止/重建图片线程池，避免额外卡顿；仅清 UI。
+        self.progress_bar.setFormat("渲染分类: %v/%m")
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+        self.cancel_button.hide()
+        self._clear_grid_widgets()
+        self.poster_containers.clear()
+        self.displayed_count = 0
+        self.window_start = 0
+        self._load_more_btn.hide()
+
+        category_type = self.category_basis_combo.currentText() if hasattr(self, "category_basis_combo") else "演员"
+        filter_text = ""
+        if hasattr(self, "category_filter_entry"):
+            filter_text = self.category_filter_entry.text().strip().lower()
+
+        all_items = self._collect_categories(category_type)
+        if filter_text:
+            all_items = [
+                (name, indices)
+                for name, indices in all_items
+                if filter_text in name.lower()
+            ]
+
+        # 这个字典只存当前筛选结果，供点击卡片时 O(1) 查找。
+        cache_root = self._category_index_cache.get("__cache__", {})
+        self._category_index_cache = {"__cache__": cache_root}
+        self._category_index_cache.update({name: indices for name, indices in all_items})
+
+        columns, card_w, card_h = self._prepare_category_layout_metrics()
+        self._category_render_items = all_items
+        self._category_render_index = 0
+        self._category_render_columns = columns
+        self._category_render_card_w = card_w
+        self._category_render_card_h = card_h
+
+        if hasattr(self, "active_category_label"):
+            self.active_category_label.setText(f"分类：{category_type} · 数量优先")
+
+        self.status_label.setText(f"准备渲染 {len(all_items)} 个分类...")
+        self._category_render_timer.start(0)
+
+    def show_category_wall(self, category_type, category_value):
+        """点击分类后显示对应影片墙。"""
+        if not self.master_posters:
+            return
+
+        self._stop_category_rendering()
+
+        indices = self._category_index_cache.get(category_value)
+        if indices is None:
+            indices = dict(self._collect_categories(category_type)).get(category_value, [])
+
+        self.active_category_type = category_type
+        self.active_category_value = category_value
+        self.current_wall_source = [self.master_posters[i] for i in indices]
+        self.all_posters = self.current_wall_source.copy()
+        self._rebuild_sort_keys_for_current_list()
+
+        if hasattr(self, "active_category_label"):
+            self.active_category_label.setText(f"{category_type}：{category_value} · {len(self.all_posters)} 部")
+
+        self._render_first_page()
+        self.status_label.setText(
+            f"{category_type}「{category_value}」：共显示 {len(self.all_posters)} 个影片"
+        )
+
+    def show_all_wall(self):
+        """回到全部影片墙。"""
+        if not self.master_posters:
+            return
+
+        self._stop_category_rendering()
+        self.active_category_type = None
+        self.active_category_value = None
+        self.current_wall_source = self.master_posters.copy()
+        self.all_posters = self.current_wall_source.copy()
+        self._rebuild_sort_keys_for_current_list()
+
+        if hasattr(self, "active_category_label"):
+            self.active_category_label.setText("全部影片")
+
+        self._render_first_page()
+        self.update_status(len(self.all_posters))
+
+
     def play_video(self, folder_path):
         """播放视频文件"""
         if not folder_path or not os.path.exists(folder_path):
@@ -1064,23 +1574,32 @@ class PhotoWallDialog(QDialog):
 
                 is_py = not getattr(sys, "frozen", False)
 
-                # 按优先顺序探测编辑器文件名（下划线版 / 点分隔版）
+                # PySide6 版优先使用当前源码入口或发布包根目录的 NFOEditor.exe。
                 if is_py:
-                    candidates = ["NFO_Editor_Qt5.py", "NFO.Editor.Qt5.py"]
+                    candidate_paths = [
+                        os.path.join(current_dir, "nfo_editor.py"),
+                        os.path.join(current_dir, "NFO_Editor_Qt5.py"),
+                        os.path.join(current_dir, "NFO.Editor.Qt5.py"),
+                    ]
                 else:
-                    candidates = ["NFO_Editor_Qt5.exe", "NFO.Editor.Qt5.exe"]
+                    candidate_paths = [
+                        os.path.join(current_dir, "NFOEditor.exe"),
+                        os.path.normpath(os.path.join(current_dir, "..", "..", "NFOEditor.exe")),
+                        os.path.normpath(os.path.join(current_dir, "..", "NFOEditor", "NFOEditor.exe")),
+                        os.path.join(current_dir, "NFO_Editor_Qt5.exe"),
+                        os.path.join(current_dir, "NFO.Editor.Qt5.exe"),
+                    ]
 
-                editor_path = None
-                for name in candidates:
-                    p = os.path.join(current_dir, name)
-                    if os.path.exists(p):
-                        editor_path = p
-                        break
+                editor_path = next(
+                    (path for path in candidate_paths if os.path.isfile(path)),
+                    None,
+                )
 
                 if not editor_path:
+                    searched = ", ".join(os.path.basename(path) for path in candidate_paths)
                     QMessageBox.critical(
                         self, "错误",
-                        f"找不到编辑器程序，已查找：{', '.join(candidates)}"
+                        f"找不到编辑器程序，已查找：{searched}"
                     )
                     return
 
@@ -1129,7 +1648,9 @@ class PhotoWallDialog(QDialog):
             self.filter_entry.setEnabled(True)
 
     def sort_posters(self):
-        """排序函数 - 重排 all_posters 后重新分页渲染第一页"""
+        """排序函数 - 重排当前影片墙后重新分页渲染第一页。"""
+        if self.view_mode == "category":
+            return
         if not self.sorting_group.checkedButton():
             return
 
@@ -1183,6 +1704,8 @@ class PhotoWallDialog(QDialog):
 
             # ---- 2. 按新顺序重建 all_posters ----
             self.all_posters = [self.all_posters[i] for i in sorted_indices]
+            if not self.filter_entry.text().strip():
+                self.current_wall_source = self.all_posters.copy()
             self.progress_bar.setValue(40)
             QApplication.processEvents()
 
@@ -1225,81 +1748,55 @@ class PhotoWallDialog(QDialog):
             self.progress_bar.hide()
             self.enable_sorting_controls()
     
+    def _movie_matches_filter(self, nfo_data, field, condition, filter_text):
+        value = ""
+        if field == "标题":
+            value = nfo_data.get("title") or ""
+        elif field == "标签":
+            value = ", ".join(t for t in (nfo_data.get("tags") or []) if t)
+        elif field == "演员":
+            value = ", ".join(a for a in (nfo_data.get("actors") or []) if a)
+        elif field == "系列":
+            value = nfo_data.get("series") or ""
+        elif field == "评分":
+            value = str(nfo_data.get("rating") or "0")
+
+        if field == "评分":
+            try:
+                current_value = float(value)
+                filter_value = float(filter_text)
+                return current_value > filter_value if condition == "大于" else current_value < filter_value
+            except ValueError:
+                return False
+
+        value_lower = value.lower()
+        text_lower = filter_text.lower()
+        return text_lower in value_lower if condition == "包含" else text_lower not in value_lower
+
     def apply_filter(self):
-        """筛选函数 - 只改变已渲染容器的可见性"""
+        """筛选函数 - 对当前影片源的全部数据筛选，而不是只筛选已渲染的第一页。"""
+        if self.view_mode == "category":
+            self.show_category_view()
+            return
+
         field = self.field_combo.currentText()
         condition = self.condition_combo.currentText()
         filter_text = self.filter_entry.text().strip()
 
         try:
-            visible_count = 0
-            columns, _, _, _ = self.calculate_grid_dimensions()
-
+            source = self.current_wall_source or self.master_posters
             if not filter_text:
-                # 显示所有已渲染容器
-                for rel_idx, container_info in enumerate(self.poster_containers):
-                    if container_info and "container" in container_info:
-                        row = visible_count // columns
-                        col = visible_count % columns
-                        container = container_info["container"]
-                        self.grid.removeWidget(container)
-                        self.grid.addWidget(container, row, col)
-                        container.show()
-                        visible_count += 1
+                self.all_posters = source.copy()
             else:
-                # 根据条件筛选（仅对已渲染的窗口范围内的 all_posters 操作）
-                for rel_idx, container_info in enumerate(self.poster_containers):
-                    data_index = self.window_start + rel_idx
-                    if data_index >= len(self.all_posters):
-                        break
-                    if not container_info or "container" not in container_info:
-                        continue
+                self.all_posters = [
+                    poster
+                    for poster in source
+                    if self._movie_matches_filter(poster[2], field, condition, filter_text)
+                ]
 
-                    _, _, nfo_data = self.all_posters[data_index]
-
-                    value = ""
-                    if field == "标题":
-                        value = nfo_data.get("title") or ""
-                    elif field == "标签":
-                        value = ", ".join(t for t in (nfo_data.get("tags") or []) if t)
-                    elif field == "演员":
-                        value = ", ".join(a for a in (nfo_data.get("actors") or []) if a)
-                    elif field == "系列":
-                        value = nfo_data.get("series") or ""
-                    elif field == "评分":
-                        value = str(nfo_data.get("rating") or "0")
-
-                    match = False
-                    if field == "评分":
-                        try:
-                            current_value = float(value)
-                            filter_value = float(filter_text)
-                            if condition == "大于":
-                                match = current_value > filter_value
-                            else:
-                                match = current_value < filter_value
-                        except ValueError:
-                            match = False
-                    else:
-                        value_lower = value.lower()
-                        text_lower = filter_text.lower()
-                        if condition == "包含":
-                            match = text_lower in value_lower
-                        else:
-                            match = text_lower not in value_lower
-
-                    container = container_info["container"]
-                    if match:
-                        row = visible_count // columns
-                        col = visible_count % columns
-                        self.grid.removeWidget(container)
-                        self.grid.addWidget(container, row, col)
-                        container.show()
-                        visible_count += 1
-                    else:
-                        container.hide()
-
-            self.update_status(visible_count)
+            self._rebuild_sort_keys_for_current_list()
+            self._render_first_page()
+            self.update_status(len(self.all_posters))
 
         except Exception as e:
             print(f"筛选失败: {str(e)}")
@@ -1314,9 +1811,11 @@ class PhotoWallDialog(QDialog):
         else:
             self.condition_combo.addItems(["包含", "不包含"])
 
-    def update_progress(self, current, total):
-        """更新进度条"""
-        self.progress_bar.setMaximum(total)
+    def update_progress(self, batch_id, current, total):
+        """仅显示仍属于当前墙面的批次进度。"""
+        if batch_id not in self._pending_image_batches:
+            return
+        self.progress_bar.setMaximum(max(1, total))
         self.progress_bar.setValue(current)
 
     def update_status(self, count, total=None, stage=None, cancelled=False):
@@ -1337,17 +1836,27 @@ class PhotoWallDialog(QDialog):
             if stage_text:
                 self.status_label.setText(f"{stage_text}: {count}/{total}")
 
-    def update_image_label(self, path, label, pixmap):
-        """更新图片标签 - 只更新图片，保持标题显示"""
+    def update_image_label(self, batch_id, path, label, image, dpr=1.0):
+        """主线程更新图片；旧墙面批次和已销毁标签会被安全忽略。"""
+        if batch_id not in self._pending_image_batches:
+            return
         try:
-            if label and not label.isHidden():
+            if label and not label.isHidden() and image is not None and not image.isNull():
+                pixmap = QPixmap.fromImage(image)
+                pixmap.setDevicePixelRatio(max(1.0, float(dpr or 1.0)))
                 label.setPixmap(pixmap)
                 label.show()
-        except Exception as e:
-            print(f"更新图片标签失败: {str(e)}")
+        except RuntimeError:
+            # QLabel 已在分页裁剪/筛选切换时 deleteLater。
+            return
+        except Exception as exc:
+            print(f"更新图片标签失败: {exc}")
 
-    def _on_image_load_all_done(self):
-        """所有图片加载任务完成（含失败）后隐藏进度条"""
+    def _on_image_load_all_done(self, batch_id):
+        """一个图片批次结束；仅当全部批次结束后隐藏进度条。"""
+        self._pending_image_batches.discard(batch_id)
+        if self._pending_image_batches:
+            return
         self.progress_bar.hide()
         self.cancel_button.hide()
         self.is_loading = False
@@ -1390,9 +1899,10 @@ class PhotoWallDialog(QDialog):
                     self.grid.removeWidget(container)
                     self.grid.addWidget(container, row, col)
 
-                    # 收集需要重新加载的图片
-                    if index < len(self.all_posters):
-                        poster_file = self.all_posters[index][0]
+                    # 收集需要重新加载的图片。index 是当前窗口内的相对索引，需要加 window_start。
+                    data_index = self.window_start + index
+                    if data_index < len(self.all_posters):
+                        poster_file = self.all_posters[data_index][0]
                         image_reload_queue.append((poster_file, poster_label))
 
                 except Exception as e:
@@ -1400,11 +1910,7 @@ class PhotoWallDialog(QDialog):
 
             # 重新以新尺寸加载图片
             if image_reload_queue and not self.is_loading:
-                if not self.image_manager.is_running:
-                    self.image_manager = ImageLoadManager()
-                    self.image_manager.progress_updated.connect(self.update_progress)
-                    self.image_manager.image_loaded.connect(self.update_image_label)
-                self.image_manager.add_images(image_reload_queue, poster_width, poster_height)
+                self._queue_image_batch(image_reload_queue, poster_width, poster_height)
 
         except Exception as e:
             print(f"处理窗口大小改变失败: {str(e)}")
@@ -1471,29 +1977,29 @@ class PhotoWallDialog(QDialog):
             return {}
 
     def cancel_loading(self):
-        """取消加载"""
+        """取消当前墙面的全部图片加载批次。"""
         if self.is_loading:
-            self.image_manager.stop()
+            pending = len(self._pending_image_batches)
+            self._reset_image_manager()
             self.is_loading = False
             self.progress_bar.hide()
             self.cancel_button.hide()
-            self.update_status(
-                self.image_manager.loaded_images,
-                self.image_manager.total_images,
-                cancelled=True,
-            )
+            self.status_label.setText(f"已取消图片加载（{pending} 个批次）")
 
     def closeEvent(self, event):
         """关闭窗口时清理资源"""
         try:
+            self._stop_category_rendering()
             if self.is_loading:
                 self.cancel_loading()
 
-            if hasattr(self, "image_manager"):
+            if hasattr(self, "image_manager") and self.image_manager:
                 self.image_manager.stop()
-                self.image_manager.executor.shutdown(wait=True)
 
-            self.clear_all_data()
+            self._clear_grid_widgets()
+            self.poster_containers.clear()
+            self.all_posters.clear()
+            self.master_posters.clear()
 
             if self.folder_path and os.path.exists(self.folder_path):
                 self.settings.setValue("last_directory", self.folder_path)
@@ -1525,7 +2031,7 @@ def main():
 
     window = PhotoWallDialog(folder_path)
     window.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

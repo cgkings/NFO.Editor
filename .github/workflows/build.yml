@@ -1,247 +1,197 @@
-name: Build NFO Tools
+name: Build PySide6 Windows Release
 
 on:
   push:
+    branches:
+      - main
+      - master
     tags:
-      - 'v*.*.*'
+      - "v*"
+  pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  PYTHONUNBUFFERED: 1
-  PYTHONUTF8: 1
-  PYTHONDONTWRITEBYTECODE: 1
+  PYTHON_VERSION: "3.11"
+  PYTHONUTF8: "1"
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  QT_QPA_PLATFORM: "offscreen"
 
 jobs:
-  build:
+  build-windows:
+    name: Build and verify Windows x64 package
     runs-on: windows-latest
-    timeout-minutes: 30  # 增加超时时间
+    timeout-minutes: 60
+    outputs:
+      build_name: ${{ steps.package.outputs.build_name }}
+      zip_name: ${{ steps.package.outputs.zip_name }}
+      artifact_name: ${{ steps.package.outputs.artifact_name }}
 
     steps:
-    - name: 检出代码
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-
-    - name: 设置 Python 版本
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.9.13'
-        cache: 'pip'
-        check-latest: false
-
-    - name: 缓存PyInstaller工作目录
-      uses: actions/cache@v4
-      with:
-        path: |
-          build
-          dist/shared
-        key: ${{ runner.os }}-pyinstaller-${{ hashFiles('*.py', 'requirements.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pyinstaller-
-
-    - name: 安装依赖
-      run: |
-        python -m pip install --upgrade pip wheel setuptools
-        pip install -r requirements.txt
-        pip install pyinstaller==6.3.0
-
-    - name: 设置构建名称
-      id: set_build_name
-      shell: pwsh
-      run: |
-        git fetch --tags
-        $latestTag = git describe --tags $(git rev-list --tags --max-count=1)
-        if ($null -eq $latestTag) {
-          Write-Error "未找到任何标签，无法继续。"
-          exit 1
-        }
-        echo "build_name=$latestTag" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-    - name: 构建应用
-      shell: pwsh
-      run: |
-        # 构建前清理
-        Remove-Item -Path "dist" -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "build" -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path "shared_libs" -Recurse -Force -ErrorAction SilentlyContinue
-        
-        # 创建必要目录
-        New-Item -Path "dist/NFOTools" -ItemType Directory -Force
-        New-Item -Path "shared_libs" -ItemType Directory -Force
-        
-        # 定义共同的 PyInstaller 参数
-        $commonArgs = @(
-          "--distpath", "./dist/shared",
-          "--workpath", "./build/shared",
-          "--onedir",
-          "--noconsole",
-          "--hidden-import", "win32com",
-          "--hidden-import", "win32com.client",
-          "--hidden-import", "win32com.shell",
-          "--hidden-import", "pythoncom",
-          "--hidden-import", "pywintypes",
-          "--hidden-import", "PIL",
-          "--hidden-import", "PIL._imaging",
-          "--hidden-import", "PIL.Image"
-        )
-        
-        # 构建 NFO.Editor.Qt5
-        $editorArgs = $commonArgs + @(
-          "--name", "NFO.Editor.Qt5",
-          "--icon", "chuizi.ico",
-          "--add-data", "*.ico;.",
-          "--add-data", "mapping_actor.xml;.",
-          "--add-data", "series_mapping.xml;.",
-          "--add-data", "Img;Img",
-          "--hidden-import", "win32com.shell.shellcon",
-          "--hidden-import", "win32wnet",
-          "--hidden-import", "winshell",
-          "-y",
-          "NFO.Editor.Qt5.py"
-        )
-        & pyinstaller $editorArgs
-        
-        Move-Item -Path "dist/shared/NFO.Editor.Qt5/NFO.Editor.Qt5.exe" -Destination "dist/NFOTools/"
-        if (Test-Path "dist/shared/NFO.Editor.Qt5/PyQt5") {
-          Move-Item -Path "dist/shared/NFO.Editor.Qt5/PyQt5" -Destination "shared_libs/"
-        }
-        if (Test-Path "dist/shared/NFO.Editor.Qt5/_internal") {
-          Move-Item -Path "dist/shared/NFO.Editor.Qt5/_internal" -Destination "shared_libs/"
-        }
-        Remove-Item -Path "dist/shared/NFO.Editor.Qt5" -Recurse -Force
-        
-        # 构建 cg_crop
-        $cgCropArgs = $commonArgs + @(
-          "--name", "cg_crop",
-          "--icon", "cg_crop.ico",
-          "--add-data", "cg_crop.ico;.",
-          "--add-data", "Img;Img",
-          "-y",
-          "cg_crop.py"
-        )
-        & pyinstaller $cgCropArgs
-        
-        Move-Item -Path "dist/shared/cg_crop/cg_crop.exe" -Destination "dist/NFOTools/"
-        Remove-Item -Path "dist/shared/cg_crop" -Recurse -Force
-        
-        # 构建 cg_rename
-        $cgRenameArgs = $commonArgs + @(
-          "--name", "cg_rename",
-          "--icon", "chuizi.ico",
-          "--add-data", "chuizi.ico;.",
-          "--add-data", "mapping_actor.xml;.",
-          "--add-data", "series_mapping.xml;.",          
-          "-y",
-          "cg_rename.py"
-        )
-        & pyinstaller $cgRenameArgs
-        
-        Move-Item -Path "dist/shared/cg_rename/cg_rename.exe" -Destination "dist/NFOTools/"
-        Remove-Item -Path "dist/shared/cg_rename" -Recurse -Force
-        
-        # 构建 cg_dedupe
-        $cgDedupeArgs = $commonArgs + @(
-          "--name", "cg_dedupe",
-          "--icon", "cg_dedupe.ico",
-          "--add-data", "cg_dedupe.ico;.",
-          "-y",
-          "cg_dedupe.py"
-        )
-        & pyinstaller $cgDedupeArgs
-        
-        Move-Item -Path "dist/shared/cg_dedupe/cg_dedupe.exe" -Destination "dist/NFOTools/"
-        Remove-Item -Path "dist/shared/cg_dedupe" -Recurse -Force
-
-        # 构建 cg_photo_wall
-        $cgPhotoWallArgs = $commonArgs + @(
-          "--name", "cg_photo_wall",
-          "--icon", "cg_photo_wall.ico",
-          "--add-data", "cg_photo_wall.ico;.",
-          "-y",
-          "cg_photo_wall.py"
-        )
-        & pyinstaller $cgPhotoWallArgs
-        
-        Move-Item -Path "dist/shared/cg_photo_wall/cg_photo_wall.exe" -Destination "dist/NFOTools/"
-        Remove-Item -Path "dist/shared/cg_photo_wall" -Recurse -Force
-
-        # 移动共享依赖到最终目录
-        Copy-Item -Path "shared_libs/*" -Destination "dist/NFOTools/" -Recurse -Force
-        
-        # 移动额外资源文件
-        Copy-Item -Path "Img" -Destination "dist/NFOTools/" -Recurse -Force
-        Copy-Item -Path "mapping_actor.xml" -Destination "dist/NFOTools/" -Force
-        Copy-Item -Path "series_mapping.xml" -Destination "dist/NFOTools/" -Force
-
-    - name: 检查构建结果
-      shell: pwsh
-      run: |
-        $requiredFiles = @(
-          "NFO.Editor.Qt5.exe",
-          "cg_crop.exe",
-          "cg_rename.exe",
-          "cg_dedupe.exe",
-          "cg_photo_wall.exe",
-          "mapping_actor.xml",
-          "series_mapping.xml"
-        )
-        
-        foreach ($file in $requiredFiles) {
-          $path = "dist/NFOTools/$file"
-          if (-not (Test-Path $path)) {
-            Write-Error "构建失败：找不到必需文件 $file"
-            exit 1
-          }
-        }
-
-    - name: 创建ZIP包
-      shell: pwsh
-      run: |
-        Compress-Archive -Path "dist/NFOTools/*" -DestinationPath "NFOTools.${{ env.build_name }}.zip" -Force
-
-    - name: 上传构建工件
-      uses: actions/upload-artifact@v4
-      with:
-        name: nfo-tools-release
-        path: NFOTools.${{ env.build_name }}.zip
-        retention-days: 7
-
-  release:
-    needs: build
-    runs-on: windows-latest
-    permissions:
-      contents: write
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: 设置构建名称
-        id: set_build_name
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: x64
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+
+      - name: Install runtime and build dependencies
         shell: pwsh
         run: |
-          git fetch --tags
-          $latestTag = git describe --tags $(git rev-list --tags --max-count=1)
-          if ($null -eq $latestTag) {
-            Write-Error "未找到任何标签，无法继续。"
-            exit 1
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements-build.txt
+          python -m pip check
+          python -c "import PySide6, qfluentwidgets, PyInstaller; print('PySide6:', PySide6.__version__); print('PyInstaller:', PyInstaller.__version__)"
+
+      - name: Reject legacy Qt bindings
+        shell: pwsh
+        run: |
+          @'
+          import importlib.util
+          import sys
+
+          forbidden = ("PyQt5", "PyQt6", "PySide2")
+          found = [name for name in forbidden if importlib.util.find_spec(name) is not None]
+          if found:
+              raise SystemExit(f"Legacy/foreign Qt bindings installed: {', '.join(found)}")
+          print("Only the PySide6 Qt binding is installed.")
+          '@ | python -
+
+      - name: Compile and run unit tests
+        shell: pwsh
+        run: |
+          python -m compileall -q .
+          python -m unittest discover -s tests -q
+          $lintFiles = @(
+            "nfo_editor.py",
+            "nfo_editor_ui.py",
+            "nfo_editor_events.py",
+            "nfo_utils.py",
+            "cg_crop.py",
+            "cg_dedupe.py",
+            "cg_photo_wall.py",
+            "cg_rename.py"
+          )
+          $lintFiles += Get-ChildItem tests -Filter "*.py" -File | ForEach-Object { $_.FullName }
+          $lintFiles += Get-ChildItem scripts -Filter "*.py" -File | ForEach-Object { $_.FullName }
+          python -m pyflakes @lintFiles
+
+      - name: Run source Qt startup smoke test
+        shell: pwsh
+        run: |
+          python scripts/qt_source_smoke.py
+
+      - name: Resolve package name
+        id: package
+        shell: pwsh
+        run: |
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $buildName = "${{ github.ref_name }}"
           }
-          echo "build_name=$latestTag" | Out-File -FilePath $env:GITHUB_ENV -Append
+          else {
+            $buildName = "dev-${{ github.run_number }}-$shortSha"
+          }
 
-      - name: 下载构建工件
-        uses: actions/download-artifact@v4
-        with:
-          name: nfo-tools-release
-          path: dist
+          $zipName = "NFOTools-$buildName-windows-x64.zip"
+          $artifactName = "NFOTools-$buildName-windows-x64"
+          "BUILD_NAME=$buildName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "build_name=$buildName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "zip_name=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "artifact_name=$artifactName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-      - name: 创建 Release
-        uses: softprops/action-gh-release@v1
+      - name: Build PySide6 applications
+        shell: pwsh
+        run: |
+          ./scripts/build_windows.ps1 -OutputRoot "dist/NFOTools"
+
+      - name: Check build contents and launch executables
+        shell: pwsh
+        run: |
+          ./scripts/check_windows_artifact.ps1 -Root "dist/NFOTools" -RunSmokeTests
+
+      - name: Create release archive and checksum
+        shell: pwsh
+        run: |
+          if (Test-Path $env:ZIP_NAME) {
+            Remove-Item $env:ZIP_NAME -Force
+          }
+          Compress-Archive -Path "dist/NFOTools/*" -DestinationPath $env:ZIP_NAME -CompressionLevel Optimal
+
+          $hash = (Get-FileHash -Algorithm SHA256 $env:ZIP_NAME).Hash.ToLowerInvariant()
+          "$hash  $env:ZIP_NAME" | Set-Content -Path "$env:ZIP_NAME.sha256" -Encoding ascii
+
+          if ((Get-Item $env:ZIP_NAME).Length -lt 1MB) {
+            throw "Release archive is unexpectedly small."
+          }
+
+          Write-Host "Archive: $env:ZIP_NAME"
+          Write-Host "SHA-256: $hash"
+
+      - name: Upload verified artifact
+        uses: actions/upload-artifact@v7
         with:
-          name: Release ${{ env.build_name }}
-          tag_name: ${{ env.build_name }}
-          draft: false
-          prerelease: false
-          files: dist/*.zip
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: |
+            ${{ steps.package.outputs.zip_name }}
+            ${{ steps.package.outputs.zip_name }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  release:
+    name: Publish tagged release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build-windows.outputs.artifact_name }}
+          path: release
+          digest-mismatch: error
+
+      - name: Publish or update GitHub Release
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+          ZIP_NAME: ${{ needs.build-windows.outputs.zip_name }}
+        run: |
+          set -euo pipefail
+          cd release
+          test -s "$ZIP_NAME"
+          test -s "$ZIP_NAME.sha256"
+          sha256sum --check "$ZIP_NAME.sha256"
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" "$ZIP_NAME" "$ZIP_NAME.sha256" --clobber
+          else
+            gh release create "$TAG_NAME" "$ZIP_NAME" "$ZIP_NAME.sha256" \
+              --verify-tag \
+              --generate-notes \
+              --title "NFOTools $TAG_NAME"
+          fi

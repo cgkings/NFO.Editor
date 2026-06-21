@@ -1,0 +1,3 @@
+-r requirements.txt
+pyinstaller==6.21.0
+pyflakes>=3.2,<4

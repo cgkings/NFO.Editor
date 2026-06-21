@@ -1,10 +1,10 @@
 import os
 import re
 import sys
-import json
 import subprocess
-from PyQt5 import QtWidgets, QtGui, QtCore
-from PyQt5.QtCore import Qt
+from PySide6 import QtWidgets, QtGui, QtCore
+from PySide6.QtCore import Qt
+from nfo_utils import canonical_path, is_path_within, normalize_scan_roots, paths_form_multi_disc_set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
 from multiprocessing import cpu_count, freeze_support
@@ -112,7 +112,6 @@ class AppTheme:
                 padding: 8px;
                 border: none;
                 font-weight: bold;
-                cursor: pointer;
             }}
             QHeaderView::section:hover {{
                 background-color: #34495e;
@@ -166,7 +165,7 @@ class AppTheme:
 
 
 class CustomSpinner(QtWidgets.QWidget):
-    valueChanged = QtCore.pyqtSignal()
+    valueChanged = QtCore.Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -257,7 +256,7 @@ class CustomSpinner(QtWidgets.QWidget):
 
 class MatchModeWidget(QtWidgets.QWidget):
     """匹配模式选择控件"""
-    modeChanged = QtCore.pyqtSignal()
+    modeChanged = QtCore.Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -310,7 +309,7 @@ class MatchModeWidget(QtWidgets.QWidget):
 
 
 class DirectoryButton(QtWidgets.QPushButton):
-    rightClicked = QtCore.pyqtSignal()
+    rightClicked = QtCore.Signal()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -431,25 +430,9 @@ class NfoFile:
 
     @staticmethod
     def should_exclude_cd_duplicate(file_paths):
-        """检查文件路径列表中是否包含CD标识，如果是则应排除重复检测"""
-        if len(file_paths) <= 1:
-            return False
-        
-        return NfoFile._check_all_files_have_cd_markers(file_paths)
+        """仅排除明确由 CD1/CD2（或 Disc1/Disc2）组成的多碟集合。"""
+        return paths_form_multi_disc_set(file_paths)
 
-    @staticmethod
-    def _check_all_files_have_cd_markers(file_paths):
-        """检查所有文件是否都包含CD标识"""
-        cd_files = []
-        for path in file_paths:
-            filename = os.path.basename(path).lower()
-            for pattern in NfoFile.CD_PATTERNS:
-                if re.search(pattern, filename, re.IGNORECASE):
-                    cd_files.append(path)
-                    break
-        
-        # 如果所有文件都包含CD标识，则排除
-        return len(cd_files) == len(file_paths)
 
 
 class NfoDuplicateLogic:
@@ -460,21 +443,25 @@ class NfoDuplicateLogic:
     FIELD_SERIES = "系列"
 
     def get_nfo_files_generator(self, directories):
-        """使用生成器获取所有NFO文件路径"""
-        for directory in directories:
-            if not os.path.exists(directory):
-                continue
+        """获取 NFO；自动去除重复/嵌套扫描根，并按真实路径去重。"""
+        seen = set()
+        for directory in normalize_scan_roots(directories):
             try:
-                for root, _, files in os.walk(directory):
-                    for file in files:
-                        if file.lower().endswith(".nfo"):
-                            yield os.path.join(root, file)
+                for root, dirs, files in os.walk(directory):
+                    dirs.sort(key=str.lower)
+                    for file in sorted(files, key=str.lower):
+                        if not file.lower().endswith(".nfo"):
+                            continue
+                        path = os.path.join(root, file)
+                        key = canonical_path(path)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        yield path
             except PermissionError:
                 print(f"无权限访问目录: {directory}")
-                continue
-            except Exception as e:
-                print(f"遍历目录出错 {directory}: {str(e)}")
-                continue
+            except OSError as e:
+                print(f"遍历目录出错 {directory}: {e}")
 
     def process_nfo_file(self, args):
         """
@@ -561,51 +548,116 @@ class NfoDuplicateLogic:
         return duplicates
 
     def _find_partial_duplicates(self, field_value_map, threshold):
-        """查找部分匹配的重复项"""
+        """按相似关系的连通分量分组，避免 A~B、B~C 时漏掉 C。"""
+        values = sorted(field_value_map.keys(), key=lambda value: value.casefold())
+        parent = list(range(len(values)))
+
+        def find(index):
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(left, right):
+            left_root = find(left)
+            right_root = find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        for left in range(len(values)):
+            for right in range(left + 1, len(values)):
+                if NfoFile.similarity(values[left], values[right]) >= threshold:
+                    union(left, right)
+
+        components = {}
+        for index, value in enumerate(values):
+            components.setdefault(find(index), []).append(value)
+
         duplicates = {}
-        processed = set()
-        values_list = list(field_value_map.keys())
-        
-        for i, value1 in enumerate(values_list):
-            if value1 in processed:
+        for group_values in components.values():
+            all_paths = []
+            for value in group_values:
+                all_paths.extend(field_value_map[value])
+            all_paths = sorted(dict.fromkeys(all_paths), key=canonical_path)
+            if len(all_paths) <= 1 or self._should_exclude_duplicate(all_paths):
                 continue
-            
-            similar_group = [value1]
-            processed.add(value1)
-            
-            # 查找相似项
-            for j in range(i + 1, len(values_list)):
-                value2 = values_list[j]
-                if value2 in processed:
-                    continue
-                
-                if NfoFile.similarity(value1, value2) >= threshold:
-                    similar_group.append(value2)
-                    processed.add(value2)
-            
-            # 处理相似组
-            self._process_similar_group(similar_group, field_value_map, duplicates)
-        
+            duplicates[group_values[0]] = all_paths
         return duplicates
 
-    def _process_similar_group(self, similar_group, field_value_map, duplicates):
-        """处理相似组"""
-        if len(similar_group) > 1:
-            # 合并相似项的路径
-            all_paths = []
-            for val in similar_group:
-                all_paths.extend(field_value_map[val])
-            
-            if not self._should_exclude_duplicate(all_paths):
-                duplicates[similar_group[0]] = all_paths
-        elif len(field_value_map[similar_group[0]]) > 1:
-            # 单个值但有多个文件
-            if not self._should_exclude_duplicate(field_value_map[similar_group[0]]):
-                duplicates[similar_group[0]] = field_value_map[similar_group[0]]
 
     def _should_exclude_duplicate(self, paths):
         """统一的重复检测排除逻辑"""
         return NfoFile.should_exclude_cd_duplicate(paths)
+
+
+class DedupeWorker(QtCore.QThread):
+    """在独立 QThread 中执行扫描、解析和匹配，GUI 线程只接收信号。"""
+
+    progress = QtCore.Signal(int, int)
+    completed = QtCore.Signal(dict, int)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, logic, directories, field, exact_match, threshold, batch_size):
+        super().__init__()
+        self.logic = logic
+        self.directories = list(directories)
+        self.field = field
+        self.exact_match = exact_match
+        self.threshold = threshold
+        self.batch_size = max(1, int(batch_size))
+
+    def run(self):
+        executor = None
+        try:
+            nfo_files = list(self.logic.get_nfo_files_generator(self.directories))
+            total = len(nfo_files)
+            self.progress.emit(0, total)
+            if not total:
+                self.completed.emit({}, 0)
+                return
+
+            batches = [
+                nfo_files[i:i + self.batch_size]
+                for i in range(0, total, self.batch_size)
+            ]
+            field_value_map = {}
+            processed = 0
+            executor = ThreadPoolExecutor(max_workers=min(32, max(1, cpu_count())))
+            futures = {
+                executor.submit(self._process_batch, batch): batch
+                for batch in batches
+            }
+            for future in as_completed(futures):
+                if self.isInterruptionRequested():
+                    for pending in futures:
+                        pending.cancel()
+                    return
+                batch = futures[future]
+                batch_results = future.result()
+                for key, values in batch_results.items():
+                    field_value_map.setdefault(key, []).extend(values)
+                processed += len(batch)
+                self.progress.emit(processed, total)
+
+            duplicates = self.logic.find_duplicates_with_similarity(
+                field_value_map, self.exact_match, self.threshold
+            )
+            self.completed.emit(duplicates, total)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
+
+    def _process_batch(self, batch):
+        results = {}
+        for nfo_file in batch:
+            if self.isInterruptionRequested():
+                break
+            value, path = self.logic.process_nfo_file((nfo_file, self.field))
+            if value:
+                results.setdefault(value, []).append(path)
+        return results
 
 
 class NfoDuplicateOperations:
@@ -617,6 +669,7 @@ class NfoDuplicateOperations:
         self.batch_size = AppConstants.DEFAULT_BATCH_SIZE
         self.current_sort_column = 0
         self.current_sort_order = Qt.AscendingOrder
+        self.worker = None
 
     def select_directories(self, index=-1):
         """选择目录，index=-1表示新增，否则表示替换指定位置"""
@@ -636,127 +689,78 @@ class NfoDuplicateOperations:
                 self.ui.add_directory(directory)
 
     def find_duplicates(self):
-        """查找重复项的核心方法，增强线程安全"""
+        """启动真正的后台查重任务，避免 GUI 主线程等待 futures。"""
         if not self.ui.selected_directories:
             QtWidgets.QMessageBox.warning(self.ui, "错误", "请先选择至少一个目录！")
             return
-
-        # 线程安全地重置状态
-        with self.progress_lock:
-            self.processed_files = 0
-        
-        self.ui.start_button.setEnabled(False)
-        self.ui.start_button.setText("正在查找...")
+        if self.worker is not None and self.worker.isRunning():
+            return
 
         selected_field = self.ui.field_spinner.get_current_value()
         is_exact_match = self.ui.match_mode_widget.is_exact_match()
         threshold = self.ui.match_mode_widget.get_threshold()
 
-        self.ui.progress_bar.setValue(0)
-        self.ui.progress_bar.setFormat("处理中: %p%")
+        self.ui.start_button.setEnabled(False)
+        self.ui.start_button.setText("正在查找...")
+        self.ui.progress_bar.setRange(0, 0)
+        self.ui.progress_bar.setFormat("正在扫描文件...")
         self.ui.result_stats_label.setText("")
 
-        # 获取文件列表
-        nfo_files = list(
-            self.ui.logic.get_nfo_files_generator(self.ui.selected_directories)
+        self.worker = DedupeWorker(
+            self.ui.logic,
+            self.ui.selected_directories,
+            selected_field,
+            is_exact_match,
+            threshold,
+            self.batch_size,
         )
-        total_files = len(nfo_files)
-        self.ui.progress_bar.setMaximum(total_files)
+        self.worker.progress.connect(self._on_worker_progress)
+        self.worker.completed.connect(self._on_worker_completed)
+        self.worker.failed.connect(self._on_worker_failed)
+        self.worker.finished.connect(self._cleanup_worker)
+        self.worker.start()
 
-        if total_files == 0:
-            self._handle_no_files_found()
+    def _on_worker_progress(self, current, total):
+        if total <= 0:
+            self.ui.progress_bar.setRange(0, 0)
+            self.ui.progress_bar.setFormat("正在扫描文件...")
             return
+        self.ui.progress_bar.setRange(0, total)
+        self.ui.progress_bar.setValue(current)
+        self.ui.progress_bar.setFormat("处理中: %v/%m (%p%)")
 
-        field_value_map = {}
-
-        # 创建更新定时器，降低更新频率
-        self.update_timer = QtCore.QTimer()
-        self.update_timer.setInterval(AppConstants.PROGRESS_UPDATE_INTERVAL)
-        self.update_timer.timeout.connect(self._update_progress_ui)
-        self.update_timer.start()
-
-        # 处理文件
-        self._process_files_in_batches(nfo_files, selected_field, field_value_map)
-
-        # 停止定时器
-        self.update_timer.stop()
-        self.ui.progress_bar.setValue(total_files)
-
-        # 根据匹配模式查找重复项
-        duplicates = self.ui.logic.find_duplicates_with_similarity(
-            field_value_map, is_exact_match, threshold
-        )
-
-        self.display_duplicates(duplicates)
+    def _on_worker_completed(self, duplicates, total_files):
+        if total_files == 0:
+            QtWidgets.QMessageBox.information(
+                self.ui, "提示", "在所选目录中未找到NFO文件。"
+            )
+            self.ui.result_list.clear()
+            self.ui.result_stats_label.setText("")
+            self.ui.progress_bar.setRange(0, 1)
+            self.ui.progress_bar.setValue(0)
+            self.ui.progress_bar.setFormat("完成")
+        else:
+            self.ui.progress_bar.setRange(0, total_files)
+            self.ui.progress_bar.setValue(total_files)
+            self.display_duplicates(duplicates)
         self._reset_ui_state()
 
-    def _handle_no_files_found(self):
-        """处理未找到文件的情况"""
-        QtWidgets.QMessageBox.information(self.ui, "提示", "在所选目录中未找到NFO文件。")
+    def _on_worker_failed(self, message):
+        QtWidgets.QMessageBox.critical(self.ui, "查重失败", message)
+        self.ui.progress_bar.setRange(0, 1)
+        self.ui.progress_bar.setValue(0)
+        self.ui.progress_bar.setFormat("失败")
+        self._reset_ui_state()
+
+    def _cleanup_worker(self):
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
         self._reset_ui_state()
 
     def _reset_ui_state(self):
-        """重置UI状态"""
         self.ui.start_button.setEnabled(True)
         self.ui.start_button.setText("开始查重")
-
-    def _process_files_in_batches(self, nfo_files, selected_field, field_value_map):
-        """批量处理文件"""
-        # 划分批次
-        batches = [
-            nfo_files[i : i + self.batch_size]
-            for i in range(0, len(nfo_files), self.batch_size)
-        ]
-
-        # 使用线程池处理批次
-        with ThreadPoolExecutor(max_workers=cpu_count()) as executor:
-            future_to_batch = {
-                executor.submit(self._process_batch, batch, selected_field): batch
-                for batch in batches
-            }
-
-            for future in as_completed(future_to_batch):
-                try:
-                    batch_results = future.result()
-                    with self.result_lock:
-                        self._merge_batch_results(batch_results, field_value_map)
-                except Exception as e:
-                    print(f"处理批次时出错: {str(e)}")
-
-    def _merge_batch_results(self, batch_results, field_value_map):
-        """合并批次结果"""
-        for key, values in batch_results.items():
-            if key in field_value_map:
-                field_value_map[key].extend(values)
-            else:
-                field_value_map[key] = values
-
-    def _update_progress_ui(self):
-        """更新UI进度条，由定时器调用"""
-        with self.progress_lock:
-            current_progress = self.processed_files
-            self.ui.progress_bar.setValue(current_progress)
-
-    def _process_batch(self, file_batch, selected_field):
-        """处理一批文件，由线程池调用"""
-        batch_results = {}
-        local_processed = 0
-
-        for nfo_file in file_batch:
-            result = self.ui.logic.process_nfo_file((nfo_file, selected_field))
-            if result[0]:
-                field_value = result[0]
-                if field_value in batch_results:
-                    batch_results[field_value].append(result[1])
-                else:
-                    batch_results[field_value] = [result[1]]
-
-            local_processed += 1
-
-        with self.progress_lock:
-            self.processed_files += local_processed
-
-        return batch_results
 
     def display_duplicates(self, duplicates):
         """显示重复项结果"""
@@ -791,7 +795,7 @@ class NfoDuplicateOperations:
         sorted_paths = sorted(
             paths,
             key=lambda x: (
-                0 if first_directory and x.startswith(first_directory) else 1,
+                0 if first_directory and is_path_within(x, first_directory) else 1,
                 x,
             ),
         )
@@ -810,7 +814,7 @@ class NfoDuplicateOperations:
         root_item.setText(0, field_value)
         root_item.setText(1, str(file_count))
         root_item.setText(2, sorted_paths[0] if sorted_paths else "")
-        root_item.setFont(0, QtGui.QFont("", weight=QtGui.QFont.Bold))
+        root_item.setFont(0, QtGui.QFont("", weight=QtGui.QFont.Weight.Bold))
 
         # 设置背景色
         root_item.setBackground(0, QtGui.QColor(self.ui.theme.colors["group_bg"]))
@@ -841,7 +845,7 @@ class NfoDuplicateOperations:
             child_item.setBackground(2, bg_color)
             use_alt_bg = not use_alt_bg
 
-            if first_directory and path.startswith(first_directory):
+            if first_directory and is_path_within(path, first_directory):
                 child_item.setForeground(
                     2, QtGui.QColor(self.ui.theme.colors["secondary"])
                 )
@@ -1259,7 +1263,16 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         settings.setValue("directories", self.selected_directories)
 
     def closeEvent(self, event):
-        """窗口关闭事件处理"""
+        """关闭前等待后台扫描安全退出，避免销毁运行中的 QThread。"""
+        worker = getattr(self.operations, "worker", None) if hasattr(self, "operations") else None
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+            if not worker.wait(5000):
+                QtWidgets.QMessageBox.warning(
+                    self, "任务仍在运行", "查重任务尚未安全停止，请稍后再关闭窗口。"
+                )
+                event.ignore()
+                return
         self.save_directories()
         event.accept()
 
@@ -1290,4 +1303,4 @@ if __name__ == "__main__":
     window.move(x, y)
 
     window.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())

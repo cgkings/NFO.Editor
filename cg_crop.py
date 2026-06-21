@@ -3,15 +3,14 @@ import sys
 import argparse
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict
-from pathlib import Path
 
-from PyQt5.QtWidgets import (
+from PySide6.QtWidgets import (
     QDialog, QLabel, QPushButton, QFileDialog, QMessageBox, QGroupBox,
     QVBoxLayout, QHBoxLayout, QCheckBox, QRadioButton, QWidget, QButtonGroup,
-    QSpinBox, QDoubleSpinBox, QApplication
+    QDoubleSpinBox, QApplication
 )
-from PyQt5.QtCore import QSize, Qt, QRect, pyqtSignal
-from PyQt5.QtGui import QIcon, QImage, QImageReader, QPixmap, QPainter, QPen, QTransform, QColor
+from PySide6.QtCore import QSize, Qt, QRect, QPoint, Signal as pyqtSignal
+from PySide6.QtGui import QIcon, QImage, QImageReader, QPixmap, QPainter, QPen, QTransform, QColor
 
 
 # ================================ 配置管理 ================================
@@ -413,38 +412,85 @@ class WatermarkProcessor:
 
 
 class ImageSaver:
-    """图片保存器 - 专门处理图片保存"""
-    
+    """图片保存器 - 两张输出均成功后才提交，失败时恢复原文件。"""
+
     @staticmethod
-    def save_images(cropped_image: QImage, full_image: QImage, original_path: str) -> Tuple[str, str]:
-        """修复：保存图片，支持更多图片格式"""
+    def save_images(
+        cropped_image: QImage,
+        full_image: QImage,
+        original_path: str,
+        preferred_base_name: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        import re
+        import tempfile
+        import uuid
+
+        directory = os.path.dirname(os.path.abspath(original_path))
+        filename = os.path.basename(original_path)
+        stem = os.path.splitext(filename)[0]
+        base_name = (preferred_base_name or "").strip()
+        if not base_name:
+            base_name = re.sub(r"-(?:fanart|poster|thumb)$", "", stem, flags=re.IGNORECASE)
+        if not base_name or os.path.basename(base_name) != base_name:
+            raise CropError("无法确定安全的输出文件基础名称")
+
+        poster_path = os.path.join(directory, f"{base_name}-poster.jpg")
+        thumb_path = os.path.join(directory, f"{base_name}-thumb.jpg")
+        targets = [poster_path, thumb_path]
+        temp_paths = []
+        backups = {}
+        committed = []
+        success = False
         try:
-            directory = os.path.dirname(original_path)
-            filename = os.path.basename(original_path)
-            
-            # 修复：改进文件名处理逻辑，支持更多格式
-            if filename.lower().endswith("-fanart.jpg"):
-                base_name = filename[:-11]  # 去掉"-fanart.jpg"
-            elif filename.lower().endswith("-fanart.jpeg"):
-                base_name = filename[:-12]  # 去掉"-fanart.jpeg"
-            elif filename.lower().endswith("-fanart.png"):
-                base_name = filename[:-11]  # 去掉"-fanart.png"
-            else:
-                # 通用处理：去掉文件扩展名
-                base_name = os.path.splitext(filename)[0]
-            
-            poster_path = os.path.join(directory, f"{base_name}-poster.jpg")
-            thumb_path = os.path.join(directory, f"{base_name}-thumb.jpg")
-            
-            if not cropped_image.save(poster_path, "JPEG", quality=95):
-                raise CropError("保存poster失败")
-            if not full_image.save(thumb_path, "JPEG", quality=95):
-                raise CropError("保存thumb失败")
-            
+            for image, label in ((cropped_image, "poster"), (full_image, "thumb")):
+                fd, temp_path = tempfile.mkstemp(
+                    prefix=f".{base_name}-{label}.", suffix=".jpg", dir=directory
+                )
+                os.close(fd)
+                temp_paths.append(temp_path)
+                if not image.save(temp_path, "JPEG", quality=95):
+                    raise CropError(f"编码{label}失败")
+
+            for target in targets:
+                if os.path.exists(target):
+                    backup = f"{target}.crop-backup-{uuid.uuid4().hex}"
+                    os.replace(target, backup)
+                    backups[target] = backup
+
+            for temp_path, target in zip(temp_paths, targets):
+                os.replace(temp_path, target)
+                committed.append(target)
+            temp_paths.clear()
+            success = True
             return poster_path, thumb_path
-            
-        except Exception as e:
-            raise CropError(f"保存图片失败: {e}")
+        except Exception as exc:
+            for target in committed:
+                try:
+                    if os.path.exists(target):
+                        os.remove(target)
+                except OSError:
+                    pass
+            for target, backup in backups.items():
+                try:
+                    if os.path.exists(backup):
+                        os.replace(backup, target)
+                except OSError:
+                    pass
+            raise CropError(f"保存图片失败: {exc}") from exc
+        finally:
+            for temp_path in temp_paths:
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except OSError:
+                    pass
+            if success:
+                for backup in backups.values():
+                    try:
+                        if os.path.exists(backup):
+                            os.remove(backup)
+                    except OSError:
+                        pass
 
 
 # ================================ UI组件 ================================
@@ -1142,7 +1188,9 @@ class EmbyPosterCrop(QDialog):
                 image = self.watermark_processor.apply_watermarks(image, watermark_settings)
             
             # 保存图片
-            poster_path, thumb_path = ImageSaver.save_images(cropped, image, self.image_path)
+            poster_path, thumb_path = ImageSaver.save_images(
+                cropped, image, self.image_path, self.nfo_base_name
+            )
             QMessageBox.information(self, "成功", f"裁剪成功！\n保存位置：{poster_path}")
             return True
             
@@ -1220,7 +1268,7 @@ if __name__ == "__main__":
             window.set_watermark_options(args.subtitle, args.mark_type)
         
         window.show()
-        sys.exit(app.exec_())
+        sys.exit(app.exec())
         
     except Exception as e:
         print(f"启动失败：{e}")

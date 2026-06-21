@@ -4,16 +4,17 @@ import re
 import logging
 from datetime import datetime
 from xml.etree import ElementTree as ET
-from PyQt5.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QCheckBox, QTextEdit, QProgressBar,
     QFileDialog, QMessageBox,
 )
-from PyQt5.QtCore import QSize, Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QIcon
+from PySide6.QtCore import QSize, Qt, QThread, Signal
+from PySide6.QtGui import QIcon
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from nfo_utils import parse_xml_file, preferred_nfo_file, same_path, write_xml_root_atomic
 
 # 配置常量
 class Config:
@@ -364,7 +365,7 @@ class NFOParser:
     def parse_nfo_file(self, nfo_path: str) -> NFOFields:
         """解析NFO文件并返回字段对象"""
         try:
-            tree = ET.parse(nfo_path)
+            tree = parse_xml_file(nfo_path)
             root = tree.getroot()
             fields = NFOFields()
             
@@ -452,7 +453,7 @@ class NFOModifier:
     def modify_nfo_file(self, nfo_path: str) -> Tuple[bool, List[str], Dict[str, int], Dict[str, any]]:
         """修改NFO文件中的演员名称和系列信息"""
         try:
-            tree = ET.parse(nfo_path)
+            tree = parse_xml_file(nfo_path)
             root = tree.getroot()
             
             stats = {'actor': 0, 'tag': 0, 'genre': 0, 'series': 0, 'set': 0}
@@ -491,7 +492,7 @@ class NFOModifier:
                 detailed_logs['structure_changes'] = structure_logs
             
             if modified:
-                tree.write(nfo_path, encoding="utf-8", xml_declaration=True)
+                write_xml_root_atomic(root, nfo_path)
             
             return modified, all_actors, stats, detailed_logs
             
@@ -859,10 +860,10 @@ class FolderRenamer:
 
 class RenameWorker(QThread):
     """重命名工作线程"""    
-    progressUpdated = pyqtSignal(int, int)
-    logUpdated = pyqtSignal(str)
-    finished = pyqtSignal()
-    error = pyqtSignal(str)
+    progressUpdated = Signal(int, int)
+    logUpdated = Signal(str)
+    completed = Signal()
+    error = Signal(str)
 
     def __init__(self, directory: str, actor_mapping: Dict[str, str], 
                  rename_folders: bool, folder_format: str = "",
@@ -889,10 +890,15 @@ class RenameWorker(QThread):
             self.log_manager.log_info(f"重命名文件夹: {'是' if self.rename_folders else '否'}")
             
             self._process_directory()
-            
+
+            if self.isInterruptionRequested():
+                self.log_manager.log_info("任务已取消")
+                self.log_manager.close()
+                return
+
             self.log_manager.log_info("所有处理完成")
             self.log_manager.close()
-            self.finished.emit()
+            self.completed.emit()
         except Exception as e:
             self.log_manager.log_error(f"处理过程出错: {e}")
             self.log_manager.close()
@@ -912,6 +918,9 @@ class RenameWorker(QThread):
             return
         
         for i, (folder_path, nfo_path) in enumerate(folders_to_process, 1):
+            if self.isInterruptionRequested():
+                self.log_manager.log_info("用户请求停止，已结束后续处理")
+                break
             try:
                 self._process_single_folder(folder_path, nfo_path, i, total_folders)
             except Exception as e:
@@ -919,17 +928,20 @@ class RenameWorker(QThread):
                 self.log_manager.log_error(error_msg)
 
     def _collect_folders_with_nfo(self) -> List[Tuple[str, str]]:
-        """收集包含NFO文件的文件夹"""
+        """收集包含 NFO 的目录；包含所选根目录，并按最深层优先处理。"""
         folders_with_nfo = []
-        
         for root, dirs, _ in os.walk(self.directory):
-            for folder in dirs:
-                folder_path = os.path.join(root, folder)
-                nfo_path = self._find_nfo_file(folder_path)
-                
-                if nfo_path:
-                    folders_with_nfo.append((folder_path, nfo_path))
-        
+            if self.isInterruptionRequested():
+                break
+            dirs.sort(key=str.lower)
+            nfo_path = self._find_nfo_file(root)
+            if nfo_path:
+                folders_with_nfo.append((root, nfo_path))
+
+        folders_with_nfo.sort(
+            key=lambda item: (len(Path(item[0]).parts), item[0].lower()),
+            reverse=True,
+        )
         return folders_with_nfo
     
     def _process_single_folder(self, folder_path: str, nfo_path: str, current: int, total: int):
@@ -954,10 +966,21 @@ class RenameWorker(QThread):
         # 修改NFO文件信息
         nfo_modified, modified_fields = self._modify_nfo_info_optimized(nfo_path, nfo_name)
         
-        # 重命名文件夹
+        # NFO 映射可能改变 series/actor 等命名字段；重命名前重新解析最新内容。
+        if nfo_modified:
+            try:
+                nfo_fields = self.nfo_parser.parse_nfo_file(nfo_path)
+            except Exception as exc:
+                self.log_manager.log_error(f"修改后重新解析NFO失败: {nfo_name} - {exc}")
+
         folder_renamed = False
         if self.rename_folders:
-            folder_renamed = self._rename_folder_if_needed_optimized(folder_path, nfo_fields, folder_name)
+            if same_path(folder_path, self.directory):
+                self.log_manager.log_info(f"跳过所选根目录重命名: {folder_path}")
+            else:
+                folder_renamed = self._rename_folder_if_needed_optimized(
+                    folder_path, nfo_fields, folder_name
+                )
         
         # UI日志：只显示有变化的操作
         if nfo_modified or folder_renamed:
@@ -1045,15 +1068,14 @@ class RenameWorker(QThread):
             return False
     
     def _find_nfo_file(self, folder_path: str) -> Optional[str]:
-        """在文件夹中查找NFO文件"""
-        for file_path in Path(folder_path).iterdir():
-            if file_path.is_file() and file_path.suffix.lower() in Config.SUPPORTED_NFO_EXTENSIONS:
-                return str(file_path)
-        return None
+        """确定性选择 NFO：优先与目录同名，否则按文件名排序取首个。"""
+        return preferred_nfo_file(folder_path, Path(folder_path).name)
 
 class RenameToolGUI(QMainWindow):
     def __init__(self, parent=None):
+        # Qt6/PySide6 版本：parent 可以安全接收 NFOEditorQt6。
         super().__init__(parent)
+        self.parent_window = parent
         # 使用新的加载器
         self.actor_loader = ActorMappingLoader()
         self.series_loader = SeriesMappingLoader()
@@ -1080,9 +1102,12 @@ class RenameToolGUI(QMainWindow):
     
     def _center_window(self):
         """窗口居中"""
-        screen_geometry = QApplication.desktop().availableGeometry()
-        x = (screen_geometry.width() - self.width()) // 2
-        y = (screen_geometry.height() - self.height()) // 2
+        screen = QApplication.primaryScreen()
+        if not screen:
+            return
+        screen_geometry = screen.availableGeometry()
+        x = screen_geometry.x() + (screen_geometry.width() - self.width()) // 2
+        y = screen_geometry.y() + (screen_geometry.height() - self.height()) // 2
         self.move(x, y)
     
     def _setup_icon(self):
@@ -1222,11 +1247,11 @@ class RenameToolGUI(QMainWindow):
         layout.addWidget(self.progress_bar)
         
         # 执行按钮
-        execute_btn = QPushButton("执行")
-        execute_btn.setMinimumHeight(45)
-        execute_btn.setStyleSheet(Config.PRIMARY_BUTTON_STYLE)
-        execute_btn.clicked.connect(self.execute_rename)
-        layout.addWidget(execute_btn)
+        self.execute_btn = QPushButton("执行")
+        self.execute_btn.setMinimumHeight(45)
+        self.execute_btn.setStyleSheet(Config.PRIMARY_BUTTON_STYLE)
+        self.execute_btn.clicked.connect(self.execute_rename)
+        layout.addWidget(self.execute_btn)
         
         return container
         
@@ -1368,12 +1393,15 @@ class RenameToolGUI(QMainWindow):
             
             self.worker.progressUpdated.connect(self.update_progress)
             self.worker.logUpdated.connect(self.update_ui_log)
-            self.worker.finished.connect(self.on_worker_finished)
+            self.worker.completed.connect(self.on_worker_finished)
             self.worker.error.connect(self.handle_error)
+            self.worker.finished.connect(self._on_worker_thread_stopped)
             
+            self.execute_btn.setEnabled(False)
             self.worker.start()
             
         except Exception as e:
+            self.execute_btn.setEnabled(True)
             QMessageBox.critical(self, "错误", f"处理过程中出现错误: {e}")
             self.log_text.append("处理出错")
     
@@ -1392,15 +1420,36 @@ class RenameToolGUI(QMainWindow):
         self.log_text.append("")
         self.log_text.append("🎉 所有处理完成！")
         self.progress_bar.setFormat("完成")
+        self._notify_parent_finished()
         
         # 显示日志文件路径
         if hasattr(self.worker, 'log_manager') and self.worker.log_manager.log_file_path:
             self.log_text.append(f"详细日志: {self.worker.log_manager.log_file_path}")
     
+    def _notify_parent_finished(self):
+        """批量改名完成后，轻量通知主窗口刷新列表。"""
+        parent = getattr(self, "parent_window", None)
+        if not parent:
+            return
+        try:
+            if hasattr(parent, "reload_timer"):
+                parent.reload_timer.start(800)
+            elif hasattr(parent, "load_files_in_folder"):
+                parent.load_files_in_folder(auto_select=False, show_progress=False)
+        except Exception as e:
+            print(f"通知主窗口刷新失败: {e}")
+
     def handle_error(self, error_message: str):
         """处理工作线程错误"""
         QMessageBox.critical(self, "错误", f"处理过程中出现错误: {error_message}")
         self.log_text.append(f"处理出错: {error_message}")
+
+    def _on_worker_thread_stopped(self):
+        worker = self.worker
+        self.worker = None
+        self.execute_btn.setEnabled(True)
+        if worker is not None:
+            worker.deleteLater()
 
     def update_ui_log(self, message: str):
         """更新UI日志"""
@@ -1410,6 +1459,20 @@ class RenameToolGUI(QMainWindow):
             # 确保最新日志可见
             scroll_bar = self.log_text.verticalScrollBar()
             scroll_bar.setValue(scroll_bar.maximum())
+
+    def closeEvent(self, event):
+        """防止运行中的重命名线程随窗口一起被销毁。"""
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.requestInterruption()
+            if not self.worker.wait(5000):
+                QMessageBox.warning(
+                    self, "任务仍在运行",
+                    "批量处理尚未安全停止，请等待当前文件处理完成后再关闭。",
+                )
+                event.ignore()
+                return
+        super().closeEvent(event)
+
 
 def start_rename_process(directory: Optional[str] = None):
     """启动重命名程序"""
@@ -1426,7 +1489,7 @@ def start_rename_process(directory: Optional[str] = None):
         window.path_entry.setText(directory)
     
     window.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 def create_rename_worker(directory: str, actor_mapping: Dict[str, str], 
                         rename_folders: bool, folder_format: str = "",
