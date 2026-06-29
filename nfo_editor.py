@@ -757,10 +757,63 @@ class FileOperationThread(QThread):
             self.status.emit(f"正在处理: {folder_name}")
             try:
                 safe_move_directory(src_path, dest_path)
-            except (OSError, shutil.Error) as exc:
+            except Exception as exc:
+                # 文件移动涉及磁盘、杀软/索引器、同名冲突、权限等外部因素。
+                # 在工作线程内兜住异常，避免异常穿透 QThread 造成主程序不稳定。
                 self.error.emit(f"移动文件夹失败: {exc}")
             finally:
                 self.progress.emit(i, total)
+
+
+class TargetFolderLoadThread(QThread):
+    """异步读取目标目录子文件夹，避免大目录双击进入时阻塞 UI。"""
+
+    batch_ready = pyqtSignal(str, list)
+    finished_signal = pyqtSignal(str, int)
+    error = pyqtSignal(str, str)
+
+    def __init__(self, target_path, batch_size=500):
+        super().__init__()
+        self.target_path = os.path.normpath(target_path)
+        self.batch_size = batch_size
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        self._stop_event.set()
+
+    @property
+    def is_stopped(self):
+        return self._stop_event.is_set()
+
+    def run(self):
+        try:
+            folder_names = []
+            with os.scandir(self.target_path) as entries:
+                for entry in entries:
+                    if self._stop_event.is_set():
+                        return
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            folder_names.append(entry.name)
+                    except OSError:
+                        # 个别目录无权限/瞬间消失时跳过，不影响整个目标目录展示。
+                        continue
+
+            if self._stop_event.is_set():
+                return
+
+            folder_names.sort(key=str.lower)
+            total = len(folder_names)
+            for start in range(0, total, self.batch_size):
+                if self._stop_event.is_set():
+                    return
+                self.batch_ready.emit(
+                    self.target_path,
+                    folder_names[start:start + self.batch_size],
+                )
+            self.finished_signal.emit(self.target_path, total)
+        except OSError as exc:
+            self.error.emit(self.target_path, f"加载目标目录失败: {exc}")
 
 
 
@@ -823,6 +876,9 @@ class NFOEditorQt6(NFOEditorQt):
         self.nfo_files = []
         self.selected_index_cache = None
         self.move_thread = None
+        self.move_progress = None
+        self.target_load_thread = None
+        self._target_dir_icon = None
         self.file_watcher = QFileSystemWatcher()
         self._pending_select_folder = None
         self._event_file_path = None
@@ -1060,8 +1116,10 @@ class NFOEditorQt6(NFOEditorQt):
             self.set_target_panel_visible(False)
 
     def clear_target_folder(self):
+        self._stop_target_load_thread()
         self.current_target_path = None
         self.sorted_tree.clear()
+        self.sorted_tree.setEnabled(True)
         self.set_target_panel_visible(False)
         self.status_bar.showMessage("目标目录已清除")
 
@@ -1086,11 +1144,13 @@ class NFOEditorQt6(NFOEditorQt):
             self.filter_entry.setEnabled(not busy)
 
     def _set_moving_busy(self, busy: bool):
-        """移动线程运行期间禁用移动相关按钮。"""
-        for name in ("btn_move", "btn_open_folder", "btn_refresh"):
+        """移动线程运行期间禁用移动相关按钮，防止目标路径/列表在移动中被改动。"""
+        for name in ("btn_move", "btn_open_folder", "btn_refresh", "btn_select_target"):
             btn = getattr(self, name, None)
             if btn is not None:
                 btn.setEnabled(not busy)
+        if getattr(self, "sorted_tree", None) is not None:
+            self.sorted_tree.setEnabled(not busy)
 
     def load_files_in_folder(self, auto_select=True, show_progress=True):
         if not self.folder_path:
@@ -1554,12 +1614,45 @@ class NFOEditorQt6(NFOEditorQt):
                 QMessageBox.warning(self, "警告", "没有有效的源文件夹可以移动")
                 return
 
+            dest_path = os.path.normpath(self.current_target_path)
+            invalid_moves = []
+            valid_src_paths = []
+            for src_path in src_paths:
+                try:
+                    common = os.path.commonpath([os.path.abspath(src_path), os.path.abspath(dest_path)])
+                except ValueError:
+                    common = ""
+                if same_path(src_path, dest_path) or same_path(common, src_path):
+                    invalid_moves.append(src_path)
+                else:
+                    valid_src_paths.append(src_path)
+
+            if invalid_moves:
+                QMessageBox.warning(
+                    self,
+                    "目标目录无效",
+                    "不能把文件夹移动到它自己或它的子目录中，已自动跳过这些项。",
+                )
+
+            src_paths = unique_paths(valid_src_paths)
+            if not src_paths:
+                QMessageBox.warning(self, "警告", "没有有效的源文件夹可以移动")
+                return
+
             self._clear_file_watches()
 
-            progress = QProgressDialog("准备移动...", "取消", 0, len(src_paths), self)
-            progress.setWindowModality(Qt.WindowModal)
-            progress.setAutoClose(True)
-            progress.setAutoReset(True)
+            if self.move_progress is not None:
+                try:
+                    self.move_progress.close()
+                    self.move_progress.deleteLater()
+                except RuntimeError:
+                    pass
+                self.move_progress = None
+
+            self.move_progress = QProgressDialog("准备移动...", "取消", 0, len(src_paths), self)
+            self.move_progress.setWindowModality(Qt.WindowModal)
+            self.move_progress.setAutoClose(True)
+            self.move_progress.setAutoReset(True)
 
             if self.move_thread is not None and self.move_thread.isRunning():
                 self.move_thread.stop()
@@ -1568,15 +1661,15 @@ class NFOEditorQt6(NFOEditorQt):
             self.move_thread = FileOperationThread(
                 operation_type="move",
                 src_paths=src_paths,
-                dest_path=self.current_target_path,
+                dest_path=dest_path,
             )
-            self.move_thread.progress.connect(progress.setValue)
-            self.move_thread.status.connect(progress.setLabelText)
+            self.move_thread.progress.connect(self.move_progress.setValue)
+            self.move_thread.status.connect(self.move_progress.setLabelText)
             self.move_thread.error.connect(
                 lambda msg: QMessageBox.critical(self, "错误", msg)
             )
             self.move_thread.finished.connect(self.on_move_finished)
-            progress.canceled.connect(self.move_thread.stop)
+            self.move_progress.canceled.connect(self.move_thread.stop)
             self._set_moving_busy(True)
             self.move_thread.start()
         except OSError as e:
@@ -1599,6 +1692,18 @@ class NFOEditorQt6(NFOEditorQt):
                 elif isinstance(entry, QLabel):
                     entry.setText("")
 
+        if self.move_progress is not None:
+            try:
+                self.move_progress.canceled.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                self.move_progress.close()
+                self.move_progress.deleteLater()
+            except RuntimeError:
+                pass
+            self.move_progress = None
+
         # 先解除移动态, 再触发加载(加载会自行接管按钮禁用), 避免两套状态打架
         self._set_moving_busy(False)
         self.load_files_in_folder(
@@ -1615,37 +1720,76 @@ class NFOEditorQt6(NFOEditorQt):
     #  目标目录
     # ================================================================
 
+    def _stop_target_load_thread(self):
+        if self.target_load_thread is not None and self.target_load_thread.isRunning():
+            self.target_load_thread.stop()
+            self.target_load_thread.wait()
+        if self.target_load_thread is not None:
+            self.target_load_thread.deleteLater()
+            self.target_load_thread = None
+
+    def _add_target_parent_item(self, target_path):
+        if os.path.dirname(target_path) == target_path:
+            return
+        parent_item = QTreeWidgetItem([".."])
+        parent_item.setIcon(
+            0,
+            self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp),
+        )
+        self.sorted_tree.addTopLevelItem(parent_item)
+
+    def _target_tree_should_be_enabled(self):
+        return not (self.move_thread is not None and self.move_thread.isRunning())
+
     def load_target_files(self, target_path):
+        target_path = os.path.normpath(target_path)
+        self.current_target_path = target_path
+        self._stop_target_load_thread()
         self.sorted_tree.clear()
-        try:
-            if os.path.dirname(target_path) != target_path:
-                parent_item = QTreeWidgetItem([".."])
-                # PySide6: 必须用全限定枚举 QStyle.StandardPixmap.SP_*
-                # 不能用 PyQt5 的实例属性短写法 self.style().SP_ArrowUp
-                parent_item.setIcon(
-                    0,
-                    self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp),
-                )
-                self.sorted_tree.addTopLevelItem(parent_item)
+        self._add_target_parent_item(target_path)
+        self.sorted_tree.setEnabled(False)
+        self.status_bar.showMessage(f"正在读取目标目录: {target_path}")
 
-            for entry in os.scandir(target_path):
-                if entry.is_dir():
-                    item = QTreeWidgetItem([entry.name])
-                    item.setIcon(
-                        0,
-                        self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon),
-                    )
-                    self.sorted_tree.addTopLevelItem(item)
+        self.target_load_thread = TargetFolderLoadThread(target_path, batch_size=500)
+        self.target_load_thread.batch_ready.connect(self._on_target_batch_ready)
+        self.target_load_thread.finished_signal.connect(self._on_target_load_finished)
+        self.target_load_thread.error.connect(self._on_target_load_error)
+        self.target_load_thread.start()
 
-            folder_count = self.sorted_tree.topLevelItemCount()
-            top_texts = [
-                self.sorted_tree.topLevelItem(i).text(0) for i in range(folder_count)
-            ]
-            if ".." in top_texts:
-                folder_count -= 1
-            self.status_bar.showMessage(f"目标目录: {target_path} (共{folder_count}个文件夹)")
-        except OSError as e:
-            QMessageBox.critical(self, "错误", f"加载目标目录失败: {str(e)}")
+    def _on_target_batch_ready(self, target_path, folder_names):
+        if not same_path(target_path, self.current_target_path):
+            return
+        if self._target_dir_icon is None:
+            self._target_dir_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+
+        items = []
+        for name in folder_names:
+            item = QTreeWidgetItem([name])
+            item.setIcon(0, self._target_dir_icon)
+            items.append(item)
+
+        if items:
+            self.sorted_tree.setUpdatesEnabled(False)
+            self.sorted_tree.addTopLevelItems(items)
+            self.sorted_tree.setUpdatesEnabled(True)
+
+    def _on_target_load_finished(self, target_path, folder_count):
+        if not same_path(target_path, self.current_target_path):
+            return
+        self.sorted_tree.setEnabled(self._target_tree_should_be_enabled())
+        self.status_bar.showMessage(f"目标目录: {target_path} (共{folder_count}个文件夹)")
+        if self.target_load_thread:
+            self.target_load_thread.deleteLater()
+            self.target_load_thread = None
+
+    def _on_target_load_error(self, target_path, error_msg):
+        if not same_path(target_path, self.current_target_path):
+            return
+        self.sorted_tree.setEnabled(self._target_tree_should_be_enabled())
+        if self.target_load_thread:
+            self.target_load_thread.deleteLater()
+            self.target_load_thread = None
+        QMessageBox.critical(self, "错误", error_msg)
 
     # ================================================================
     #  未保存检测
@@ -2450,18 +2594,16 @@ class NFOEditorQt6(NFOEditorQt):
                 QMessageBox.critical(self, "错误", f"文件夹不存在: {os.path.dirname(nfo_path)}")
 
     def on_target_tree_double_click(self, item, column):
-        if not self.current_target_path:
+        if not self.current_target_path or not self.sorted_tree.isEnabled():
             return
         text = item.text(0)
         if text == "..":
             parent = os.path.dirname(self.current_target_path)
             if parent != self.current_target_path:
-                self.current_target_path = parent
                 self.load_target_files(parent)
         else:
             new_path = os.path.join(self.current_target_path, text)
             if os.path.isdir(new_path):
-                self.current_target_path = new_path
                 self.load_target_files(new_path)
 
     def focus_file_list(self):
@@ -2697,6 +2839,10 @@ class NFOEditorQt6(NFOEditorQt):
                 self.move_thread.stop()
                 if not self.move_thread.wait(5000):
                     running_threads.append("文件移动")
+            if self.target_load_thread is not None and self.target_load_thread.isRunning():
+                self.target_load_thread.stop()
+                if not self.target_load_thread.wait(5000):
+                    running_threads.append("目标目录加载")
 
             if running_threads:
                 QMessageBox.warning(
@@ -2714,6 +2860,13 @@ class NFOEditorQt6(NFOEditorQt):
                 self.file_watcher.removePaths(directories)
             if files:
                 self.file_watcher.removePaths(files)
+            if self.move_progress is not None:
+                try:
+                    self.move_progress.close()
+                    self.move_progress.deleteLater()
+                except RuntimeError:
+                    pass
+                self.move_progress = None
             self.nfo_cache.clear()
         except (OSError, RuntimeError) as exc:
             print(f"清理资源时出错: {exc}")
