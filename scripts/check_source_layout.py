@@ -12,7 +12,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_FILES = (
     "nfo_editor.py",
     "nfo_editor_ui.py",
-    "nfo_editor_events.py",
     "nfo_utils.py",
     "cg_crop.py",
     "cg_dedupe.py",

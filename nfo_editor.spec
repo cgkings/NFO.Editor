@@ -11,7 +11,6 @@ def add_if_exists(items, source, destination="."):
 
 datas = [
     ("nfo_editor_ui.py", "."),
-    ("nfo_editor_events.py", "."),
     ("nfo_utils.py", "."),
 ]
 

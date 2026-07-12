@@ -22,7 +22,6 @@ sys.path.insert(0, str(repo_root))
 _required_source_files = (
     "nfo_editor.py",
     "nfo_editor_ui.py",
-    "nfo_editor_events.py",
     "nfo_utils.py",
     "cg_crop.py",
     "cg_dedupe.py",

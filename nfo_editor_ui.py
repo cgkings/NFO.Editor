@@ -266,19 +266,14 @@ class AdaptiveImageLabel(QLabel):
 # ============================================================
 
 class _ImagePreviewContainer(QWidget):
-    """图片区子容器,在 resizeEvent 中按比例分配 poster/thumb 尺寸。
+    """图片区子容器，保证 poster/thumb 的显示框始终等高。
 
-    Poster: 2:3 (width:height = 2:3,即 width = height * 2/3)
-    Thumb:  16:9 (width:height = 16:9,即 height = width * 9/16)
+    Poster 的宽度优先按 2:3 计算，Thumb 使用剩余宽度。两张图片的
+    QLabel 显示框从同一 y 坐标开始并使用同一个高度；实际图片仍由
+    AdaptiveImageLabel 以 KeepAspectRatio 居中缩放，因此不会变形。
 
-    布局逻辑(给定容器高度 H 和宽度 W):
-      1. 预留底部 20px 给分辨率标签
-      2. 可用图片高度 h = H - 20
-      3. Poster 尺寸: poster_w = h * 2/3, poster_h = h
-      4. 剩余宽度给 Thumb: thumb_w = W - poster_w - spacing
-      5. Thumb 维持 16:9,高度 = thumb_w * 9/16,
-         但不超过 h(否则会撑破容器)
-      6. 如果 thumb 的 16:9 高度 < h,在垂直方向居中
+    这样初始化、窗口缩放和拖动分隔条时，封面与缩略图的上下边缘
+    始终对齐，不再出现两个图片区块高度不一致的问题。
     """
 
     SPACING = 8
@@ -317,45 +312,48 @@ class _ImagePreviewContainer(QWidget):
         if self.poster_label is None:
             return
 
-        W = self.width()
-        H = self.height()
-        if W <= 1 or H <= 1:
+        width = self.width()
+        height = self.height()
+        label_gap = 2
+        if width <= self.SPACING + 2 or height <= self.RESOLUTION_LABEL_HEIGHT + label_gap:
             return
 
-        # 图片高度 = 总高度 - 分辨率标签高度
-        h = H - self.RESOLUTION_LABEL_HEIGHT - 2
+        # 使用一个共同图片高度，同时满足 Poster 2:3 和 Thumb 16:9。
+        # 高度既受容器高度限制，也受两张图片并排所需总宽度限制：
+        #   h * 2/3 + spacing + h * 16/9 <= width
+        # 这样不仅两个 QLabel 等高，标准比例图片的实际显示内容也等高。
+        available_image_height = height - self.RESOLUTION_LABEL_HEIGHT - label_gap
+        combined_width_ratio = (2 / 3) + (16 / 9)
+        height_by_width = int((width - self.SPACING) / combined_width_ratio)
+        image_height = max(1, min(available_image_height, height_by_width))
 
-        # Poster 维持 2:3
-        poster_w = int(h * 2 / 3)
-        # Poster 宽度上限,防止极端情况
-        poster_w = min(poster_w, int(W * 0.45))
-        poster_h = h
+        poster_width = max(1, int(round(image_height * 2 / 3)))
+        thumb_width = max(1, int(round(image_height * 16 / 9)))
 
-        # 剩余宽度给 Thumb
-        thumb_w = W - poster_w - self.SPACING
-        if thumb_w < 100:
-            thumb_w = 100  # 兜底
+        # 四舍五入可能多出 1px，统一从 Thumb 回收，确保永不越界。
+        overflow = poster_width + self.SPACING + thumb_width - width
+        if overflow > 0:
+            thumb_width = max(1, thumb_width - overflow)
 
-        # Thumb 维持 16:9,但高度不超过 h
-        thumb_h_by_ratio = int(thumb_w * 9 / 16)
-        thumb_h = min(thumb_h_by_ratio, h)
-        # 如果按 16:9 算出来高度不够 h,thumb 在垂直方向居中
-        thumb_y_offset = (h - thumb_h) // 2
+        group_width = poster_width + self.SPACING + thumb_width
+        group_height = image_height + label_gap + self.RESOLUTION_LABEL_HEIGHT
+        origin_x = max(0, (width - group_width) // 2)
+        origin_y = max(0, (height - group_height) // 2)
+        thumb_x = origin_x + poster_width + self.SPACING
+        resolution_y = origin_y + image_height + label_gap
 
-        # 实际宽度可能因为高度限制需要回缩(维持 16:9)
-        if thumb_h_by_ratio > h:
-            thumb_w = int(h * 16 / 9)
-
-        # 设置几何
-        self.poster_label.setGeometry(0, 0, poster_w, poster_h)
+        self.poster_label.setGeometry(
+            origin_x, origin_y, poster_width, image_height
+        )
         self.poster_resolution_label.setGeometry(
-            0, poster_h + 2, poster_w, self.RESOLUTION_LABEL_HEIGHT
+            origin_x, resolution_y, poster_width, self.RESOLUTION_LABEL_HEIGHT
         )
 
-        thumb_x = poster_w + self.SPACING
-        self.thumb_label.setGeometry(thumb_x, thumb_y_offset, thumb_w, thumb_h)
+        self.thumb_label.setGeometry(
+            thumb_x, origin_y, thumb_width, image_height
+        )
         self.thumb_resolution_label.setGeometry(
-            thumb_x, h + 2, thumb_w, self.RESOLUTION_LABEL_HEIGHT
+            thumb_x, resolution_y, thumb_width, self.RESOLUTION_LABEL_HEIGHT
         )
 
 
@@ -408,7 +406,7 @@ class NFOEditorQt(QMainWindow):
         self.current_target_path = None
         self.fields_entries = {}
 
-        self.setWindowTitle("大锤 NFO Editor v9.8.0")
+        self.setWindowTitle("大锤 NFO Editor v9.8.2")
         self.resize(1400, 900)
         self.setMinimumSize(1000, 650)
 
@@ -765,9 +763,8 @@ class NFOEditorQt(QMainWindow):
 
         布局:[60px "封面:" 标签] + [自适应比例的 Poster + Thumb 容器]
 
-        Poster 维持 2:3(width:height),Thumb 维持 16:9。
-        当图片区高度变化时,Poster 跟随高度(宽度=高度*2/3),
-        Thumb 高度不超过 Poster 高度,自适应剩余宽度。
+        Poster 宽度优先按 2:3 计算，Thumb 使用剩余宽度。
+        两个图片显示框始终等高、顶部和底部对齐，图片内容保持原比例。
         """
         BodyLabel = self._fw["BodyLabel"]
         CaptionLabel = self._fw["CaptionLabel"]

@@ -11,17 +11,24 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QSize, Qt, QThread, Signal
 from PySide6.QtGui import QIcon
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from dataclasses import dataclass
-from nfo_utils import parse_xml_file, preferred_nfo_file, same_path, write_xml_root_atomic
+from nfo_utils import (
+    normalize_catalog_number,
+    parse_xml_file,
+    preferred_nfo_from_names,
+    read_series_text,
+    same_path,
+    write_xml_root_atomic,
+)
 
 # 配置常量
 class Config:
     DEFAULT_FOLDER_FORMAT = "filename smart_actor"
     SUPPORTED_NFO_EXTENSIONS = ['.nfo']
     INVALID_FILENAME_CHARS = r'[\\/:*?"<>|]'
-    APP_VERSION = "v9.7.6"
+    APP_VERSION = "v9.8.1"
     WINDOW_MIN_SIZE = (900, 900)
     # 日志配置
     LOG_FOLDER = "log"
@@ -211,7 +218,7 @@ class LogManager:
             self.logger.info("批量改名工具日志结束")
             self.logger.info("="*60)
             
-            for handler in self.logger.handlers:
+            for handler in list(self.logger.handlers):
                 handler.close()
                 self.logger.removeHandler(handler)
 
@@ -323,485 +330,372 @@ class ActorMappingLoader(BaseMappingLoader):
         return mapping
 
 class SeriesMappingLoader(BaseMappingLoader):
-    """系列映射加载器"""
-    
+    """Load series mappings with catalog-number normalization and conflict checks."""
+
     def __init__(self):
         super().__init__("series_mapping.xml", "系列")
-    
+
     def _parse_mapping_file(self, mapping_file: str) -> Dict[str, str]:
-        """解析系列映射文件"""
-        mapping = {}
+        mapping: Dict[str, str] = {}
+        conflicts: List[str] = []
         context = ET.iterparse(mapping_file, events=("start",))
-        for event, elem in context:
+        for _event, elem in context:
             if elem.tag == "map":
-                code = elem.get("code")
-                series = elem.get("series")
-                if code and series:
-                    mapping[code.strip()] = series.strip()
+                raw_code = (elem.get("code") or "").strip()
+                series = (elem.get("series") or "").strip()
+                key = normalize_catalog_number(raw_code)
+                if key and series:
+                    existing = mapping.get(key)
+                    if existing and existing != series:
+                        conflicts.append(
+                            f"{raw_code}: {existing} / {series}"
+                        )
+                    else:
+                        mapping[key] = series
             elem.clear()
+        if conflicts:
+            preview = "；".join(conflicts[:8])
+            more = f"，另有 {len(conflicts) - 8} 项" if len(conflicts) > 8 else ""
+            raise ValueError(f"系列映射存在番号冲突：{preview}{more}")
         return mapping
 
+
 class NFOParser:
-    """NFO文件解析器"""
-    
-    # 字段映射配置
+    """Parse NFO fields from a file or an already parsed XML root."""
+
     FIELD_MAPPINGS = {
-        'title': ['.//title'],
-        'number': ['.//num', './/id', './/number'],
-        'director': ['.//director'],
-        'series': ['.//series', './/set'],
-        'studio': ['.//studio'],
-        'publisher': ['.//publisher'],
-        'year': ['.//year'],
-        'runtime': ['.//runtime'],
-        'rating': ['.//rating'],
-        'mosaic': ['.//mosaic'],
-        'definition': ['.//definition', './/resolution'],
+        "title": ["title"],
+        "number": ["num", "id", "number"],
+        "director": ["director"],
+        "studio": ["studio"],
+        "publisher": ["publisher"],
+        "year": ["year"],
+        "runtime": ["runtime"],
+        "rating": ["rating"],
+        "mosaic": ["mosaic"],
+        "definition": ["definition", "resolution"],
     }
-    
+
     def __init__(self, actor_mapping: Optional[Dict[str, str]] = None):
         self.actor_mapping = actor_mapping or {}
-    
+
     def parse_nfo_file(self, nfo_path: str) -> NFOFields:
-        """解析NFO文件并返回字段对象"""
         try:
             tree = parse_xml_file(nfo_path)
-            root = tree.getroot()
-            fields = NFOFields()
-            
-            # 设置文件名
-            fields.filename = Path(nfo_path).stem
-            
-            # 解析基本字段
-            for field_name, xpath_list in self.FIELD_MAPPINGS.items():
-                setattr(fields, field_name, self._find_first_valid_text(root, xpath_list))
-            
-            # 处理特殊字段
-            self._process_special_fields(fields)
-            
-            # 解析演员信息
-            self._parse_actors(root, fields)
-            
-            return fields
-            
-        except Exception as e:
-            raise Exception(f"解析NFO文件失败 {nfo_path}: {e}")
-    
-    def _process_special_fields(self, fields: NFOFields):
-        """处理特殊字段"""
-        # 处理评分
+            return self.parse_root(tree.getroot(), nfo_path)
+        except Exception as exc:
+            raise Exception(f"解析NFO文件失败 {nfo_path}: {exc}") from exc
+
+    def parse_root(self, root: ET.Element, nfo_path: str) -> NFOFields:
+        fields = NFOFields()
+        fields.filename = Path(nfo_path).stem
+        for field_name, xpath_list in self.FIELD_MAPPINGS.items():
+            setattr(
+                fields,
+                field_name,
+                XMLUtils.find_first_valid_text(root, xpath_list),
+            )
+        fields.series = read_series_text(root)
+        self._process_special_fields(fields)
+        self._parse_actors(root, fields)
+        return fields
+
+    @staticmethod
+    def _process_special_fields(fields: NFOFields):
         if fields.rating:
             try:
-                rating_value = float(fields.rating)
-                fields.rating = f"{rating_value:.1f}"
+                fields.rating = f"{float(fields.rating):.1f}"
             except ValueError:
                 fields.rating = ""
-        
-        # 处理4K标识
-        fields.four_k = "4K" if any(keyword in fields.definition.lower() 
-                                  for keyword in ['4k', '2160']) else ""
-    
+        fields.four_k = "4K" if any(
+            keyword in fields.definition.casefold() for keyword in ("4k", "2160")
+        ) else ""
+
     def _parse_actors(self, root: ET.Element, fields: NFOFields):
-        """解析演员信息"""
-        actors = []
-        
-        for actor in root.findall(".//actor"):
+        actors: List[str] = []
+        for actor in root.findall("actor"):
             name_element = actor.find("name")
             if name_element is not None and name_element.text:
                 original_name = name_element.text.strip()
-                # 应用映射关系
-                mapped_name = self.actor_mapping.get(original_name, original_name)
-                actors.append(mapped_name)
-        
-        if actors:
-            fields.actor = ",".join(actors)
-            fields.smart_actor = self._generate_smart_actor(actors)
-    
-    def _generate_smart_actor(self, actors: List[str]) -> str:
-        """生成智能演员显示"""
-        count = len(actors)
-        if count == 0:
-            return ""
-        elif count == 1:
-            return actors[0]
-        elif count == 2:
-            return f"{actors[0]},{actors[1]}"
-        elif count == 3:
-            return f"{actors[0]},{actors[1]},{actors[2]}"
-        else:  # 3个以上
-            return f"{actors[0]},{actors[1]},{actors[2]}等演员"
-    
-    def _find_first_valid_text(self, root: ET.Element, xpath_list: List[str]) -> str:
-        """使用公共工具方法"""
-        return XMLUtils.find_first_valid_text(root, xpath_list)
+                actors.append(self.actor_mapping.get(original_name, original_name))
+        fields.actor = ",".join(actors)
+        fields.smart_actor = self._generate_smart_actor(actors)
+
+    @staticmethod
+    def _generate_smart_actor(actors: List[str]) -> str:
+        if len(actors) <= 3:
+            return ",".join(actors)
+        return f"{','.join(actors[:3])}等演员"
+
 
 class NFOModifier:
-    """NFO文件修改器"""
-    
-    def __init__(self, actor_mapping: Dict[str, str], series_mapping: Optional[Dict[str, str]] = None):
-        self.actor_mapping = actor_mapping
-        self.series_mapping = series_mapping or {}
-        
-        # 简化的位置参考 - 定义关键的参考标签
-        self.position_references = {
-            'series': ['studio', 'maker', 'publisher', 'label', 'tag', 'genre'],  # series在studio前
-            'set': ['studio', 'maker', 'publisher', 'label', 'tag', 'genre'],     # set紧跟series
-            'tag': ['genre', 'poster', 'cover'],                                   # tag在genre前
-            'genre': ['poster', 'cover', 'trailer']                               # genre在poster前
+    """Apply selected actor/series changes to an already parsed XML root."""
+
+    SERIES_PREFIX = re.compile(r"^\s*系列\s*[:：]", re.IGNORECASE)
+
+    def __init__(
+        self,
+        actor_mapping: Dict[str, str],
+        series_mapping: Optional[Dict[str, str]] = None,
+    ):
+        self.actor_mapping = actor_mapping or {}
+        self.series_mapping = {
+            normalize_catalog_number(code): value
+            for code, value in (series_mapping or {}).items()
+            if normalize_catalog_number(code) and value
         }
-    
-    def modify_nfo_file(self, nfo_path: str) -> Tuple[bool, List[str], Dict[str, int], Dict[str, any]]:
-        """修改NFO文件中的演员名称和系列信息"""
-        try:
-            tree = parse_xml_file(nfo_path)
-            root = tree.getroot()
-            
-            stats = {'actor': 0, 'tag': 0, 'genre': 0, 'series': 0, 'set': 0}
-            detailed_logs = {}
-            modified = False
-            all_actors = []
-            
-            # 记录NFO文件路径
-            detailed_logs['file_path'] = nfo_path
-            
-            # 1. 处理演员相关元素
-            for element_type, xpath in [('actor', './/actor'), ('tag', './/tag'), ('genre', './/genre')]:
-                elem_modified, actors, count, changes = self._modify_elements_with_log(root, xpath, element_type == 'actor')
-                if elem_modified:
+        self.position_references = {
+            "series": ["studio", "maker", "publisher", "label", "tag", "genre"],
+            "set": ["studio", "maker", "publisher", "label", "tag", "genre"],
+            "tag": ["genre", "poster", "cover"],
+            "genre": ["poster", "cover", "trailer"],
+        }
+
+    def modify_nfo_file(
+        self,
+        nfo_path: str,
+        *,
+        modify_actors: bool = True,
+        modify_series: bool = True,
+        normalize_structure: bool = False,
+    ) -> Tuple[bool, List[str], Dict[str, int], Dict[str, Any]]:
+        tree = parse_xml_file(nfo_path)
+        modified, actors, stats, logs = self.modify_root(
+            tree.getroot(),
+            modify_actors=modify_actors,
+            modify_series=modify_series,
+            normalize_structure=normalize_structure,
+        )
+        if modified:
+            write_xml_root_atomic(tree.getroot(), nfo_path)
+        return modified, actors, stats, logs
+
+    def modify_root(
+        self,
+        root: ET.Element,
+        *,
+        modify_actors: bool,
+        modify_series: bool,
+        normalize_structure: bool = False,
+    ) -> Tuple[bool, List[str], Dict[str, int], Dict[str, Any]]:
+        stats = {"actor": 0, "tag": 0, "genre": 0, "series": 0, "set": 0}
+        logs: Dict[str, Any] = {}
+        modified = False
+        actors: List[str] = []
+
+        if modify_actors and self.actor_mapping:
+            for element_type, tag_name in (
+                ("actor", "actor"), ("tag", "tag"), ("genre", "genre")
+            ):
+                changed, found_actors, count, changes = self._modify_elements_with_log(
+                    root, tag_name, element_type == "actor"
+                )
+                actors.extend(found_actors)
+                if changed:
                     modified = True
-                    if element_type == 'actor':
-                        all_actors.extend(actors)
-                        stats['actor'] = len([a for a in actors if a])
-                        detailed_logs['actor_changes'] = changes
-                    else:
-                        stats[element_type] = count
-                        detailed_logs[f'{element_type}_changes'] = changes
-            
-            # 2. 处理系列信息
-            if self.series_mapping:
-                series_modified, series_stats, series_logs = self._modify_series_with_log(root)
-                if series_modified:
-                    modified = True
-                    stats.update(series_stats)
-                    detailed_logs.update(series_logs)
-            
-            # 3. 规范化NFO结构
-            structure_modified, structure_logs = self._normalize_nfo_structure_with_log(root)
-            if structure_modified:
+                    stats[element_type] += count
+                    logs[f"{element_type}_changes"] = changes
+
+        if modify_series and self.series_mapping:
+            changed, series_stats, series_logs = self._modify_series_with_log(root)
+            if changed:
                 modified = True
-                detailed_logs['structure_changes'] = structure_logs
-            
-            if modified:
-                write_xml_root_atomic(root, nfo_path)
-            
-            return modified, all_actors, stats, detailed_logs
-            
-        except Exception as e:
-            raise Exception(f"修改NFO文件失败 {nfo_path}: {e}")
-    
-    def _modify_elements_with_log(self, root: ET.Element, xpath: str, is_actor: bool) -> Tuple[bool, List[str], int, List[str]]:
-        """修改元素并记录详细变化"""
-        modified, actors, count = False, [], 0
-        changes = []
-        
-        for element in root.findall(xpath):
+                for key, count in series_stats.items():
+                    stats[key] = stats.get(key, 0) + count
+                logs.update(series_logs)
+
+        if normalize_structure:
+            structure_changed, structure_logs = self._normalize_nfo_structure_with_log(root)
+            if structure_changed:
+                modified = True
+                logs["structure_changes"] = structure_logs
+
+        return modified, actors, stats, logs
+
+    def _modify_elements_with_log(
+        self, root: ET.Element, tag_name: str, is_actor: bool
+    ) -> Tuple[bool, List[str], int, List[str]]:
+        modified = False
+        actors: List[str] = []
+        count = 0
+        changes: List[str] = []
+        for element in root.findall(tag_name):
             if is_actor:
                 name_element = element.find("name")
-                if name_element is not None and name_element.text:
-                    original_name = name_element.text.strip()
-                    mapped_name = self.actor_mapping.get(original_name, original_name)
-                    
-                    if mapped_name != original_name:
-                        name_element.text = mapped_name
-                        modified = True
-                        changes.append(f"{original_name} → {mapped_name}")
-                    
-                    actors.append(mapped_name)
-            else:
-                if element.text and element.text.strip() in self.actor_mapping:
-                    original_text = element.text.strip()
-                    mapped_name = self.actor_mapping[original_text]
-                    if mapped_name != original_text:
-                        element.text = mapped_name
-                        modified = True
-                        count += 1
-                        changes.append(f"{original_text} → {mapped_name}")
-        
+                if name_element is None or not name_element.text:
+                    continue
+                original = name_element.text.strip()
+                mapped = self.actor_mapping.get(original, original)
+                actors.append(mapped)
+                if mapped != original:
+                    name_element.text = mapped
+                    modified = True
+                    count += 1
+                    changes.append(f"{original} → {mapped}")
+            elif element.text:
+                original = element.text.strip()
+                mapped = self.actor_mapping.get(original, original)
+                if mapped != original:
+                    element.text = mapped
+                    modified = True
+                    count += 1
+                    changes.append(f"{original} → {mapped}")
         return modified, actors, count, changes
-    
-    def _modify_series_with_log(self, root: ET.Element) -> Tuple[bool, Dict[str, int], Dict[str, str]]:
-        """修改系列信息"""
-        stats = {'series': 0, 'set': 0, 'tag': 0, 'genre': 0}
-        logs = {}
+
+    def _modify_series_with_log(
+        self, root: ET.Element
+    ) -> Tuple[bool, Dict[str, int], Dict[str, str]]:
+        stats = {"series": 0, "set": 0, "tag": 0, "genre": 0}
+        logs: Dict[str, str] = {}
+        number = XMLUtils.find_first_valid_text(root, ["num", "id", "number"])
+        expected = self.series_mapping.get(normalize_catalog_number(number))
+        if not expected:
+            return False, stats, logs
+
+        operations = (
+            ("series", self._update_series_field_with_log),
+            ("set", self._update_set_field_with_log),
+            ("tag", lambda r, value: self._update_series_text_nodes(r, "tag", value)),
+            ("genre", lambda r, value: self._update_series_text_nodes(r, "genre", value)),
+        )
         modified = False
-        
-        # 获取番号
-        number = self._find_first_valid_text(root, ['.//num', './/id', './/number'])
-        if not number:
-            return False, stats, logs
-        
-        # 查找对应的系列
-        expected_series = self.series_mapping.get(number.strip())
-        if not expected_series:
-            return False, stats, logs
-        
-        # 1. 修复 series 字段
-        series_change = self._update_series_field_with_log(root, expected_series)
-        if series_change:
-            modified = True
-            stats['series'] = 1
-            logs['series_change'] = series_change
-        
-        # 2. 修复 set 字段
-        set_change = self._update_set_field_with_log(root, expected_series)
-        if set_change:
-            modified = True
-            stats['set'] = 1
-            logs['set_change'] = set_change
-        
-        # 3. 联动更新 tag 字段
-        tag_change = self._update_series_in_tags_with_log(root, expected_series)
-        if tag_change:
-            modified = True
-            stats['tag'] = 1
-            logs['tag_change'] = tag_change
-        
-        # 4. 联动更新 genre 字段
-        genre_change = self._update_series_in_genres_with_log(root, expected_series)
-        if genre_change:
-            modified = True
-            stats['genre'] = 1
-            logs['genre_change'] = genre_change
-        
+        for key, func in operations:
+            change = func(root, expected)
+            if change:
+                modified = True
+                stats[key] += 1
+                logs[f"{key}_change"] = change
         return modified, stats, logs
-    
-    def _update_series_field_with_log(self, root: ET.Element, expected_series: str) -> Optional[str]:
-        """更新 series 字段"""
-        series_element = root.find('.//series')
-        
-        if series_element is None:
-            # 创建新的 series 元素
-            series_element = ET.Element('series')
-            series_element.text = expected_series
-            
-            # 简单策略：在studio前插入
+
+    def _update_series_field_with_log(
+        self, root: ET.Element, expected: str
+    ) -> Optional[str]:
+        element = root.find("series")
+        if element is None:
+            element = ET.Element("series")
+            element.text = expected
             positioned = XMLUtils.insert_element_before_reference(
-                root, series_element, self.position_references['series']
+                root, element, self.position_references["series"]
             )
-            
-            position_info = "studio前" if positioned else "末尾"
-            return f"空 → {expected_series} ({position_info})"
-        else:
-            # 更新现有 series 元素
-            current_series = series_element.text or ""
-            if current_series.strip() != expected_series:
-                old_value = current_series.strip() or "空"
-                series_element.text = expected_series
-                return f"{old_value} → {expected_series}"
-        
+            return f"空 → {expected} ({'参考节点前' if positioned else '末尾'})"
+        old = (element.text or "").strip()
+        if old != expected:
+            element.text = expected
+            return f"{old or '空'} → {expected}"
         return None
-    
-    def _update_set_field_with_log(self, root: ET.Element, expected_series: str) -> Optional[str]:
-        """更新 set 字段"""
-        set_element = root.find('.//set')
-        
-        if set_element is None:
-            # 创建规范的 set 元素结构
-            set_element = ET.Element('set')
-            name_element = ET.SubElement(set_element, 'name')
-            name_element.text = expected_series
-            
-            # 简单策略：在studio前插入（紧跟series）
+
+    def _update_set_field_with_log(
+        self, root: ET.Element, expected: str
+    ) -> Optional[str]:
+        element = root.find("set")
+        if element is None:
+            element = ET.Element("set")
+            ET.SubElement(element, "name").text = expected
             positioned = XMLUtils.insert_element_before_reference(
-                root, set_element, self.position_references['set']
+                root, element, self.position_references["set"]
             )
-            
-            position_info = "series后" if positioned else "末尾"
-            return f"空 → {expected_series} ({position_info})"
-        else:
-            # 修复现有 set 元素结构
-            name_element = set_element.find('name')
-            
-            if name_element is None:
-                # 转换为规范结构
-                old_text = set_element.text or "空"
-                set_element.text = None
-                name_element = ET.SubElement(set_element, 'name')
-                name_element.text = expected_series
-                return f"{old_text} → {expected_series} (结构修复)"
-            else:
-                # 更新现有 name 元素
-                current_name = name_element.text or ""
-                if current_name.strip() != expected_series:
-                    old_value = current_name.strip() or "空"
-                    name_element.text = expected_series
-                    return f"{old_value} → {expected_series}"
-        
+            return f"空 → {expected} ({'参考节点前' if positioned else '末尾'})"
+
+        name = element.find("name")
+        legacy = (element.text or "").strip()
+        if name is None:
+            element.text = None
+            name = ET.SubElement(element, "name")
+            name.text = expected
+            return f"{legacy or '空'} → {expected} (结构修复)"
+        old = (name.text or "").strip()
+        if old != expected or legacy:
+            element.text = None
+            name.text = expected
+            return f"{old or legacy or '空'} → {expected}"
         return None
-    
-    def _update_series_in_tags_with_log(self, root: ET.Element, expected_series: str) -> Optional[str]:
-        """联动更新 tag 字段"""
-        series_tag = f"系列: {expected_series}"
-        
-        # 查找现有的系列标签
-        for tag in root.findall('.//tag'):
-            if tag.text and tag.text.startswith('系列:'):
-                if tag.text.strip() != series_tag:
-                    old_value = tag.text.strip()
-                    tag.text = series_tag
-                    return f"{old_value} → {series_tag}"
-                return None
-        
-        # 没有系列标签，创建新的
-        new_tag = ET.Element('tag')
-        new_tag.text = series_tag
-        
-        # 简单策略：在genre前插入
-        positioned = XMLUtils.insert_element_before_reference(
-            root, new_tag, self.position_references['tag']
-        )
-        
-        position_info = "genre前" if positioned else "末尾"
-        return f"空 → {series_tag} ({position_info})"
-    
-    def _update_series_in_genres_with_log(self, root: ET.Element, expected_series: str) -> Optional[str]:
-        """联动更新 genre 字段"""
-        series_genre = f"系列: {expected_series}"
-        
-        # 查找现有的系列类型
-        for genre in root.findall('.//genre'):
-            if genre.text and genre.text.startswith('系列:'):
-                if genre.text.strip() != series_genre:
-                    old_value = genre.text.strip()
-                    genre.text = series_genre
-                    return f"{old_value} → {series_genre}"
-                return None
-        
-        # 没有系列类型，创建新的
-        new_genre = ET.Element('genre')
-        new_genre.text = series_genre
-        
-        # 简单策略：在poster前插入
-        positioned = XMLUtils.insert_element_before_reference(
-            root, new_genre, self.position_references['genre']
-        )
-        
-        position_info = "poster前" if positioned else "末尾"
-        return f"空 → {series_genre} ({position_info})"
-    
-    def _normalize_nfo_structure_with_log(self, root: ET.Element) -> Tuple[bool, List[str]]:
-        """规范化NFO文件结构"""
-        logs = []
-        modified = False
-        
-        # 1. 修复 actor 元素结构
-        actor_fixes = self._fix_actor_elements_with_log(root)
-        if actor_fixes:
-            modified = True
-            logs.extend(actor_fixes)
-        
-        # 2. 修复 set 元素结构
-        set_fixes = self._fix_set_elements_with_log(root)
-        if set_fixes:
-            modified = True
-            logs.extend(set_fixes)
-        
-        # 3. 简单重排序 - 只移动明显错位的元素
-        reorder_result = self._simple_reorder_with_log(root)
-        if reorder_result:
-            modified = True
-            logs.append(reorder_result)
-        
-        return modified, logs
-    
-    def _fix_actor_elements_with_log(self, root: ET.Element) -> List[str]:
-        """修复 actor 元素结构"""
-        logs = []
-        fixed_count = 0
-        
-        for actor in root.findall('.//actor'):
-            actor_fixed = False
-            
-            # 修复 name 子元素
-            name_element = actor.find('name')
-            if name_element is None and actor.text:
-                name_element = ET.SubElement(actor, 'name')
-                name_element.text = actor.text.strip()
+
+    def _update_series_text_nodes(
+        self, root: ET.Element, tag_name: str, expected: str
+    ) -> Optional[str]:
+        target = f"系列: {expected}"
+        matches = [
+            elem for elem in root.findall(tag_name)
+            if elem.text and self.SERIES_PREFIX.match(elem.text)
+        ]
+        if not matches:
+            element = ET.Element(tag_name)
+            element.text = target
+            positioned = XMLUtils.insert_element_before_reference(
+                root, element, self.position_references[tag_name]
+            )
+            return f"空 → {target} ({'参考节点前' if positioned else '末尾'})"
+
+        old_values = [(elem.text or "").strip() for elem in matches]
+        matches[0].text = target
+        for duplicate in matches[1:]:
+            root.remove(duplicate)
+        if old_values != [target]:
+            suffix = f"，移除重复 {len(matches) - 1} 个" if len(matches) > 1 else ""
+            return f"{' | '.join(old_values)} → {target}{suffix}"
+        return None
+
+    def _normalize_nfo_structure_with_log(
+        self, root: ET.Element
+    ) -> Tuple[bool, List[str]]:
+        logs: List[str] = []
+        logs.extend(self._fix_actor_elements_with_log(root))
+        logs.extend(self._fix_set_elements_with_log(root))
+        reorder = self._simple_reorder_with_log(root)
+        if reorder:
+            logs.append(reorder)
+        return bool(logs), logs
+
+    @staticmethod
+    def _fix_actor_elements_with_log(root: ET.Element) -> List[str]:
+        fixed = 0
+        for actor in root.findall("actor"):
+            name = actor.find("name")
+            if name is None and actor.text and actor.text.strip():
+                name = ET.SubElement(actor, "name")
+                name.text = actor.text.strip()
                 actor.text = None
-                actor_fixed = True
-            
-            # 确保有 type 子元素
-            type_element = actor.find('type')
-            if type_element is None:
-                type_element = ET.SubElement(actor, 'type')
-                type_element.text = 'Actor'
-                actor_fixed = True
-            
-            if actor_fixed:
-                fixed_count += 1
-        
-        if fixed_count > 0:
-            logs.append(f"修复actor元素结构: {fixed_count}个")
-        
-        return logs
-    
-    def _fix_set_elements_with_log(self, root: ET.Element) -> List[str]:
-        """修复 set 元素结构"""
-        logs = []
-        fixed_count = 0
-        
-        for set_elem in root.findall('.//set'):
-            name_element = set_elem.find('name')
-            if name_element is None and set_elem.text:
-                original_text = set_elem.text.strip()
-                set_elem.text = None
-                name_element = ET.SubElement(set_elem, 'name')
-                name_element.text = original_text
-                fixed_count += 1
-        
-        if fixed_count > 0:
-            logs.append(f"修复set元素结构: {fixed_count}个")
-        
-        return logs
-    
-    def _simple_reorder_with_log(self, root: ET.Element) -> Optional[str]:
-        """简单重排序 - 只处理明显错位的关键元素"""
-        moved_count = 0
-        
-        # 确保series在studio前
-        series_elements = root.findall('.//series')
-        studio_elements = root.findall('.//studio')
-        
-        if series_elements and studio_elements:
-            series_pos = list(root).index(series_elements[0])
-            studio_pos = list(root).index(studio_elements[0])
-            
+                fixed += 1
+        return [f"修复actor元素结构: {fixed}个"] if fixed else []
+
+    @staticmethod
+    def _fix_set_elements_with_log(root: ET.Element) -> List[str]:
+        fixed = 0
+        for element in root.findall("set"):
+            if element.find("name") is None and element.text and element.text.strip():
+                text = element.text.strip()
+                element.text = None
+                ET.SubElement(element, "name").text = text
+                fixed += 1
+        return [f"修复set元素结构: {fixed}个"] if fixed else []
+
+    @staticmethod
+    def _simple_reorder_with_log(root: ET.Element) -> Optional[str]:
+        moved = 0
+        series = root.find("series")
+        studio = root.find("studio")
+        if series is not None and studio is not None:
+            children = list(root)
+            series_pos = children.index(series)
+            studio_pos = children.index(studio)
             if series_pos > studio_pos:
-                # series在studio后面，需要移动
-                root.remove(series_elements[0])
-                root.insert(studio_pos, series_elements[0])
-                moved_count += 1
-        
-        # 确保set在series后
-        set_elements = root.findall('.//set')
-        if series_elements and set_elements:
-            series_pos = list(root).index(series_elements[0])
-            set_pos = list(root).index(set_elements[0])
-            
-            if set_pos < series_pos:
-                # set在series前面，需要移动
-                root.remove(set_elements[0])
-                root.insert(series_pos + 1, set_elements[0])
-                moved_count += 1
-        
-        if moved_count > 0:
-            return f"关键元素重排序: {moved_count}个"
-        
-        return None
-    
-    def _find_first_valid_text(self, root: ET.Element, xpath_list: List[str]) -> str:
-        """使用公共工具方法"""
-        return XMLUtils.find_first_valid_text(root, xpath_list)
+                root.remove(series)
+                root.insert(studio_pos, series)
+                moved += 1
+
+        set_elem = root.find("set")
+        series = root.find("series")
+        if set_elem is not None and series is not None:
+            children = list(root)
+            series_pos = children.index(series)
+            set_pos = children.index(set_elem)
+            if set_pos != series_pos + 1:
+                root.remove(set_elem)
+                children = list(root)
+                root.insert(children.index(series) + 1, set_elem)
+                moved += 1
+        return f"关键元素重排序: {moved}个" if moved else None
+
 
 class FolderRenamer:
     """文件夹重命名器"""
@@ -859,219 +753,191 @@ class FolderRenamer:
         return re.sub(Config.INVALID_FILENAME_CHARS, "_", filename)
 
 class RenameWorker(QThread):
-    """重命名工作线程"""    
+    """Batch worker: one XML parse and at most one XML write per NFO."""
+
     progressUpdated = Signal(int, int)
     logUpdated = Signal(str)
-    completed = Signal()
+    completed = Signal(dict)
     error = Signal(str)
+    nfoChanged = Signal(str)
+    folderRenamed = Signal(str, str)
 
-    def __init__(self, directory: str, actor_mapping: Dict[str, str], 
-                 rename_folders: bool, folder_format: str = "",
-                 series_mapping: Optional[Dict[str, str]] = None):
+    def __init__(
+        self,
+        directory: str,
+        actor_mapping: Dict[str, str],
+        rename_folders: bool,
+        folder_format: str = "",
+        series_mapping: Optional[Dict[str, str]] = None,
+        *,
+        modify_actors: bool = True,
+        modify_series: bool = True,
+    ):
         super().__init__()
-        self.directory = directory
-        self.actor_mapping = actor_mapping
+        self.directory = os.path.normpath(directory)
+        self.actor_mapping = actor_mapping or {}
         self.series_mapping = series_mapping or {}
         self.rename_folders = rename_folders
-        
-        # 初始化组件
-        self.nfo_parser = NFOParser(actor_mapping)
-        self.nfo_modifier = NFOModifier(actor_mapping, series_mapping)
+        self.modify_actors = bool(modify_actors and self.actor_mapping)
+        self.modify_series = bool(modify_series and self.series_mapping)
+        self.nfo_parser = NFOParser(self.actor_mapping if self.modify_actors else {})
+        self.nfo_modifier = NFOModifier(self.actor_mapping, self.series_mapping)
         self.folder_renamer = FolderRenamer(folder_format)
-        
-        # 初始化日志管理器
         self.log_manager = LogManager()
+        self.result = {
+            "total": 0,
+            "processed": 0,
+            "nfo_modified": 0,
+            "renamed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "canceled": False,
+        }
 
     def run(self):
         try:
             self.log_manager.log_info(f"开始处理目录: {self.directory}")
-            self.log_manager.log_info(f"演员映射数量: {len(self.actor_mapping)}")
-            self.log_manager.log_info(f"系列映射数量: {len(self.series_mapping)}")
+            self.log_manager.log_info(f"修改演员: {'是' if self.modify_actors else '否'}")
+            self.log_manager.log_info(f"修改系列: {'是' if self.modify_series else '否'}")
             self.log_manager.log_info(f"重命名文件夹: {'是' if self.rename_folders else '否'}")
-            
             self._process_directory()
-
-            if self.isInterruptionRequested():
+            self.result["canceled"] = self.isInterruptionRequested()
+            if self.result["canceled"]:
                 self.log_manager.log_info("任务已取消")
-                self.log_manager.close()
-                return
-
-            self.log_manager.log_info("所有处理完成")
+            else:
+                self.log_manager.log_info("批量任务处理完成")
+            self.completed.emit(dict(self.result))
+        except Exception as exc:
+            self.log_manager.log_error(f"处理过程出错: {exc}")
+            self.error.emit(str(exc))
+        finally:
             self.log_manager.close()
-            self.completed.emit()
-        except Exception as e:
-            self.log_manager.log_error(f"处理过程出错: {e}")
-            self.log_manager.close()
-            self.error.emit(str(e))
 
     def _process_directory(self):
-        """处理目录"""
-        folders_to_process = self._collect_folders_with_nfo()
-        total_folders = len(folders_to_process)
-        
-        log_msg = f"找到 {total_folders} 个包含NFO文件的文件夹"
-        self.log_manager.log_info(log_msg)
-        
-        if total_folders == 0:
-            no_folder_msg = "没有找到需要处理的文件夹"
-            self.log_manager.log_info(no_folder_msg)
-            return
-        
-        for i, (folder_path, nfo_path) in enumerate(folders_to_process, 1):
+        folders = self._collect_folders_with_nfo()
+        total = len(folders)
+        self.result["total"] = total
+        self.log_manager.log_info(f"找到 {total} 个包含NFO文件的文件夹")
+        for current, (folder_path, nfo_path) in enumerate(folders, 1):
             if self.isInterruptionRequested():
-                self.log_manager.log_info("用户请求停止，已结束后续处理")
                 break
             try:
-                self._process_single_folder(folder_path, nfo_path, i, total_folders)
-            except Exception as e:
-                error_msg = f"处理文件夹 {folder_path} 时出错: {e}"
-                self.log_manager.log_error(error_msg)
+                outcome = self._process_single_folder(folder_path, nfo_path)
+                self.result["processed"] += 1
+                self.result["nfo_modified"] += int(outcome["nfo_modified"])
+                self.result["renamed"] += int(outcome["renamed"])
+                self.result["skipped"] += int(outcome["skipped"])
+            except Exception as exc:
+                self.result["failed"] += 1
+                message = f"处理文件夹 {folder_path} 时出错: {exc}"
+                self.log_manager.log_error(message)
+                self.logUpdated.emit(message)
+            finally:
+                self.progressUpdated.emit(current, total)
 
     def _collect_folders_with_nfo(self) -> List[Tuple[str, str]]:
-        """收集包含 NFO 的目录；包含所选根目录，并按最深层优先处理。"""
-        folders_with_nfo = []
-        for root, dirs, _ in os.walk(self.directory):
+        folders: List[Tuple[str, str]] = []
+        for root, dirs, files in os.walk(self.directory):
             if self.isInterruptionRequested():
                 break
-            dirs.sort(key=str.lower)
-            nfo_path = self._find_nfo_file(root)
+            dirs.sort(key=str.casefold)
+            nfo_path = preferred_nfo_from_names(root, files, Path(root).name)
             if nfo_path:
-                folders_with_nfo.append((root, nfo_path))
-
-        folders_with_nfo.sort(
-            key=lambda item: (len(Path(item[0]).parts), item[0].lower()),
+                folders.append((root, nfo_path))
+        folders.sort(
+            key=lambda item: (len(Path(item[0]).parts), item[0].casefold()),
             reverse=True,
         )
-        return folders_with_nfo
-    
-    def _process_single_folder(self, folder_path: str, nfo_path: str, current: int, total: int):
-        """处理单个文件夹"""
+        return folders
+
+    def _process_single_folder(self, folder_path: str, nfo_path: str) -> Dict[str, bool]:
         folder_name = Path(folder_path).name
         nfo_name = Path(nfo_path).name
-        
-        # 详细日志：开始处理
-        start_msg = f"[{current}/{total}] 开始处理文件夹: {folder_name}"
-        self.log_manager.log_info(start_msg)
-        self.log_manager.log_info(f"NFO文件路径: {nfo_path}")
-        
-        # 解析NFO文件
-        try:
-            nfo_fields = self.nfo_parser.parse_nfo_file(nfo_path)
-            self.log_manager.log_info(f"成功解析NFO文件: {nfo_name}")
-        except Exception as e:
-            error_msg = f"解析NFO文件失败: {nfo_name} - {e}"
-            self.log_manager.log_error(error_msg)
-            return
-        
-        # 修改NFO文件信息
-        nfo_modified, modified_fields = self._modify_nfo_info_optimized(nfo_path, nfo_name)
-        
-        # NFO 映射可能改变 series/actor 等命名字段；重命名前重新解析最新内容。
-        if nfo_modified:
-            try:
-                nfo_fields = self.nfo_parser.parse_nfo_file(nfo_path)
-            except Exception as exc:
-                self.log_manager.log_error(f"修改后重新解析NFO失败: {nfo_name} - {exc}")
+        self.log_manager.log_info(f"开始处理: {folder_path}")
 
-        folder_renamed = False
+        tree = parse_xml_file(nfo_path)
+        root = tree.getroot()
+        fields = self.nfo_parser.parse_root(root, nfo_path)
+
+        nfo_modified = False
+        modified_fields: List[str] = []
+        if self.modify_actors or self.modify_series:
+            nfo_modified, _actors, stats, logs = self.nfo_modifier.modify_root(
+                root,
+                modify_actors=self.modify_actors,
+                modify_series=self.modify_series,
+                normalize_structure=False,
+            )
+            if nfo_modified:
+                write_xml_root_atomic(root, nfo_path)
+                fields = self.nfo_parser.parse_root(root, nfo_path)
+                modified_fields = self._log_modifications(nfo_name, stats, logs)
+
+        # NFO 已经成功落盘时立即上报。即使后续文件夹重命名失败，
+        # 主编辑器也不会漏掉这次内容变化；若重命名成功，路径重定向会接管旧路径。
+        if nfo_modified:
+            self.nfoChanged.emit(nfo_path)
+
+        renamed_path: Optional[str] = None
         if self.rename_folders:
             if same_path(folder_path, self.directory):
                 self.log_manager.log_info(f"跳过所选根目录重命名: {folder_path}")
             else:
-                folder_renamed = self._rename_folder_if_needed_optimized(
-                    folder_path, nfo_fields, folder_name
+                renamed_path = self._rename_folder_if_needed(
+                    folder_path, fields, folder_name
                 )
-        
-        # UI日志：只显示有变化的操作
-        if nfo_modified or folder_renamed:
-            ui_messages = []
-            if nfo_modified:
-                ui_messages.append(f"{', '.join(modified_fields)}字段已修改")
-            if folder_renamed:
-                ui_messages.append("文件夹已重命名")
-            
-            ui_msg = f"{nfo_name} - {', '.join(ui_messages)}"
-            self.logUpdated.emit(ui_msg)
-        
-        # 更新进度
-        self.progressUpdated.emit(current, total)
-    
-    def _modify_nfo_info_optimized(self, nfo_path: str, nfo_name: str) -> Tuple[bool, List[str]]:
-        """修改NFO文件信息"""
-        try:
-            modified, new_actors, stats, detailed_logs = self.nfo_modifier.modify_nfo_file(nfo_path)
-            
-            # 详细日志：记录所有信息
-            if 'structure_changes' in detailed_logs:
-                for change in detailed_logs['structure_changes']:
-                    self.log_manager.log_info(f"NFO规范化 - {change}")
-            
-            modified_fields = []
-            
-            if modified:
-                # 演员信息
-                if stats['actor'] > 0:
-                    modified_fields.append("演员")
-                    if 'actor_changes' in detailed_logs:
-                        for change in detailed_logs['actor_changes']:
-                            self.log_manager.log_success(f"演员字段修改: {change}")
-                
-                # 标签信息
-                if stats['tag'] > 0:
-                    modified_fields.append("标签")
-                    if 'tag_changes' in detailed_logs:
-                        for change in detailed_logs['tag_changes']:
-                            self.log_manager.log_success(f"标签字段修改: {change}")
-                
-                # 类型信息
-                if stats['genre'] > 0:
-                    modified_fields.append("类型")
-                    if 'genre_changes' in detailed_logs:
-                        for change in detailed_logs['genre_changes']:
-                            self.log_manager.log_success(f"类型字段修改: {change}")
-                
-                # 系列信息
-                if stats['series'] > 0:
-                    modified_fields.append("系列")
-                    if 'series_change' in detailed_logs:
-                        self.log_manager.log_success(f"系列字段修改: {detailed_logs['series_change']}")
-                    if 'set_change' in detailed_logs:
-                        self.log_manager.log_success(f"set字段修改: {detailed_logs['set_change']}")
-                
-                self.log_manager.log_success(f"NFO文件修改完成: {nfo_name}")
-            else:
-                self.log_manager.log_info(f"NFO文件无需修改: {nfo_name}")
-            
-            return modified, modified_fields
-            
-        except Exception as e:
-            error_msg = f"修改NFO文件失败: {nfo_name} - {e}"
-            self.log_manager.log_error(error_msg)
-            return False, []
-    
-    def _rename_folder_if_needed_optimized(self, folder_path: str, nfo_fields: NFOFields, folder_name: str) -> bool:
-        """根据需要重命名文件夹"""
-        try:
-            expected_name = self.folder_renamer.generate_folder_name(nfo_fields)
-            
-            if folder_name != expected_name:
-                self.folder_renamer.rename_folder(folder_path, expected_name)
-                self.log_manager.log_success(f"文件夹重命名: {folder_name} → {expected_name}")
-                return True
-            else:
-                self.log_manager.log_info(f"文件夹名称符合规范: {folder_name}")
-                return False
-                
-        except Exception as e:
-            error_msg = f"重命名文件夹失败: {folder_name} - {e}"
-            self.log_manager.log_error(error_msg)
-            return False
-    
-    def _find_nfo_file(self, folder_path: str) -> Optional[str]:
-        """确定性选择 NFO：优先与目录同名，否则按文件名排序取首个。"""
-        return preferred_nfo_file(folder_path, Path(folder_path).name)
+
+        if renamed_path:
+            self.folderRenamed.emit(folder_path, renamed_path)
+
+        ui_messages = list(modified_fields)
+        if renamed_path:
+            ui_messages.append("文件夹已重命名")
+        if ui_messages:
+            self.logUpdated.emit(f"{nfo_name} - {', '.join(ui_messages)}")
+
+        return {
+            "nfo_modified": nfo_modified,
+            "renamed": bool(renamed_path),
+            "skipped": not nfo_modified and not renamed_path,
+        }
+
+    def _log_modifications(
+        self, nfo_name: str, stats: Dict[str, int], logs: Dict[str, Any]
+    ) -> List[str]:
+        fields: List[str] = []
+        labels = {"actor": "演员", "tag": "标签", "genre": "类型", "series": "系列"}
+        for key, label in labels.items():
+            if stats.get(key, 0):
+                fields.append(label)
+        for key in ("actor_changes", "tag_changes", "genre_changes"):
+            for change in logs.get(key, []) or []:
+                self.log_manager.log_success(f"{change}")
+        for key in ("series_change", "set_change", "tag_change", "genre_change"):
+            if logs.get(key):
+                self.log_manager.log_success(f"{key}: {logs[key]}")
+        self.log_manager.log_success(f"NFO文件修改完成: {nfo_name}")
+        return [f"{label}已修改" for label in fields]
+
+    def _rename_folder_if_needed(
+        self, folder_path: str, fields: NFOFields, folder_name: str
+    ) -> Optional[str]:
+        expected = self.folder_renamer.generate_folder_name(fields)
+        if folder_name == expected:
+            self.log_manager.log_info(f"文件夹名称符合规范: {folder_name}")
+            return None
+        new_path = os.path.normpath(os.path.join(str(Path(folder_path).parent), expected))
+        self.folder_renamer.rename_folder(folder_path, expected)
+        self.log_manager.log_success(f"文件夹重命名: {folder_name} → {expected}")
+        return new_path
+
 
 class RenameToolGUI(QMainWindow):
+    operationStarted = Signal(str)
+    nfoChanged = Signal(str)
+    folderRenamed = Signal(str, str)
+    operationFinished = Signal(bool)
+
     def __init__(self, parent=None):
         # Qt6/PySide6 版本：parent 可以安全接收 NFOEditorQt6。
         super().__init__(parent)
@@ -1083,6 +949,7 @@ class RenameToolGUI(QMainWindow):
         self.actor_mapping = {}
         self.series_mapping = {}
         self.worker = None
+        self._operation_active = False
         
         self.init_ui()
         self.load_mappings()
@@ -1353,55 +1220,82 @@ class RenameToolGUI(QMainWindow):
         if folder:
             self.path_entry.setText(folder)
     
+
     def execute_rename(self):
-        """执行重命名操作"""
-        if hasattr(self, "worker") and self.worker and self.worker.isRunning():
+        """执行重命名操作，并通过信号向编辑器报告精确变化。"""
+        if self.worker and self.worker.isRunning():
+            self.worker.requestInterruption()
+            self.execute_btn.setText("正在停止...")
+            self.execute_btn.setEnabled(False)
+            self.log_text.append("已请求停止，将在当前文件处理完成后结束。")
             return
-        
+
         directory = self.path_entry.text().strip()
         if not directory or not os.path.isdir(directory):
             QMessageBox.critical(self, "错误", f"路径 '{directory}' 不是一个有效的目录")
             return
-        
-        # 检查是否至少有一个映射文件可用
-        has_actor_mapping = self.modify_actors_cb.isChecked() and bool(self.actor_mapping)
-        has_series_mapping = self.modify_series_cb.isChecked() and bool(self.series_mapping)
-        
-        if not has_actor_mapping and not has_series_mapping and not self.rename_folders_cb.isChecked():
-            QMessageBox.critical(self, "错误", "请至少选择一项操作：修改演员信息、修改系列信息或重命名文件夹")
+
+        has_actor_mapping = (
+            self.modify_actors_cb.isChecked() and bool(self.actor_mapping)
+        )
+        has_series_mapping = (
+            self.modify_series_cb.isChecked() and bool(self.series_mapping)
+        )
+
+        if (
+            not has_actor_mapping
+            and not has_series_mapping
+            and not self.rename_folders_cb.isChecked()
+        ):
+            QMessageBox.critical(
+                self,
+                "错误",
+                "请至少选择一项操作：修改演员信息、修改系列信息或重命名文件夹",
+            )
             return
-        
+
         try:
             self.log_text.clear()
             self.progress_bar.setValue(0)
-            
-            # 简单的开始提示
             self.log_text.append("开始处理，只显示有修改的文件...")
             self.log_text.append("")
-            
-            folder_format = self.folder_format_entry.text().strip() or Config.DEFAULT_FOLDER_FORMAT
-            
-            # 准备映射数据
+
+            folder_format = (
+                self.folder_format_entry.text().strip()
+                or Config.DEFAULT_FOLDER_FORMAT
+            )
             actor_mapping = self.actor_mapping if has_actor_mapping else {}
             series_mapping = self.series_mapping if has_series_mapping else {}
-            
+
             self.worker = RenameWorker(
-                directory, actor_mapping,
-                self.rename_folders_cb.isChecked(), folder_format,
-                series_mapping
+                directory,
+                actor_mapping,
+                self.rename_folders_cb.isChecked(),
+                folder_format,
+                series_mapping,
+                modify_actors=has_actor_mapping,
+                modify_series=has_series_mapping,
             )
-            
+
             self.worker.progressUpdated.connect(self.update_progress)
             self.worker.logUpdated.connect(self.update_ui_log)
+            self.worker.nfoChanged.connect(self.nfoChanged.emit)
+            self.worker.folderRenamed.connect(self.folderRenamed.emit)
             self.worker.completed.connect(self.on_worker_finished)
             self.worker.error.connect(self.handle_error)
             self.worker.finished.connect(self._on_worker_thread_stopped)
-            
-            self.execute_btn.setEnabled(False)
+
+            self.execute_btn.setText("停止")
+            self.execute_btn.setEnabled(True)
+            self._operation_active = True
+            self.operationStarted.emit(os.path.normpath(directory))
             self.worker.start()
-            
+
         except Exception as e:
             self.execute_btn.setEnabled(True)
+            if self._operation_active:
+                self._operation_active = False
+                self.operationFinished.emit(False)
             QMessageBox.critical(self, "错误", f"处理过程中出现错误: {e}")
             self.log_text.append("处理出错")
     
@@ -1415,39 +1309,64 @@ class RenameToolGUI(QMainWindow):
             self.progress_bar.setValue(0)
             self.progress_bar.setFormat("0/0 (0%)")
 
-    def on_worker_finished(self):
-        """工作线程完成"""
+
+    def on_worker_finished(self, stats):
+        """Show truthful success/failure/cancel statistics."""
         self.log_text.append("")
-        self.log_text.append("🎉 所有处理完成！")
-        self.progress_bar.setFormat("完成")
-        self._notify_parent_finished()
-        
-        # 显示日志文件路径
-        if hasattr(self.worker, 'log_manager') and self.worker.log_manager.log_file_path:
+        summary = (
+            f"处理 {stats.get('processed', 0)}/{stats.get('total', 0)}，"
+            f"修改NFO {stats.get('nfo_modified', 0)}，"
+            f"重命名 {stats.get('renamed', 0)}，"
+            f"失败 {stats.get('failed', 0)}，跳过 {stats.get('skipped', 0)}"
+        )
+        if stats.get("canceled"):
+            self.log_text.append(f"任务已取消：{summary}")
+            self.progress_bar.setFormat("已取消")
+        elif stats.get("failed"):
+            self.log_text.append(f"任务完成但存在失败：{summary}")
+            self.progress_bar.setFormat("部分完成")
+        else:
+            self.log_text.append(f"🎉 处理完成：{summary}")
+            self.progress_bar.setFormat("完成")
+
+        success = not stats.get("canceled") and not stats.get("failed")
+        if self._operation_active:
+            self._operation_active = False
+            self.operationFinished.emit(success)
+
+        if getattr(self.worker, "log_manager", None) and self.worker.log_manager.log_file_path:
             self.log_text.append(f"详细日志: {self.worker.log_manager.log_file_path}")
-    
+
+
     def _notify_parent_finished(self):
-        """批量改名完成后，轻量通知主窗口刷新列表。"""
-        parent = getattr(self, "parent_window", None)
-        if not parent:
-            return
-        try:
-            if hasattr(parent, "reload_timer"):
-                parent.reload_timer.start(800)
-            elif hasattr(parent, "load_files_in_folder"):
-                parent.load_files_in_folder(auto_select=False, show_progress=False)
-        except Exception as e:
-            print(f"通知主窗口刷新失败: {e}")
+        """保留旧接口；新版通过 operationFinished/变更信号通知主窗口。"""
+        if self._operation_active:
+            self._operation_active = False
+            self.operationFinished.emit(True)
+
 
     def handle_error(self, error_message: str):
-        """处理工作线程错误"""
-        QMessageBox.critical(self, "错误", f"处理过程中出现错误: {error_message}")
+        """处理工作线程错误。"""
+        if self._operation_active:
+            self._operation_active = False
+            self.operationFinished.emit(False)
+        QMessageBox.critical(
+            self, "错误", f"处理过程中出现错误: {error_message}"
+        )
         self.log_text.append(f"处理出错: {error_message}")
+
 
     def _on_worker_thread_stopped(self):
         worker = self.worker
         self.worker = None
+        self.execute_btn.setText("执行")
         self.execute_btn.setEnabled(True)
+
+        # 被用户中断或线程异常退出但未走 completed/error 时，也必须解除主程序操作锁。
+        if self._operation_active:
+            self._operation_active = False
+            self.operationFinished.emit(False)
+
         if worker is not None:
             worker.deleteLater()
 
@@ -1496,7 +1415,6 @@ def create_rename_worker(directory: str, actor_mapping: Dict[str, str],
                         series_mapping: Optional[Dict[str, str]] = None) -> RenameWorker:
     """便利函数：创建RenameWorker实例，保持向后兼容性"""
     return RenameWorker(directory, actor_mapping, rename_folders, folder_format, series_mapping)
-
 if __name__ == "__main__":
     try:
         if len(sys.argv) > 1:

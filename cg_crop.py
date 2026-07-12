@@ -16,7 +16,7 @@ from PySide6.QtGui import QIcon, QImage, QImageReader, QPixmap, QPainter, QPen, 
 # ================================ 配置管理 ================================
 class CropConfig:
     """裁剪工具配置中心"""
-    APP_VERSION = "v9.7.6"
+    APP_VERSION = "v9.8.1"
     APP_TITLE = "大锤 EMBY海报裁剪工具"
     WINDOW_SIZE = (1200, 680)
     IMAGE_DISPLAY_SIZE = (800, 538)
@@ -173,6 +173,17 @@ def get_resource_path(relative_path: str) -> str:
     return os.path.join(base_path, relative_path)
 
 
+def load_oriented_qimage(image_path: str) -> QImage:
+    """Load an image once with EXIF orientation consistently applied."""
+    reader = QImageReader(image_path)
+    reader.setAutoTransform(True)
+    image = reader.read()
+    if image.isNull():
+        message = reader.errorString() or "无法读取图片"
+        raise ImageLoadError(message)
+    return image
+
+
 # ================================ 功能模块 ================================
 class ImageProcessor:
     """图片处理器 - 专门处理图片相关操作"""
@@ -185,27 +196,18 @@ class ImageProcessor:
         self.current_rotation: int = 0  # 修复：跟踪当前旋转角度
     
     def load_image(self, image_path: str) -> Tuple[QPixmap, QSize]:
-        """加载图片并返回pixmap和原始尺寸"""
+        """加载图片并返回已应用 EXIF 方向的 pixmap 和尺寸。"""
         try:
-            reader = QImageReader(image_path)
-            reader.setAutoTransform(True)
-            
-            self.original_size = reader.size()
-            if not self.original_size or self.original_size.isNull():
-                raise ImageLoadError("无法读取图片尺寸信息")
-            
-            self.original_pixmap = QPixmap(image_path)
+            image = load_oriented_qimage(image_path)
+            self.original_size = image.size()
+            self.original_pixmap = QPixmap.fromImage(image)
             if self.original_pixmap.isNull():
-                raise ImageLoadError("无法加载图片文件")
-            
-            # 修复：保存原图备份并重置旋转
+                raise ImageLoadError("无法创建图片预览")
             self.original_pixmap_backup = self.original_pixmap.copy()
             self.current_rotation = 0
-            
             return self.original_pixmap, self.original_size
-            
-        except Exception as e:
-            raise ImageLoadError(f"加载图片失败: {e}")
+        except Exception as exc:
+            raise ImageLoadError(f"加载图片失败: {exc}") from exc
     
     def rotate_image(self, angle: int) -> QPixmap:
         """修复：基于原图和累积角度进行旋转，避免质量损失"""
@@ -796,7 +798,10 @@ class CropDisplayWidget(QLabel):
     
     def _is_image_file(self, file_path: str) -> bool:
         """检查是否为图片文件"""
-        return any(file_path.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".bmp"])
+        return any(
+            file_path.lower().endswith(ext)
+            for ext in [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
+        )
 
 
 class RatioControlWidget(QGroupBox):
@@ -979,6 +984,8 @@ class InfoDisplayWidget(QGroupBox):
 # ================================ 主窗口 ================================
 class EmbyPosterCrop(QDialog):
     """主窗口 - 组装各个组件"""
+
+    imagesSaved = pyqtSignal(str, str)  # poster_path, thumb_path
     
     def __init__(self, parent=None, nfo_base_name=None):
         super().__init__(parent)
@@ -1147,53 +1154,56 @@ class EmbyPosterCrop(QDialog):
         
         file_path, _ = QFileDialog.getOpenFileName(
             self, "选择图片", start_dir,
-            "图片文件 (*.jpg *.jpeg *.png *.bmp);;所有文件 (*.*)"
+            "图片文件 (*.jpg *.jpeg *.png *.webp *.bmp);;所有文件 (*.*)"
         )
         
         if file_path:
             self.load_initial_image(file_path)
     
+
     def _perform_crop_operation(self) -> bool:
-        """修复：提取公共的裁剪操作逻辑"""
+        """执行裁剪并精确上报两个输出图片路径。"""
         if not self.image_path:
             QMessageBox.warning(self, "警告", "请先打开图片")
             return False
-        
+
         try:
-            # 获取裁剪坐标
             coords = self.crop_display.get_crop_coordinates()
             if not coords:
                 raise CropError("无效的裁剪区域")
-            
+
             x, y, w, h = coords
-            
-            # 加载并处理图片
-            image = QImage(self.image_path)
-            if image.isNull():
-                raise ImageLoadError("无法读取原图")
-            
-            # 应用旋转
+            image = load_oriented_qimage(self.image_path)
+
             if self.crop_display.crop_params.rotation_angle != 0:
-                transform = QTransform().rotate(self.crop_display.crop_params.rotation_angle)
-                image = image.transformed(transform, Qt.SmoothTransformation)
-            
-            # 执行裁剪
+                transform = QTransform().rotate(
+                    self.crop_display.crop_params.rotation_angle
+                )
+                image = image.transformed(
+                    transform, Qt.SmoothTransformation
+                )
+
             cropped = image.copy(x, y, w, h)
-            
-            # 获取并应用水印
+
             watermark_settings = self.watermark_control.get_watermark_settings()
             marks = watermark_settings.get_active_marks()
             if marks:
-                cropped = self.watermark_processor.apply_watermarks(cropped, watermark_settings)
-                image = self.watermark_processor.apply_watermarks(image, watermark_settings)
-            
-            # 保存图片
+                cropped = self.watermark_processor.apply_watermarks(
+                    cropped, watermark_settings
+                )
+                image = self.watermark_processor.apply_watermarks(
+                    image, watermark_settings
+                )
+
             poster_path, thumb_path = ImageSaver.save_images(
                 cropped, image, self.image_path, self.nfo_base_name
             )
-            QMessageBox.information(self, "成功", f"裁剪成功！\n保存位置：{poster_path}")
+            self.imagesSaved.emit(poster_path, thumb_path)
+            QMessageBox.information(
+                self, "成功", f"裁剪成功！\n保存位置：{poster_path}"
+            )
             return True
-            
+
         except Exception as e:
             QMessageBox.critical(self, "错误", f"裁剪失败：{e}")
             return False

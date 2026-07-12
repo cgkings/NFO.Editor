@@ -3,6 +3,7 @@ import sys
 import subprocess
 import xml.etree.ElementTree as ET
 from functools import lru_cache
+from collections import OrderedDict
 from threading import Lock
 from PySide6.QtWidgets import (
     QApplication,
@@ -34,7 +35,12 @@ from PySide6.QtGui import (
 )
 import concurrent.futures
 from enum import Enum
-from nfo_utils import is_path_within, preferred_image_file, preferred_nfo_file
+from nfo_utils import (
+    is_path_within,
+    preferred_image_from_names,
+    preferred_nfo_from_names,
+    read_series_text,
+)
 
 
 class LoadStage(Enum):
@@ -79,6 +85,8 @@ class ImageLoadManager(QObject):
         self._next_batch_id = 0
         self._batches = {}
         self._futures = set()
+        self._image_cache = OrderedDict()
+        self._cache_limit = 128
 
     def _mark_done(self, batch_id, success=False):
         emit_done = False
@@ -99,6 +107,35 @@ class ImageLoadManager(QObject):
         if emit_done:
             self.all_done.emit(batch_id)
 
+    def _cache_get(self, key):
+        with self._lock:
+            image = self._image_cache.get(key)
+            if image is not None:
+                self._image_cache.move_to_end(key)
+            return image
+
+    def _cache_put(self, key, image):
+        with self._lock:
+            self._image_cache[key] = image
+            self._image_cache.move_to_end(key)
+            while len(self._image_cache) > self._cache_limit:
+                self._image_cache.popitem(last=False)
+
+    def _is_batch_active(self, batch_id):
+        with self._lock:
+            state = self._batches.get(batch_id)
+            return bool(state is not None and not state.get("cancelled"))
+
+    def cancel_pending(self):
+        """Cancel queued batches while keeping the long-lived thread pool alive."""
+        with self._lock:
+            for state in self._batches.values():
+                state["cancelled"] = True
+            self._batches.clear()
+            futures = list(self._futures)
+        for future in futures:
+            future.cancel()
+
     def load_image(
         self, batch_id, image_path, label, target_width, target_height, dpr=1.0
     ):
@@ -110,6 +147,26 @@ class ImageLoadManager(QObject):
             dpr = max(1.0, float(dpr or 1.0))
             physical_width = max(1, int(round(target_width * dpr)))
             physical_height = max(1, int(round(target_height * dpr)))
+            try:
+                stat_result = os.stat(image_path)
+                cache_key = (
+                    os.path.normcase(os.path.abspath(image_path)),
+                    stat_result.st_mtime_ns,
+                    stat_result.st_size,
+                    physical_width,
+                    physical_height,
+                )
+            except OSError:
+                cache_key = None
+
+            if cache_key is not None:
+                cached = self._cache_get(cache_key)
+                if cached is not None and self._is_batch_active(batch_id):
+                    self.image_loaded.emit(
+                        batch_id, image_path, label, cached, dpr
+                    )
+                    success = True
+                    return True
 
             reader = QImageReader(image_path)
             reader.setAutoTransform(True)
@@ -124,7 +181,13 @@ class ImageLoadManager(QObject):
                     reader.setScaledSize(QSize(new_width, new_height))
 
                 image = reader.read()
-                if self.is_running and not image.isNull():
+                if (
+                    self.is_running
+                    and self._is_batch_active(batch_id)
+                    and not image.isNull()
+                ):
+                    if cache_key is not None:
+                        self._cache_put(cache_key, image)
                     self.image_loaded.emit(batch_id, image_path, label, image, dpr)
                     success = True
                     return True
@@ -140,7 +203,8 @@ class ImageLoadManager(QObject):
             self._next_batch_id += 1
             batch_id = self._next_batch_id
             self._batches[batch_id] = {
-                "total": len(items), "loaded": 0, "completed": 0, "done": False
+                "total": len(items), "loaded": 0, "completed": 0,
+                "done": False, "cancelled": False
             }
 
         if not items:
@@ -170,6 +234,9 @@ class ImageLoadManager(QObject):
         for future in futures:
             future.cancel()
         self.executor.shutdown(wait=False, cancel_futures=True)
+        with self._lock:
+            self._image_cache.clear()
+            self._batches.clear()
 
 
 class PosterContainer(QFrame):
@@ -310,7 +377,7 @@ class PhotoWallDialog(QDialog):
 
     def init_ui(self):
         """初始化UI"""
-        self.setWindowTitle("大锤 照片墙 v9.7.7")
+        self.setWindowTitle("大锤 照片墙 v9.8.1")
         self.setStyleSheet(
             """
             QDialog {
@@ -642,7 +709,13 @@ class PhotoWallDialog(QDialog):
             return max(1.0, float(screen.devicePixelRatio() if screen else 1.0))
 
     def _reset_image_manager(self):
+        """Invalidate old batches without repeatedly creating thread pools."""
         old_manager = getattr(self, "image_manager", None)
+        if old_manager is not None and getattr(old_manager, "is_running", False):
+            old_manager.cancel_pending()
+            self._pending_image_batches = set()
+            return
+
         if old_manager is not None:
             try:
                 old_manager.progress_updated.disconnect(self.update_progress)
@@ -654,6 +727,7 @@ class PhotoWallDialog(QDialog):
                 old_manager.stop()
             except Exception:
                 pass
+
         self._pending_image_batches = set()
         self.image_manager = ImageLoadManager()
         self.image_manager.progress_updated.connect(self.update_progress)
@@ -806,8 +880,14 @@ class PhotoWallDialog(QDialog):
                         return
                     dirs.sort(key=str.lower)
                     preferred_stem = os.path.basename(root)
-                    poster_file = preferred_image_file(root, "poster", preferred_stem)
-                    nfo_file = preferred_nfo_file(root, preferred_stem)
+                    # os.walk 已经给出 files，直接从这一份列表选择，
+                    # 避免每个目录再执行两次 os.scandir。
+                    poster_file = preferred_image_from_names(
+                        root, files, "poster", preferred_stem
+                    )
+                    nfo_file = preferred_nfo_from_names(
+                        root, files, preferred_stem
+                    )
                     if poster_file and nfo_file:
                         poster_nfo_pairs.append((poster_file, nfo_file, root))
 
@@ -1176,7 +1256,7 @@ class PhotoWallDialog(QDialog):
         self.view_mode = "wall"
         self.active_category_type = None
         self.active_category_value = None
-        self.parse_nfo.cache_clear()
+        self._parse_nfo_cached.cache_clear()
 
     def _update_sort_keys(self, nfo_data, index):
         """更新排序键"""
@@ -1928,52 +2008,61 @@ class PhotoWallDialog(QDialog):
             self.settings.setValue("last_directory", folder_selected)
             self.load_posters(folder_selected)
 
-    @lru_cache(maxsize=1000)
     def parse_nfo(self, nfo_path):
-        """解析NFO文件（带缓存）"""
+        """Parse NFO with an mtime/size-aware cache so external edits are visible."""
+        try:
+            stat_result = os.stat(nfo_path)
+            return self._parse_nfo_cached(
+                nfo_path, stat_result.st_mtime_ns, stat_result.st_size
+            )
+        except OSError as exc:
+            print(f"解析NFO文件失败 {nfo_path}: {exc}")
+            return {}
+
+    @lru_cache(maxsize=2000)
+    def _parse_nfo_cached(self, nfo_path, _mtime_ns, _size):
         try:
             tree = ET.parse(nfo_path)
             root = tree.getroot()
 
-            title = root.find("title")
-            title = title.text if title is not None else ""
+            title_elem = root.find("title")
+            title = (title_elem.text or "").strip() if title_elem is not None else ""
 
-            year = ""
-            release = root.find("release")
-            if release is not None and release.text:
-                try:
-                    year = release.text.split("-")[0]
-                except:
-                    year = ""
+            release_elem = root.find("release")
+            release_text = (
+                (release_elem.text or "").strip()
+                if release_elem is not None else ""
+            )
+            year = release_text.split("-", 1)[0] if release_text else ""
 
-            series = root.find("series")
-            series = series.text if series is not None else ""
-
-            rating = root.find("rating")
-            rating = rating.text if rating is not None else "0"
+            rating_elem = root.find("rating")
+            rating = (
+                (rating_elem.text or "0").strip()
+                if rating_elem is not None else "0"
+            )
 
             actors = []
             for actor in root.findall("actor"):
                 name = actor.find("name")
-                if name is not None and name.text:
+                if name is not None and name.text and name.text.strip():
                     actors.append(name.text.strip())
 
-            tags = []
-            for tag in root.findall("tag"):
-                if tag is not None and tag.text:
-                    tags.append(tag.text.strip())
+            tags = [
+                tag.text.strip() for tag in root.findall("tag")
+                if tag.text and tag.text.strip()
+            ]
 
             return {
                 "title": title,
                 "year": year,
-                "series": series,
+                "series": read_series_text(root),
                 "rating": rating,
                 "actors": actors,
                 "tags": tags,
-                "release": release.text if release is not None else "",
+                "release": release_text,
             }
-        except Exception as e:
-            print(f"解析NFO文件失败 {nfo_path}: {str(e)}")
+        except Exception as exc:
+            print(f"解析NFO文件失败 {nfo_path}: {exc}")
             return {}
 
     def cancel_loading(self):

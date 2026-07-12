@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import time
 import shutil
 import tempfile
-import xml.dom.minidom as minidom
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
+
+IMAGE_EXTENSIONS: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 
 VIDEO_EXTENSIONS: tuple[str, ...] = (
     ".mp4", ".mkv", ".avi", ".mov", ".rm", ".rmvb", ".mpeg", ".mpg",
@@ -162,6 +165,129 @@ def normalize_scan_roots(paths: Iterable[str]) -> list[str]:
 
 
 
+def append_editor_event(
+    library_root: str,
+    event_type: str,
+    *,
+    path: Optional[str] = None,
+    old_path: Optional[str] = None,
+    message: Optional[str] = None,
+    source: Optional[str] = None,
+    **extra,
+) -> str:
+    """Append one structured event for a separately running editor tool.
+
+    Tools running inside the NFO Editor process should prefer Qt signals.
+    Independent processes can call this helper after their filesystem write
+    succeeds.  One ``os.write`` call is used with ``O_APPEND`` so concurrent
+    tools cannot overwrite each other's event records.
+    """
+    if not library_root or not os.path.isdir(library_root):
+        raise OSError(f"NFO 根目录不存在: {library_root}")
+    event_type = (event_type or "").strip()
+    if not event_type:
+        raise ValueError("event_type 不能为空")
+
+    payload = {
+        "type": event_type,
+        "timestamp": time.time(),
+    }
+    if path:
+        payload["path"] = os.path.normpath(os.fspath(path))
+    if old_path:
+        payload["old_path"] = os.path.normpath(os.fspath(old_path))
+    if message:
+        payload["message"] = str(message)
+    if source:
+        payload["source"] = str(source)
+    payload.update(extra)
+
+    event_file = os.path.join(
+        os.path.normpath(library_root),
+        ".nfo_editor_events.jsonl",
+    )
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    fd = os.open(event_file, flags, 0o600)
+    try:
+        written = os.write(fd, encoded)
+        if written != len(encoded):
+            raise OSError("外部事件写入不完整")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return event_file
+
+
+
+def read_series_text(root: ET.Element) -> str:
+    """Read series text from common NFO layouts.
+
+    Preferred order is a direct ``<series>`` node, then the structured
+    ``<set><name>`` form, and finally legacy text stored directly in ``<set>``.
+    """
+    series = root.find("series")
+    if series is not None and series.text and series.text.strip():
+        return series.text.strip()
+
+    set_elem = root.find("set")
+    if set_elem is None:
+        return ""
+    name_elem = set_elem.find("name")
+    if name_elem is not None and name_elem.text and name_elem.text.strip():
+        return name_elem.text.strip()
+    return (set_elem.text or "").strip()
+
+
+def preferred_nfo_from_names(
+    folder_path: str, file_names: Iterable[str], preferred_stem: Optional[str] = None
+) -> Optional[str]:
+    """Select a deterministic NFO from an already enumerated filename list."""
+    candidates = sorted(
+        (name for name in file_names if str(name).lower().endswith(".nfo")),
+        key=lambda name: str(name).casefold(),
+    )
+    if not candidates:
+        return None
+    if preferred_stem:
+        wanted = preferred_stem.casefold()
+        for name in candidates:
+            if Path(name).stem.casefold() == wanted:
+                return os.path.join(folder_path, name)
+    return os.path.join(folder_path, candidates[0])
+
+
+def preferred_image_from_names(
+    folder_path: str,
+    file_names: Iterable[str],
+    image_type: str,
+    preferred_stem: Optional[str] = None,
+) -> Optional[str]:
+    """Select a deterministic image from an already enumerated filename list."""
+    image_type = (image_type or "").casefold()
+    candidates = [
+        str(name) for name in file_names
+        if str(name).casefold().endswith(IMAGE_EXTENSIONS)
+        and image_type in str(name).casefold()
+    ]
+    if not candidates:
+        return None
+
+    preferred_stem = (preferred_stem or "").casefold()
+
+    def sort_key(name: str):
+        lower = name.casefold()
+        stem = Path(name).stem.casefold()
+        exact = bool(preferred_stem and stem == f"{preferred_stem}-{image_type}")
+        canonical_suffix = stem.endswith(f"-{image_type}")
+        return (0 if exact else 1, 0 if canonical_suffix else 1, lower)
+
+    return os.path.join(folder_path, sorted(candidates, key=sort_key)[0])
+
 def parse_xml_file(path: str) -> ET.ElementTree:
     """Parse XML while retaining comments and processing instructions where supported."""
     builder = ET.TreeBuilder(insert_comments=True, insert_pis=True)
@@ -216,6 +342,39 @@ def sync_actor_nodes(root: ET.Element, actor_names: Sequence[str]) -> None:
             name_elem = ET.SubElement(actor, "name")
             name_elem.text = name
         root.insert(insert_at + offset, actor)
+
+
+def sync_series_nodes(root: ET.Element, series_value: str) -> None:
+    """Keep direct ``series`` and structured ``set/name`` values consistent."""
+    value = (series_value or "").strip()
+    series = root.find("series")
+    if series is None:
+        series = ET.Element("series")
+        # Put series before studio-like metadata when possible.
+        children = list(root)
+        insert_at = len(children)
+        for index, child in enumerate(children):
+            if child.tag in {"studio", "maker", "publisher", "label", "tag", "genre"}:
+                insert_at = index
+                break
+        root.insert(insert_at, series)
+    series.text = value
+
+    set_elem = root.find("set")
+    if set_elem is None and value:
+        set_elem = ET.Element("set")
+        children = list(root)
+        try:
+            insert_at = children.index(series) + 1
+        except ValueError:
+            insert_at = len(children)
+        root.insert(insert_at, set_elem)
+    if set_elem is not None:
+        set_elem.text = None
+        name = set_elem.find("name")
+        if name is None:
+            name = ET.SubElement(set_elem, "name")
+        name.text = value
 
 
 def replace_text_nodes(root: ET.Element, tag_name: str, values: Sequence[str]) -> None:
@@ -273,10 +432,19 @@ def atomic_write_text(path: str, text: str, *, encoding: str = "utf-8") -> None:
 
 
 def serialize_pretty_xml(root: ET.Element) -> str:
-    xml_bytes = ET.tostring(root, encoding="utf-8")
-    parsed = minidom.parseString(xml_bytes)
-    pretty = parsed.toprettyxml(indent="  ", encoding="utf-8").decode("utf-8")
-    return "\n".join(line for line in pretty.splitlines() if line.strip()) + "\n"
+    """Serialize XML without constructing a second DOM tree.
+
+    ``ElementTree.indent`` is substantially lighter than ``minidom`` for large
+    batch operations and preserves comments/processing instructions retained by
+    :func:`parse_xml_file`. Callers discard the in-memory tree after writing, so
+    applying indentation in place is safe here.
+    """
+    if hasattr(ET, "indent"):
+        ET.indent(root, space="  ")
+    xml_bytes = ET.tostring(
+        root, encoding="utf-8", xml_declaration=True, short_empty_elements=True
+    )
+    return xml_bytes.decode("utf-8").rstrip() + "\n"
 
 
 def write_xml_root_atomic(root: ET.Element, path: str) -> None:
@@ -330,50 +498,19 @@ def safe_move_directory(src_path: str, dest_parent: str) -> str:
 
 def preferred_nfo_file(folder_path: str, preferred_stem: Optional[str] = None) -> Optional[str]:
     try:
-        candidates = sorted(
-            (
-                entry.path
-                for entry in os.scandir(folder_path)
-                if entry.is_file() and entry.name.lower().endswith(".nfo")
-            ),
-            key=lambda p: os.path.basename(p).lower(),
-        )
+        names = [entry.name for entry in os.scandir(folder_path) if entry.is_file()]
     except OSError:
         return None
-    if not candidates:
-        return None
-    if preferred_stem:
-        wanted = preferred_stem.lower()
-        for candidate in candidates:
-            if Path(candidate).stem.lower() == wanted:
-                return candidate
-    return candidates[0]
+    return preferred_nfo_from_names(folder_path, names, preferred_stem)
 
 
 def preferred_image_file(
     folder_path: str, image_type: str, preferred_stem: Optional[str] = None
 ) -> Optional[str]:
-    image_type = (image_type or "").lower()
     try:
-        candidates = [
-            entry.path
-            for entry in os.scandir(folder_path)
-            if entry.is_file()
-            and entry.name.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
-            and image_type in entry.name.lower()
-        ]
+        names = [entry.name for entry in os.scandir(folder_path) if entry.is_file()]
     except OSError:
         return None
-    if not candidates:
-        return None
-
-    preferred_stem = (preferred_stem or "").lower()
-
-    def sort_key(path: str):
-        name = os.path.basename(path).lower()
-        stem = Path(path).stem.lower()
-        exact = bool(preferred_stem and stem == f"{preferred_stem}-{image_type}")
-        canonical_suffix = stem.endswith(f"-{image_type}")
-        return (0 if exact else 1, 0 if canonical_suffix else 1, name)
-
-    return sorted(candidates, key=sort_key)[0]
+    return preferred_image_from_names(
+        folder_path, names, image_type, preferred_stem
+    )

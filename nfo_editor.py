@@ -28,6 +28,7 @@ import time
 import webbrowser
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from pathlib import Path
 
 import requests
 try:
@@ -35,7 +36,6 @@ try:
 except (ImportError, OSError):
     winshell = None
 from bs4 import BeautifulSoup
-from PIL import Image
 
 # ============================================================
 #  PySide6 imports
@@ -50,9 +50,10 @@ from PySide6.QtCore import (
     QThread,
     QTimer,
     Signal as pyqtSignal,
+    Slot as pyqtSlot,
     qInstallMessageHandler,
 )
-from PySide6.QtGui import QKeySequence, QPixmap, QShortcut, QTextCursor
+from PySide6.QtGui import QImageReader, QKeySequence, QPixmap, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -82,12 +83,15 @@ from nfo_utils import (
     atomic_write_text,
     find_numbered_trailer,
     find_trailer_in_movie_folder,
+    is_path_within,
     parse_xml_file,
     preferred_image_file,
+    read_series_text,
     safe_move_directory,
     same_path,
     split_csv_values,
     sync_actor_nodes,
+    sync_series_nodes,
     unique_paths,
     write_xml_root_atomic,
     replace_text_nodes,
@@ -183,6 +187,26 @@ class NFODiskIndex:
         try:
             data = json.loads(data_json)
             data["path"] = nfo_path
+            return data
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    def get_stale(self, conn, root_path, nfo_path):
+        """Return the last known data even when the file is temporarily unreadable."""
+        row = conn.execute(
+            """
+            SELECT data_json
+            FROM nfo_index
+            WHERE root_path = ? AND nfo_path = ?
+            """,
+            (root_path, nfo_path),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            data = json.loads(row[0])
+            data["path"] = nfo_path
+            data["stale"] = True
             return data
         except (json.JSONDecodeError, TypeError):
             return None
@@ -320,12 +344,43 @@ class LoadFilesThread(QThread):
                         self.progress.emit(i, total, os.path.basename(nfo_path))
 
                 except (ET.ParseError, OSError) as e:
-                    # 文件仍然存在但可能正被外部组件写入/替换,保留旧索引,不要当成已删除。
+                    # 原子替换或外部写入期间可能短暂无法解析。优先展示旧索引，
+                    # 避免项目从树中闪退消失；下一次精确事件会重新解析。
+                    stale_data = None
                     try:
-                        self.disk_index.mark_seen(conn, self.folder_path, nfo_path, scan_id)
+                        stale_data = self.disk_index.get_stale(
+                            conn, self.folder_path, nfo_path
+                        )
+                        self.disk_index.mark_seen(
+                            conn, self.folder_path, nfo_path, scan_id
+                        )
                     except sqlite3.Error:
                         pass
-                    print(f"解析文件失败 {nfo_path}: {str(e)}")
+                    if stale_data is not None:
+                        relative_path = os.path.relpath(nfo_path, self.folder_path)
+                        parts = relative_path.split(os.sep)
+                        if len(parts) > 1:
+                            first_level = os.sep.join(parts[:-2]) if len(parts) > 2 else ""
+                            second_level = parts[-2]
+                            nfo_file = parts[-1]
+                        else:
+                            first_level = second_level = ""
+                            nfo_file = parts[-1]
+                        batch.append((
+                            nfo_path, first_level, second_level, nfo_file, stale_data
+                        ))
+                    if len(batch) >= self.batch_size:
+                        if index_rows:
+                            self.disk_index.upsert_many(
+                                conn, self.folder_path, index_rows, scan_id
+                            )
+                        conn.commit()
+                        self.batch_ready.emit(batch)
+                        batch = []
+                        index_rows = []
+                    if i % 200 == 0 or i == total:
+                        self.progress.emit(i, total, os.path.basename(nfo_path))
+                    print(f"解析文件失败，已尝试使用旧索引 {nfo_path}: {e}")
                     continue
 
             if batch:
@@ -353,10 +408,11 @@ class LoadFilesThread(QThread):
             'rating': 0.0, 'release': '', 'actors': [], 'tags': [],
         }
 
-        for field in ['num', 'title', 'plot', 'series']:
+        for field in ['num', 'title', 'plot']:
             elem = root.find(field)
             if elem is not None and elem.text:
                 data[field] = elem.text.strip()
+        data['series'] = read_series_text(root)
 
         rating_elem = root.find('rating')
         if rating_elem is not None and rating_elem.text:
@@ -396,10 +452,11 @@ def parse_single_nfo(nfo_path):
             'num': '', 'title': '', 'plot': '', 'series': '',
             'rating': 0.0, 'release': '', 'actors': [], 'tags': [],
         }
-        for field in ['num', 'title', 'plot', 'series']:
+        for field in ['num', 'title', 'plot']:
             elem = root.find(field)
             if elem is not None and elem.text:
                 data[field] = elem.text.strip()
+        data['series'] = read_series_text(root)
         rating_elem = root.find('rating')
         if rating_elem is not None and rating_elem.text:
             try:
@@ -723,14 +780,18 @@ class SettingsDialog(QDialog):
 # ================ 文件移动线程 ================
 
 class FileOperationThread(QThread):
-    progress = pyqtSignal(int, int)
+    # QProgressDialog.setValue 只接收一个整数，信号也只传递当前进度，
+    # 避免依赖 PySide 对“多参数信号连接少参数槽”的隐式裁剪行为。
+    progress = pyqtSignal(int)
     error = pyqtSignal(str)
     status = pyqtSignal(str)
+    moved = pyqtSignal(str, str)  # old_folder, new_folder
 
     def __init__(self, operation_type, **kwargs):
         super().__init__()
         self.operation_type = operation_type
         self.kwargs = kwargs
+        self.moved_paths = []
         # 工程规范: 停止用 threading.Event, 不用裸布尔标志
         self._stop_event = threading.Event()
 
@@ -739,8 +800,13 @@ class FileOperationThread(QThread):
         return self._stop_event.is_set()
 
     def run(self):
-        if self.operation_type == "move":
-            self.move_files()
+        try:
+            if self.operation_type == "move":
+                self.move_files()
+        except Exception as exc:
+            # 线程入口最后一道保护：任何未预料异常都通过信号交给主线程，
+            # 绝不让异常越过 QThread.run()。
+            self.error.emit(f"移动线程异常: {exc}")
 
     def stop(self):
         self._stop_event.set()
@@ -748,7 +814,6 @@ class FileOperationThread(QThread):
     def move_files(self):
         src_paths = unique_paths(self.kwargs.get("src_paths", []))
         dest_path = self.kwargs.get("dest_path")
-        total = len(src_paths)
 
         for i, src_path in enumerate(src_paths, 1):
             if self._stop_event.is_set():
@@ -756,13 +821,131 @@ class FileOperationThread(QThread):
             folder_name = os.path.basename(os.path.normpath(src_path))
             self.status.emit(f"正在处理: {folder_name}")
             try:
-                safe_move_directory(src_path, dest_path)
+                moved_path = safe_move_directory(src_path, dest_path)
+                self.moved_paths.append((src_path, moved_path))
+                self.moved.emit(src_path, moved_path)
             except Exception as exc:
                 # 文件移动涉及磁盘、杀软/索引器、同名冲突、权限等外部因素。
                 # 在工作线程内兜住异常，避免异常穿透 QThread 造成主程序不稳定。
                 self.error.emit(f"移动文件夹失败: {exc}")
             finally:
-                self.progress.emit(i, total)
+                self.progress.emit(i)
+
+
+class BatchNFOOperationThread(QThread):
+    """Run batch XML writes outside the GUI thread with exact per-file events."""
+
+    progress = pyqtSignal(int, int, str)
+    changed = pyqtSignal(str)
+    error = pyqtSignal(str, str)
+    completed = pyqtSignal(dict)
+
+    def __init__(self, paths, operation, *, field="", value=""):
+        super().__init__()
+        self.paths = unique_paths(paths)
+        self.operation = operation
+        self.field = field
+        self.value = value
+        self._stop_event = threading.Event()
+
+    @property
+    def is_stopped(self):
+        return self._stop_event.is_set()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run(self):
+        stats = {
+            "total": len(self.paths),
+            "processed": 0,
+            "changed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "canceled": False,
+        }
+        total = len(self.paths)
+        for current, nfo_path in enumerate(self.paths, 1):
+            if self._stop_event.is_set():
+                stats["canceled"] = True
+                break
+            try:
+                changed = self._apply_one(nfo_path)
+                stats["processed"] += 1
+                if changed:
+                    stats["changed"] += 1
+                    self.changed.emit(nfo_path)
+                else:
+                    stats["skipped"] += 1
+            except Exception as exc:
+                stats["failed"] += 1
+                self.error.emit(nfo_path, str(exc))
+            finally:
+                self.progress.emit(current, total, os.path.basename(nfo_path))
+        self.completed.emit(stats)
+
+    def _apply_one(self, nfo_path):
+        tree = parse_xml_file(nfo_path)
+        root = tree.getroot()
+        changed = False
+
+        if self.operation == "fill":
+            if self.field == "actor":
+                desired = split_csv_values(self.value)
+                before = [
+                    (actor.findtext("name") or "").strip()
+                    for actor in root.findall("actor")
+                    if (actor.findtext("name") or "").strip()
+                ]
+                if before != desired:
+                    sync_actor_nodes(root, desired)
+                    changed = True
+            elif self.field == "rating":
+                rating_value = float(self.value)
+                rating_text = self.value.strip()
+                rating = root.find("rating")
+                if rating is None:
+                    rating = ET.SubElement(root, "rating")
+                if (rating.text or "").strip() != rating_text:
+                    rating.text = rating_text
+                    changed = True
+                critic_text = str(int(rating_value * 10))
+                critic = root.find("criticrating")
+                if critic is None:
+                    critic = ET.SubElement(root, "criticrating")
+                if (critic.text or "").strip() != critic_text:
+                    critic.text = critic_text
+                    changed = True
+            elif self.field == "series":
+                before = read_series_text(root)
+                if before != self.value.strip():
+                    sync_series_nodes(root, self.value)
+                    changed = True
+            else:
+                element = root.find(self.field)
+                if element is None:
+                    element = ET.SubElement(root, self.field)
+                if (element.text or "").strip() != self.value.strip():
+                    element.text = self.value.strip()
+                    changed = True
+
+        elif self.operation == "add_tags":
+            existing = []
+            for tag in root.findall("tag"):
+                for value in split_csv_values(tag.text or ""):
+                    if value not in existing:
+                        existing.append(value)
+            requested = split_csv_values(self.value)
+            additions = [value for value in requested if value not in existing]
+            if additions:
+                replace_text_nodes(root, "tag", existing + additions)
+                changed = True
+        else:
+            raise ValueError(f"未知批量操作: {self.operation}")
+
+        if changed:
+            write_xml_root_atomic(root, nfo_path)
+        return changed
 
 
 class TargetFolderLoadThread(QThread):
@@ -883,9 +1066,30 @@ class NFOEditorQt6(NFOEditorQt):
         self._pending_select_folder = None
         self._event_file_path = None
         self._event_file_offset = 0
+        self._event_partial_line = ""
         self.library_dirty = False
         self._last_selected_item = None
         self._selection_change_guard = False
+        self._move_error_messages = []
+        self._move_results = []
+        self._target_reload_after_move = False
+        self.batch_thread = None
+        self.batch_progress = None
+        self._batch_errors = []
+        self._batch_stats = None
+        self._loaded_snapshot = None
+        self._nfo_path_index = {}
+        self._tree_item_index = {}
+
+        # 事件驱动刷新状态：
+        # 定时器只用于合并短时间内的重复事件，不再周期性扫描整个媒体库。
+        self._active_operations = set()
+        self._pending_library_events = {}
+        self._full_reconcile_required = False
+        self._full_reconcile_reason = ""
+        self._path_redirects = []
+        self._refresh_pending = False
+        self._rename_tool = None
 
         # 缓存 & 异步加载
         self.nfo_cache = NFOCache()
@@ -941,7 +1145,7 @@ class NFOEditorQt6(NFOEditorQt):
         self.btn_open_dir.clicked.connect(self.open_selected_folder)
         self.btn_play_video.clicked.connect(self.open_selected_video)
         self.btn_unify_actor.clicked.connect(self.open_batch_rename_tool)
-        self.btn_refresh.clicked.connect(lambda: self.load_files_in_folder())
+        self.btn_refresh.clicked.connect(self.request_full_refresh)
         self.btn_photo_wall.clicked.connect(self.show_photo_wall)
         self.btn_move.clicked.connect(self.start_move_thread)
         self.btn_settings.clicked.connect(self.open_settings)
@@ -1019,7 +1223,7 @@ class NFOEditorQt6(NFOEditorQt):
         return super().eventFilter(obj, event)
 
     def setup_shortcuts(self):
-        QShortcut(QKeySequence("F5"), self, self.load_files_in_folder)
+        QShortcut(QKeySequence("F5"), self, self.request_full_refresh)
         QShortcut(QKeySequence("Ctrl+Right"), self, self.start_move_thread)
         # 跨线程预告片信号
         self._trailer_play_signal.connect(self._play_online_trailer)
@@ -1088,12 +1292,26 @@ class NFOEditorQt6(NFOEditorQt):
     # ================================================================
 
     def set_nfo_folder(self, folder_path):
-        self.folder_path = os.path.normpath(folder_path)
+        folder_path = os.path.normpath(folder_path)
+        changing_folder = bool(
+            self.folder_path and not same_path(folder_path, self.folder_path)
+        )
+        if changing_folder and not self._confirm_unsaved_changes("切换目录"):
+            return False
+        if changing_folder:
+            self._clear_current_editor_state()
+        self.folder_path = folder_path
         settings = QSettings("NFOEditor", "Directories")
         settings.setValue("last_nfo_dir", self.folder_path)
         self._clear_file_watches()
         self._set_event_file_for_folder(self.folder_path)
         self.load_files_in_folder()
+        return True
+
+    def request_full_refresh(self):
+        """User-requested full scan, guarded against losing unsaved edits."""
+        if self._confirm_unsaved_changes("刷新列表"):
+            self.load_files_in_folder(auto_select=False)
 
     def open_folder(self):
         settings = QSettings("NFOEditor", "Directories")
@@ -1143,17 +1361,36 @@ class NFOEditorQt6(NFOEditorQt):
         if hasattr(self, "filter_entry") and self.filter_entry is not None:
             self.filter_entry.setEnabled(not busy)
 
+
     def _set_moving_busy(self, busy: bool):
-        """移动线程运行期间禁用移动相关按钮，防止目标路径/列表在移动中被改动。"""
-        for name in ("btn_move", "btn_open_folder", "btn_refresh", "btn_select_target"):
+        """移动或批量改名期间锁定会写磁盘/切换根目录的控件。"""
+        for name in (
+            "btn_move",
+            "btn_open_folder",
+            "btn_refresh",
+            "btn_select_target",
+            "btn_save",
+            "btn_batch_fill",
+            "btn_batch_add",
+            "btn_unify_actor",
+        ):
             btn = getattr(self, name, None)
             if btn is not None:
                 btn.setEnabled(not busy)
+        if getattr(self, "file_tree", None) is not None:
+            self.file_tree.setEnabled(not busy)
         if getattr(self, "sorted_tree", None) is not None:
             self.sorted_tree.setEnabled(not busy)
 
     def load_files_in_folder(self, auto_select=True, show_progress=True):
         if not self.folder_path:
+            return
+        if self._active_operations:
+            self._request_full_reconcile("文件操作完成后执行用户请求的列表校验")
+            self.status_bar.showMessage(
+                "当前正在修改文件，完整刷新已推迟到操作完成后",
+                4000,
+            )
             return
 
         # 防重复启动: 若已有加载线程在跑, 先停掉再重开(下方已 stop+wait),
@@ -1176,10 +1413,13 @@ class NFOEditorQt6(NFOEditorQt):
                 pass
             self.load_thread.wait()
 
-        self._last_selected_item = None
+        self._clear_current_editor_state()
         self.file_tree.clear()
         self.nfo_files = []
         self.nfo_cache.clear()
+        self._nfo_path_index.clear()
+        self._tree_item_index.clear()
+        self._loaded_snapshot = None
 
         self._show_progress = show_progress
         if show_progress:
@@ -1209,12 +1449,18 @@ class NFOEditorQt6(NFOEditorQt):
 
     def _on_batch_ready(self, batch):
         items = []
+        paths = []
         for nfo_path, first, second, nfo_name, cache_data in batch:
-            items.append(QTreeWidgetItem([first, second, nfo_name]))
+            item = QTreeWidgetItem([first, second, nfo_name])
+            items.append(item)
+            paths.append(nfo_path)
             self.nfo_cache.set(nfo_path, cache_data)
             self.nfo_files.append(nfo_path)
+            self._nfo_path_index[self._event_path_key(nfo_path)] = nfo_path
         if items:
             self.file_tree.addTopLevelItems(items)
+            for nfo_path, item in zip(paths, items):
+                self._tree_item_index[self._event_path_key(nfo_path)] = item
 
     def _on_load_finished(self, count, auto_select, selection_path, parsed_count=0):
         if self._show_progress:
@@ -1225,10 +1471,15 @@ class NFOEditorQt6(NFOEditorQt):
         failed_count = max(count - loaded_count, 0)
         total_folders = len(set(os.path.dirname(f) for f in self.nfo_files))
         cache_hits = max(loaded_count - parsed_count, 0)
+        stale_count = sum(
+            1 for path in self.nfo_files
+            if (self.nfo_cache.get(path) or {}).get("stale")
+        )
         failure_text = f"，失败 {failed_count} 个" if failed_count else ""
+        stale_text = f"，临时使用旧索引 {stale_count} 个" if stale_count else ""
         self.status_bar.showMessage(
             f"加载完成: 成功 {loaded_count}/{count} 个NFO ({total_folders} 个文件夹)，"
-            f"本次解析 {parsed_count} 个，缓存命中 {cache_hits} 个{failure_text} - "
+            f"本次解析 {parsed_count} 个，缓存命中 {cache_hits} 个{stale_text}{failure_text} - "
             f"目录: {self.folder_path}"
         )
 
@@ -1248,6 +1499,8 @@ class NFOEditorQt6(NFOEditorQt):
             self.load_thread = None
 
         self._set_loading_busy(False)
+        if self._pending_library_events or self._full_reconcile_required:
+            QTimer.singleShot(0, self._process_pending_library_events)
 
     def _restore_selection(self, target_path):
         for i in range(self.file_tree.topLevelItemCount()):
@@ -1259,7 +1512,7 @@ class NFOEditorQt6(NFOEditorQt):
                     if values[1]
                     else os.path.join(self.folder_path, values[0], values[2])
                 )
-                if os.path.normpath(item_path) == os.path.normpath(target_path):
+                if same_path(item_path, target_path):
                     self.file_tree.setCurrentItem(item)
                     self.file_tree.scrollToItem(item)
                     return
@@ -1308,28 +1561,581 @@ class NFOEditorQt6(NFOEditorQt):
             except RuntimeError:
                 pass
 
+
     def _set_event_file_for_folder(self, folder_path):
-        self._event_file_path = os.path.join(folder_path, ".nfo_editor_events.jsonl")
+        self._event_file_path = os.path.join(
+            folder_path, ".nfo_editor_events.jsonl"
+        )
+        self._event_partial_line = ""
         try:
-            self._event_file_offset = os.path.getsize(self._event_file_path)
+            self._event_file_offset = os.path.getsize(
+                self._event_file_path
+            )
         except OSError:
             self._event_file_offset = 0
 
-    def _poll_external_events(self):
-        if not self._event_file_path or not os.path.exists(self._event_file_path):
+
+    def _begin_operation(self, name):
+        """登记一个会修改文件系统的内部操作，并暂停事件消费。"""
+        if not name:
             return
+        self._active_operations.add(str(name))
+        self.reload_timer.stop()
+
+    def _end_operation(self, name):
+        """结束内部操作；所有嵌套操作结束后再合并处理事件。"""
+        if name:
+            self._active_operations.discard(str(name))
+        if not self._active_operations and (
+            self._pending_library_events or self._full_reconcile_required
+        ):
+            QTimer.singleShot(0, self._process_pending_library_events)
+
+    def _normalize_event_path(self, path):
+        if not path:
+            return ""
+        path = os.path.expandvars(os.path.expanduser(os.fspath(path)))
+        if not os.path.isabs(path) and self.folder_path:
+            path = os.path.join(self.folder_path, path)
+        return os.path.normpath(os.path.abspath(path))
+
+    @staticmethod
+    def _event_path_key(path):
+        if not path:
+            return ""
+        return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+
+
+    def _register_path_redirect(self, old_path, new_path):
+        old_path = self._normalize_event_path(old_path)
+        new_path = self._normalize_event_path(new_path)
+        if not old_path or not new_path or same_path(old_path, new_path):
+            return
+
+        now = time.monotonic()
+        old_key = self._event_path_key(old_path)
+        self._path_redirects = [
+            entry for entry in self._path_redirects
+            if entry[2] > now and self._event_path_key(entry[0]) != old_key
+        ]
+        # 路径映射仅用于处理同一批延迟事件，避免未来重新创建同名目录时被误重定向。
+        self._path_redirects.append((old_path, new_path, now + 15.0))
+        self._path_redirects = self._path_redirects[-64:]
+
+
+
+    def _redirect_event_path(self, path):
+        """把同一批事件中的旧路径映射到重命名/移动后的新路径。"""
+        result = self._normalize_event_path(path)
+        if not result:
+            return ""
+
+        now = time.monotonic()
+        self._path_redirects = [
+            entry for entry in self._path_redirects if entry[2] > now
+        ]
+        redirects = sorted(
+            self._path_redirects,
+            key=lambda entry: len(Path(entry[0]).parts),
+            reverse=True,
+        )
+
+        for _ in range(8):
+            redirected = False
+            for old_path, new_path, _expires_at in redirects:
+                try:
+                    if same_path(result, old_path):
+                        result = new_path
+                        redirected = True
+                        break
+                    if is_path_within(result, old_path, include_equal=False):
+                        relative = os.path.relpath(result, old_path)
+                        result = os.path.normpath(
+                            os.path.join(new_path, relative)
+                        )
+                        redirected = True
+                        break
+                except (OSError, ValueError):
+                    continue
+            if not redirected:
+                break
+        return result
+
+    def _queue_library_event(self, event_type, path="", old_path="", **extra):
+        """合并文件系统事件。定时器只做防抖，不再直接全量扫描。"""
+        event_type = (event_type or "").strip()
+        if not event_type:
+            return
+
+        path = self._normalize_event_path(path)
+        old_path = self._normalize_event_path(old_path)
+
+        if event_type in {"folder_renamed", "folder_moved"} and old_path and path:
+            self._register_path_redirect(old_path, path)
+
+        key_path = old_path if event_type in {
+            "folder_renamed", "folder_moved", "folder_deleted"
+        } else path
+        key = (event_type, self._event_path_key(key_path))
+        event = {
+            "type": event_type,
+            "path": path,
+            "old_path": old_path,
+        }
+        event.update(extra)
+        self._pending_library_events[key] = event
+
+        if not self._active_operations:
+            self.reload_timer.start(300)
+
+    def _request_full_reconcile(self, reason):
+        """仅在无法精确定位变化时，安排一次兜底全量校验。"""
+        self._full_reconcile_required = True
+        if reason:
+            self._full_reconcile_reason = str(reason)
+        self.library_dirty = True
+        if not self._active_operations:
+            self.reload_timer.start(500)
+
+    def _rebuild_path_indexes(self):
+        self._nfo_path_index = {
+            self._event_path_key(path): path for path in self.nfo_files
+        }
+        self._tree_item_index = {}
+        for index in range(self.file_tree.topLevelItemCount()):
+            item = self.file_tree.topLevelItem(index)
+            path = self._nfo_path_from_item(item)
+            if path:
+                self._tree_item_index[self._event_path_key(path)] = item
+
+    def _known_nfo_path(self, path):
+        key = self._event_path_key(path)
+        known = self._nfo_path_index.get(key)
+        if known:
+            return known
+        for known_path in self.nfo_files:
+            if same_path(known_path, path):
+                self._nfo_path_index[key] = known_path
+                return known_path
+        return None
+
+    def _find_tree_item_by_nfo_path(self, nfo_path):
+        key = self._event_path_key(nfo_path)
+        item = self._tree_item_index.get(key)
+        if item is not None:
+            return item
+        for index in range(self.file_tree.topLevelItemCount()):
+            item = self.file_tree.topLevelItem(index)
+            item_path = self._nfo_path_from_item(item)
+            if item_path and same_path(item_path, nfo_path):
+                self._tree_item_index[key] = item
+                return item
+        return None
+
+    def _insert_nfo_tree_item(self, nfo_path):
+        if self._find_tree_item_by_nfo_path(nfo_path) is not None:
+            return
+        values = self._path_to_tree_values(nfo_path)
+        sort_key = tuple(value.casefold() for value in values)
+        insert_at = self.file_tree.topLevelItemCount()
+        for index in range(self.file_tree.topLevelItemCount()):
+            item = self.file_tree.topLevelItem(index)
+            current_key = tuple(item.text(i).casefold() for i in range(3))
+            if sort_key < current_key:
+                insert_at = index
+                break
+        item = QTreeWidgetItem(values)
+        self.file_tree.insertTopLevelItem(insert_at, item)
+        key = self._event_path_key(nfo_path)
+        self._nfo_path_index[key] = nfo_path
+        self._tree_item_index[key] = item
+
+    def _clear_current_editor_state(self):
+        self.current_file_path = None
+        self._last_selected_item = None
+        self._loaded_snapshot = None
+        self._clear_file_watches()
+        self.clear_images()
+        for entry in self.fields_entries.values():
+            if isinstance(entry, QTextEdit):
+                entry.clear()
+            elif isinstance(entry, QLabel):
+                entry.setText("")
+        self.release_label.setText("")
+        self.save_time_label.setText("")
+
+    def _refresh_single_nfo(self, nfo_path, *, reload_current=True):
+        """重新解析一个 NFO，并只更新对应缓存/树行。"""
+        nfo_path = self._redirect_event_path(nfo_path)
+        if (
+            not nfo_path
+            or not os.path.isfile(nfo_path)
+            or not self.folder_path
+            or not is_path_within(nfo_path, self.folder_path, include_equal=False)
+        ):
+            return False
+
+        cache_data = parse_single_nfo(nfo_path)
+        if not cache_data:
+            return False
+
+        known_path = self._known_nfo_path(nfo_path)
+        tree_was_full = self.file_tree.topLevelItemCount() == len(self.nfo_files)
+
+        if known_path and known_path != nfo_path:
+            try:
+                index = self.nfo_files.index(known_path)
+                self.nfo_files[index] = nfo_path
+            except ValueError:
+                pass
+            self.nfo_cache.remove(known_path)
+            self._nfo_path_index.pop(self._event_path_key(known_path), None)
+            old_item = self._tree_item_index.pop(
+                self._event_path_key(known_path), None
+            )
+            if old_item is not None:
+                self._tree_item_index[self._event_path_key(nfo_path)] = old_item
+        elif not known_path:
+            self.nfo_files.append(nfo_path)
+            if tree_was_full:
+                self._insert_nfo_tree_item(nfo_path)
+
+        cache_data["path"] = nfo_path
+        self.nfo_cache.set(nfo_path, cache_data)
+        self._nfo_path_index[self._event_path_key(nfo_path)] = nfo_path
+
+        if reload_current and self._same_path(nfo_path, self.current_file_path):
+            # 外部修改不能静默覆盖用户尚未保存的输入。
+            if self.has_unsaved_changes():
+                self.status_bar.showMessage(
+                    "当前 NFO 已被外部修改；请先保存或重新选择该项目以载入新内容",
+                    6000,
+                )
+            else:
+                self.load_nfo_fields()
+                if self.show_images_checkbox.isChecked():
+                    self.display_image()
+        return True
+
+    def _remove_folder_from_library(self, folder_path):
+        """从内存模型和当前树中移除一个目录下的所有 NFO。"""
+        folder_path = self._normalize_event_path(folder_path)
+        if not folder_path:
+            return 0
+
+        affected = [
+            path for path in self.nfo_files
+            if same_path(path, folder_path)
+            or is_path_within(path, folder_path, include_equal=False)
+        ]
+        if not affected:
+            return 0
+
+        affected_keys = {self._event_path_key(path) for path in affected}
+        current_removed = bool(
+            self.current_file_path
+            and (
+                same_path(self.current_file_path, folder_path)
+                or is_path_within(
+                    self.current_file_path, folder_path, include_equal=False
+                )
+            )
+        )
+
+        blocker = QSignalBlocker(self.file_tree)
+        for index in range(self.file_tree.topLevelItemCount() - 1, -1, -1):
+            item = self.file_tree.topLevelItem(index)
+            item_path = self._nfo_path_from_item(item)
+            if item_path and self._event_path_key(item_path) in affected_keys:
+                self.file_tree.takeTopLevelItem(index)
+        del blocker
+
+        for path in affected:
+            self.nfo_cache.remove(path)
+        self.nfo_files = [
+            path for path in self.nfo_files
+            if self._event_path_key(path) not in affected_keys
+        ]
+        self._rebuild_path_indexes()
+
+        if current_removed:
+            self._clear_current_editor_state()
+            if self.file_tree.topLevelItemCount() > 0:
+                first_item = self.file_tree.topLevelItem(0)
+                QTimer.singleShot(0, lambda item=first_item: self.file_tree.setCurrentItem(item))
+        return len(affected)
+
+    def _remap_folder_in_library(self, old_folder, new_folder):
+        """目录改名时原地改写路径、缓存键和树行，不重新扫描媒体库。"""
+        old_folder = self._normalize_event_path(old_folder)
+        new_folder = self._normalize_event_path(new_folder)
+        if not old_folder or not new_folder:
+            return 0
+
+        remapped = []
+        for old_nfo in list(self.nfo_files):
+            if not (
+                same_path(old_nfo, old_folder)
+                or is_path_within(old_nfo, old_folder, include_equal=False)
+            ):
+                continue
+            try:
+                relative = os.path.relpath(old_nfo, old_folder)
+            except ValueError:
+                continue
+            new_nfo = os.path.normpath(os.path.join(new_folder, relative))
+            item = self._find_tree_item_by_nfo_path(old_nfo)
+            data = self.nfo_cache.get(old_nfo)
+            self.nfo_cache.remove(old_nfo)
+            if data:
+                data = dict(data)
+                data["path"] = new_nfo
+                self.nfo_cache.set(new_nfo, data)
+            if item is not None:
+                values = self._path_to_tree_values(new_nfo)
+                for column, value in enumerate(values):
+                    item.setText(column, value)
+            remapped.append((old_nfo, new_nfo))
+
+        if not remapped:
+            return 0
+
+        mapping = {
+            self._event_path_key(old): new for old, new in remapped
+        }
+        self.nfo_files = [
+            mapping.get(self._event_path_key(path), path)
+            for path in self.nfo_files
+        ]
+
+        if self.current_file_path:
+            current_key = self._event_path_key(self.current_file_path)
+            if current_key in mapping:
+                self.current_file_path = mapping[current_key]
+                self._watch_current_item()
+        self._rebuild_path_indexes()
+        return len(remapped)
+
+    def _scan_folder_into_library(self, folder_path):
+        """只扫描新增目录，而不是重新扫描整个根目录。"""
+        folder_path = self._normalize_event_path(folder_path)
+        if (
+            not folder_path
+            or not os.path.isdir(folder_path)
+            or not self.folder_path
+            or not is_path_within(folder_path, self.folder_path, include_equal=True)
+        ):
+            return 0
+
+        added = 0
+        for root, dirs, files in os.walk(folder_path):
+            dirs.sort(key=str.casefold)
+            for filename in sorted(files, key=str.casefold):
+                if not filename.lower().endswith(".nfo"):
+                    continue
+                nfo_path = os.path.join(root, filename)
+                was_known = self._known_nfo_path(nfo_path) is not None
+                if self._refresh_single_nfo(nfo_path, reload_current=False) and not was_known:
+                    added += 1
+        return added
+
+    def _remove_target_folder_item(self, folder_path):
+        if not self.current_target_path:
+            return
+        folder_path = self._normalize_event_path(folder_path)
+        if not same_path(os.path.dirname(folder_path), self.current_target_path):
+            return
+        name = os.path.basename(folder_path)
+        for index in range(self.sorted_tree.topLevelItemCount() - 1, -1, -1):
+            item = self.sorted_tree.topLevelItem(index)
+            if item.text(0) == name:
+                self.sorted_tree.takeTopLevelItem(index)
+
+    def _append_target_folder(self, folder_path):
+        if not self.current_target_path:
+            return
+        folder_path = self._normalize_event_path(folder_path)
+        if not same_path(os.path.dirname(folder_path), self.current_target_path):
+            return
+        name = os.path.basename(folder_path)
+        if not name:
+            return
+        for index in range(self.sorted_tree.topLevelItemCount()):
+            if self.sorted_tree.topLevelItem(index).text(0) == name:
+                return
+        if self._target_dir_icon is None:
+            self._target_dir_icon = self.style().standardIcon(
+                QStyle.StandardPixmap.SP_DirIcon
+            )
+        item = QTreeWidgetItem([name])
+        item.setIcon(0, self._target_dir_icon)
+        self.sorted_tree.addTopLevelItem(item)
+        self.sorted_tree.sortItems(0, Qt.AscendingOrder)
+
+    def _apply_folder_path_change(self, old_path, new_path, event_type):
+        old_path = self._normalize_event_path(old_path)
+        new_path = self._normalize_event_path(new_path)
+        if not old_path or not new_path:
+            self._request_full_reconcile(f"{event_type} 事件缺少旧路径或新路径")
+            return
+
+        old_in_library = bool(
+            self.folder_path
+            and is_path_within(old_path, self.folder_path, include_equal=True)
+        )
+        new_in_library = bool(
+            self.folder_path
+            and is_path_within(new_path, self.folder_path, include_equal=True)
+        )
+
+        if old_in_library and new_in_library:
+            self._remap_folder_in_library(old_path, new_path)
+        elif old_in_library:
+            self._remove_folder_from_library(old_path)
+        elif new_in_library:
+            self._scan_folder_into_library(new_path)
+
+        self._remove_target_folder_item(old_path)
+        self._append_target_folder(new_path)
+
+    def _process_pending_library_events(self):
+        """消费合并后的事件；只有无法精确处理时才执行全量校验。"""
+        load_busy = self.load_thread is not None and self.load_thread.isRunning()
+        move_busy = self.move_thread is not None and self.move_thread.isRunning()
+        if self._active_operations or load_busy or move_busy:
+            self._refresh_pending = True
+            return
+
+        self.reload_timer.stop()
+        self._refresh_pending = False
+        events = list(self._pending_library_events.values())
+        self._pending_library_events.clear()
+
+        priority = {
+            "folder_deleted": 0,
+            "folder_renamed": 1,
+            "folder_moved": 1,
+            "folder_added": 2,
+            "nfo_changed": 3,
+            "image_changed": 4,
+            "directory_changed": 5,
+            "full_reconcile": 9,
+        }
+        events.sort(key=lambda event: priority.get(event.get("type"), 8))
+
+        local_updates = 0
+        for event in events:
+            event_type = event.get("type", "")
+            path = event.get("path", "")
+            old_path = event.get("old_path", "")
+
+            if event_type == "folder_deleted":
+                local_updates += self._remove_folder_from_library(path or old_path)
+            elif event_type in {"folder_renamed", "folder_moved"}:
+                self._apply_folder_path_change(old_path, path, event_type)
+                local_updates += 1
+            elif event_type == "folder_added":
+                local_updates += self._scan_folder_into_library(
+                    self._redirect_event_path(path)
+                )
+            elif event_type == "nfo_changed":
+                if self._refresh_single_nfo(
+                    self._redirect_event_path(path),
+                    reload_current=event.get("reload_current", True),
+                ):
+                    local_updates += 1
+            elif event_type == "image_changed":
+                event_path = self._redirect_event_path(path)
+                current_dir = (
+                    os.path.dirname(self.current_file_path)
+                    if self.current_file_path else ""
+                )
+                event_dir = (
+                    event_path if os.path.isdir(event_path)
+                    else os.path.dirname(event_path)
+                )
+                if (
+                    current_dir
+                    and self._same_path(event_dir, current_dir)
+                    and self.show_images_checkbox.isChecked()
+                ):
+                    self.display_image()
+                    local_updates += 1
+            elif event_type == "directory_changed":
+                current_dir = (
+                    os.path.dirname(self.current_file_path)
+                    if self.current_file_path else ""
+                )
+                if current_dir and self._same_path(path, current_dir):
+                    if not os.path.isdir(current_dir) or not os.path.isfile(
+                        self.current_file_path
+                    ):
+                        self._request_full_reconcile(
+                            "当前目录在未知外部操作中消失或 NFO 被删除"
+                        )
+                    elif self.show_images_checkbox.isChecked():
+                        self.display_image()
+                    self._watch_current_item()
+            elif event_type in {"full_reconcile", "library_dirty", "refresh_list"}:
+                self._request_full_reconcile(
+                    event.get("reason") or "收到无法精确定位的外部变化"
+                )
+
+        if self._full_reconcile_required:
+            self.reload_timer.stop()
+            reason = self._full_reconcile_reason or "文件列表需要校验"
+            self._full_reconcile_required = False
+            self._full_reconcile_reason = ""
+            self.library_dirty = False
+            self.status_bar.showMessage(f"{reason}，正在执行一次完整校验...", 5000)
+            if self.folder_path:
+                self.load_files_in_folder(auto_select=False, show_progress=False)
+            return
+
+        self.library_dirty = False
+        if local_updates:
+            self.status_bar.showMessage(
+                f"已局部同步 {local_updates} 项变化，无需扫描整个目录",
+                4000,
+            )
+
+
+    def _poll_external_events(self):
+        """增量读取外部事件文件，并保留尚未写完的最后一行。"""
+        if not self._event_file_path or not os.path.exists(
+            self._event_file_path
+        ):
+            return
+
         try:
             size = os.path.getsize(self._event_file_path)
             if size < self._event_file_offset:
                 self._event_file_offset = 0
+                self._event_partial_line = ""
             if size == self._event_file_offset:
                 return
-            with open(self._event_file_path, "r", encoding="utf-8") as f:
-                f.seek(self._event_file_offset)
-                lines = f.readlines()
-                self._event_file_offset = f.tell()
+
+            with open(
+                self._event_file_path, "r", encoding="utf-8"
+            ) as handle:
+                handle.seek(self._event_file_offset)
+                chunk = handle.read()
+                self._event_file_offset = handle.tell()
         except OSError:
             return
+
+        buffer = self._event_partial_line + chunk
+        if buffer and not buffer.endswith(("\n", "\r")):
+            completed, separator, partial = buffer.rpartition("\n")
+            if separator:
+                lines = completed.splitlines()
+                self._event_partial_line = partial
+            else:
+                self._event_partial_line = buffer
+                lines = []
+        else:
+            lines = buffer.splitlines()
+            self._event_partial_line = ""
 
         for line in lines:
             line = line.strip()
@@ -1341,64 +2147,88 @@ class NFOEditorQt6(NFOEditorQt):
                 continue
             self._handle_external_event(event)
 
+
     def _handle_external_event(self, event):
-        event_type = event.get("type", "")
+        """接收独立外部程序写入的结构化事件。"""
+        event_type = (event.get("type") or "").strip()
         event_path = event.get("path", "")
-        if event_path and not os.path.isabs(event_path) and self.folder_path:
-            event_path = os.path.join(self.folder_path, event_path)
+        old_path = event.get("old_path", "")
 
         if event_type == "task_started":
-            self.status_bar.showMessage(event.get("message", "外部组件正在处理..."), 5000)
+            self.status_bar.showMessage(
+                event.get("message", "外部组件正在处理..."), 5000
+            )
             return
+
         if event_type == "task_finished":
-            self.status_bar.showMessage(event.get("message", "外部组件处理完成"), 5000)
+            self.status_bar.showMessage(
+                event.get("message", "外部组件处理完成"), 5000
+            )
+            if self._pending_library_events:
+                self.reload_timer.start(150)
             return
 
         if event_type == "nfo_changed" and event_path:
-            cache_data = parse_single_nfo(event_path)
-            if cache_data:
-                self.nfo_cache.set(event_path, cache_data)
-                if event_path not in self.nfo_files:
-                    self.library_dirty = True
-                    self.reload_timer.start(800)
-            if self._same_path(event_path, self.current_file_path):
-                self.load_nfo_fields()
+            self._queue_library_event("nfo_changed", event_path)
             return
 
         if event_type == "image_changed" and event_path:
-            current_dir = os.path.dirname(self.current_file_path) if self.current_file_path else ""
-            event_dir = event_path if os.path.isdir(event_path) else os.path.dirname(event_path)
-            if self._same_path(event_dir, current_dir) and self.show_images_checkbox.isChecked():
-                self.display_image()
+            self._queue_library_event("image_changed", event_path)
             return
 
-        if event_type in {"folder_moved", "folder_deleted", "library_dirty", "refresh_list"}:
-            self.library_dirty = True
-            self.reload_timer.start(1000)
-            self.status_bar.showMessage("检测到外部组件修改列表，稍后执行增量刷新", 5000)
+        if event_type in {"folder_renamed", "folder_moved"}:
+            if old_path and event_path:
+                self._queue_library_event(
+                    event_type, event_path, old_path=old_path
+                )
+            else:
+                self._request_full_reconcile(
+                    f"{event_type} 事件没有同时提供 old_path 和 path"
+                )
+            return
+
+        if event_type == "folder_deleted":
+            deleted_path = event_path or old_path
+            if deleted_path:
+                self._queue_library_event("folder_deleted", deleted_path)
+            else:
+                self._request_full_reconcile("folder_deleted 事件缺少路径")
+            return
+
+        if event_type == "folder_added" and event_path:
+            self._queue_library_event("folder_added", event_path)
+            return
+
+        if event_type in {"library_dirty", "refresh_list", "full_reconcile"}:
+            self._request_full_reconcile(
+                event.get("reason") or "外部组件无法提供精确变更路径"
+            )
+
 
     def on_file_changed(self, path):
+        # 内部保存、批量改名等操作会主动提交精确事件；
+        # 此时忽略 QFileSystemWatcher 的重复通知。
+        if self._active_operations:
+            QTimer.singleShot(100, self._watch_current_item)
+            return
         if self._same_path(path, self.current_file_path):
-            cache_data = parse_single_nfo(path)
-            if cache_data:
-                self.nfo_cache.set(path, cache_data)
-            self.load_nfo_fields()
-            self.status_bar.showMessage("当前 NFO 已刷新", 3000)
+            self._queue_library_event("nfo_changed", path)
+            self.status_bar.showMessage("检测到当前 NFO 外部修改", 3000)
+            QTimer.singleShot(100, self._watch_current_item)
 
-            # 某些编辑器会以“删除旧文件 + 新建文件”的方式保存, QFileSystemWatcher 会丢失 watch。
-            self._watch_current_item()
 
     def on_directory_changed(self, path):
-        current_dir = os.path.dirname(self.current_file_path) if self.current_file_path else ""
-        if self._same_path(path, current_dir):
-            if self.show_images_checkbox.isChecked():
-                self.display_image()
-            self.status_bar.showMessage("当前文件夹图片已刷新", 3000)
-            self._watch_current_item()
+        # 这里只监控当前影片文件夹；目录事件优先解释为图片变化。
+        # 只有当前目录或 NFO 真正消失时，才请求一次完整校验。
+        if self._active_operations:
+            QTimer.singleShot(100, self._watch_current_item)
+            return
+        self._queue_library_event("directory_changed", path)
+
 
     def _delayed_reload(self):
-        if self.folder_path:
-            self.load_files_in_folder(auto_select=False, show_progress=False)
+        # 定时器仅负责合并事件，不再无条件调用 load_files_in_folder()。
+        self._process_pending_library_events()
 
     # ================================================================
     #  文件选中
@@ -1447,22 +2277,25 @@ class NFOEditorQt6(NFOEditorQt):
             return
 
         previous_item = self._last_selected_item
-        if self.current_file_path and self.has_unsaved_changes():
-            reply = QMessageBox.question(
-                self, "保存更改", "当前有未保存的更改，是否保存？",
-                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-            )
-            if reply == QMessageBox.Cancel:
-                self._restore_tree_selection(previous_item)
-                return
-            if reply == QMessageBox.Yes and not self.save_changes():
-                self._restore_tree_selection(previous_item)
-                return
+        if not self._confirm_unsaved_changes("切换文件"):
+            self._restore_tree_selection(previous_item)
+            return
 
         if not os.path.exists(new_path):
             self.file_tree.takeTopLevelItem(self.file_tree.indexOfTopLevelItem(item))
+            known = self._known_nfo_path(new_path)
+            if known:
+                try:
+                    self.nfo_files.remove(known)
+                except ValueError:
+                    pass
+                self.nfo_cache.remove(known)
+            key = self._event_path_key(new_path)
+            self._nfo_path_index.pop(key, None)
+            self._tree_item_index.pop(key, None)
             self.current_file_path = None
             self._last_selected_item = None
+            self._loaded_snapshot = None
             self._watch_current_item()
             return
 
@@ -1473,6 +2306,43 @@ class NFOEditorQt6(NFOEditorQt):
         if self.show_images_checkbox.isChecked():
             self.display_image()
 
+    @staticmethod
+    def _snapshot_from_root(root):
+        def text_of(tag):
+            elem = root.find(tag)
+            return (elem.text or "").strip() if elem is not None else ""
+
+        return {
+            "title": text_of("title"),
+            "plot": text_of("plot"),
+            "series": read_series_text(root),
+            "rating": text_of("rating"),
+            "actors": [
+                (actor.findtext("name") or "").strip()
+                for actor in root.findall("actor")
+                if (actor.findtext("name") or "").strip()
+            ],
+            "tags": [
+                (tag.text or "").strip()
+                for tag in root.findall("tag")
+                if (tag.text or "").strip()
+            ],
+        }
+
+    def _capture_editor_snapshot(self):
+        return {
+            "title": self.fields_entries["title"].toPlainText().strip(),
+            "plot": self.fields_entries["plot"].toPlainText().strip(),
+            "series": self.fields_entries["series"].toPlainText().strip(),
+            "rating": self.fields_entries["rating"].toPlainText().strip(),
+            "actors": split_csv_values(
+                self.fields_entries["actors"].toPlainText()
+            ),
+            "tags": split_csv_values(
+                self.fields_entries["tags"].toPlainText()
+            ),
+        }
+
     def load_nfo_fields(self):
         for entry in self.fields_entries.values():
             if isinstance(entry, QTextEdit):
@@ -1480,50 +2350,68 @@ class NFOEditorQt6(NFOEditorQt):
             elif isinstance(entry, QLabel):
                 entry.setText("")
 
+        if not self.current_file_path:
+            self._loaded_snapshot = None
+            return
+
         try:
             tree = parse_xml_file(self.current_file_path)
             root = tree.getroot()
 
-            for field in ["title", "plot", "series", "rating", "num"]:
+            for field in ("title", "plot", "rating", "num"):
                 elem = root.find(field)
-                if elem is not None and elem.text:
-                    widget = self.fields_entries.get(field)
-                    if widget:
-                        if isinstance(widget, QLabel):
-                            widget.setText(elem.text)
-                        else:
-                            widget.setPlainText(elem.text)
+                value = (elem.text or "").strip() if elem is not None else ""
+                widget = self.fields_entries.get(field)
+                if widget:
+                    if isinstance(widget, QLabel):
+                        widget.setText(value)
+                    else:
+                        widget.setPlainText(value)
+            self.fields_entries["series"].setPlainText(read_series_text(root))
 
             actors = [
-                actor.find("name").text.strip()
+                (actor.findtext("name") or "").strip()
                 for actor in root.findall("actor")
-                if actor.find("name") is not None and actor.find("name").text
+                if (actor.findtext("name") or "").strip()
             ]
             self.fields_entries["actors"].setPlainText(", ".join(actors))
 
             tags = [
-                tag.text.strip() for tag in root.findall("tag")
-                if tag is not None and tag.text
+                (tag.text or "").strip()
+                for tag in root.findall("tag")
+                if (tag.text or "").strip()
             ]
             self.fields_entries["tags"].setPlainText(", ".join(tags))
 
             release_elem = root.find("release")
-            if release_elem is not None and release_elem.text:
-                self.release_label.setText(release_elem.text.strip())
-            else:
-                self.release_label.setText("")
-        except (ET.ParseError, OSError) as e:
-            QMessageBox.critical(self, "错误", f"加载NFO文件失败: {str(e)}")
+            self.release_label.setText(
+                (release_elem.text or "").strip()
+                if release_elem is not None else ""
+            )
+            self._loaded_snapshot = self._snapshot_from_root(root)
+        except (ET.ParseError, OSError) as exc:
+            self._loaded_snapshot = None
+            QMessageBox.critical(self, "错误", f"加载NFO文件失败: {exc}")
 
     # ================================================================
     #  保存
     # ================================================================
 
+
     def save_changes(self):
         if not self.current_file_path:
             return False
+        if self._active_operations - {"save"}:
+            self.status_bar.showMessage(
+                "当前正在移动或重命名文件，暂不能保存 NFO",
+                4000,
+            )
+            return False
+
+        nfo_path = self.current_file_path
+        self._begin_operation("save")
         try:
-            tree = parse_xml_file(self.current_file_path)
+            tree = parse_xml_file(nfo_path)
             root = tree.getroot()
 
             title = self.fields_entries["title"].toPlainText().strip()
@@ -1534,12 +2422,14 @@ class NFOEditorQt6(NFOEditorQt):
             rating = self.fields_entries["rating"].toPlainText().strip()
 
             for field, value in {
-                "title": title, "plot": plot, "series": series, "rating": rating,
+                "title": title, "plot": plot, "rating": rating,
             }.items():
                 elem = root.find(field)
                 if elem is None:
                     elem = ET.SubElement(root, field)
                 elem.text = value
+
+            sync_series_nodes(root, series)
 
             critic_elem = root.find("criticrating")
             if rating:
@@ -1553,32 +2443,40 @@ class NFOEditorQt6(NFOEditorQt):
             elif critic_elem is not None:
                 root.remove(critic_elem)
 
-            # 只同步可编辑字段：保留匹配 actor 下的 role/thumb/type 等扩展信息，
-            # tag 与 genre 分离，普通保存不再覆盖 genre。
             sync_actor_nodes(root, actors)
             replace_text_nodes(root, "tag", tags)
 
             self._clear_file_watches()
-            write_xml_root_atomic(root, self.current_file_path)
+            write_xml_root_atomic(root, nfo_path)
 
-            cache_data = parse_single_nfo(self.current_file_path)
-            if cache_data:
-                self.nfo_cache.set(self.current_file_path, cache_data)
+            # 直接更新当前 NFO 的缓存，不触发整个目录扫描。
+            self._refresh_single_nfo(nfo_path, reload_current=False)
+            self._loaded_snapshot = self._capture_editor_snapshot()
 
-            self._watch_current_item()
             save_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.save_time_label.setText(f"保存时间: {save_time}")
+            self.status_bar.showMessage("NFO 已保存并局部更新", 3000)
             return True
         except (ET.ParseError, OSError, ValueError) as exc:
-            self._watch_current_item()
             QMessageBox.critical(self, "错误", f"保存NFO文件失败: {exc}")
             return False
+        finally:
+            self._watch_current_item()
+            self._end_operation("save")
 
     # ================================================================
     #  移动文件
     # ================================================================
 
+
     def start_move_thread(self):
+        if not self._confirm_unsaved_changes("移动文件夹"):
+            return
+        # 工具栏按钮被禁用时，Ctrl+Right 快捷键仍可能触发此方法。
+        if self.move_thread is not None and self.move_thread.isRunning():
+            self.status_bar.showMessage("文件移动正在进行，请勿重复操作", 3000)
+            return
+
         try:
             selected = self.file_tree.selectedItems()
             if not selected:
@@ -1609,17 +2507,22 @@ class NFOEditorQt6(NFOEditorQt):
                     self, "根目录保护",
                     "根目录中的 NFO 不能按文件夹移动，已自动跳过。",
                 )
-
             if not src_paths:
                 QMessageBox.warning(self, "警告", "没有有效的源文件夹可以移动")
                 return
 
             dest_path = os.path.normpath(self.current_target_path)
+            if not os.path.isdir(dest_path):
+                QMessageBox.critical(self, "错误", f"目标目录不存在: {dest_path}")
+                return
+
             invalid_moves = []
             valid_src_paths = []
             for src_path in src_paths:
                 try:
-                    common = os.path.commonpath([os.path.abspath(src_path), os.path.abspath(dest_path)])
+                    common = os.path.commonpath([
+                        os.path.abspath(src_path), os.path.abspath(dest_path)
+                    ])
                 except ValueError:
                     common = ""
                 if same_path(src_path, dest_path) or same_path(common, src_path):
@@ -1639,7 +2542,15 @@ class NFOEditorQt6(NFOEditorQt):
                 QMessageBox.warning(self, "警告", "没有有效的源文件夹可以移动")
                 return
 
+            self.reload_timer.stop()
+            self._target_reload_after_move = bool(
+                self.target_load_thread is not None
+                and self.target_load_thread.isRunning()
+            )
+            self._stop_target_load_thread()
             self._clear_file_watches()
+            self._move_error_messages = []
+            self._move_results = []
 
             if self.move_progress is not None:
                 try:
@@ -1649,14 +2560,14 @@ class NFOEditorQt6(NFOEditorQt):
                     pass
                 self.move_progress = None
 
-            self.move_progress = QProgressDialog("准备移动...", "取消", 0, len(src_paths), self)
+            self.move_progress = QProgressDialog(
+                "准备移动...", "取消", 0, len(src_paths), self
+            )
             self.move_progress.setWindowModality(Qt.WindowModal)
-            self.move_progress.setAutoClose(True)
-            self.move_progress.setAutoReset(True)
-
-            if self.move_thread is not None and self.move_thread.isRunning():
-                self.move_thread.stop()
-                self.move_thread.wait()
+            self.move_progress.setMinimumDuration(0)
+            self.move_progress.setAutoClose(False)
+            self.move_progress.setAutoReset(False)
+            self.move_progress.setValue(0)
 
             self.move_thread = FileOperationThread(
                 operation_type="move",
@@ -1665,56 +2576,139 @@ class NFOEditorQt6(NFOEditorQt):
             )
             self.move_thread.progress.connect(self.move_progress.setValue)
             self.move_thread.status.connect(self.move_progress.setLabelText)
-            self.move_thread.error.connect(
-                lambda msg: QMessageBox.critical(self, "错误", msg)
-            )
+            self.move_thread.error.connect(self._on_move_error)
+            self.move_thread.moved.connect(self._on_move_item_moved)
             self.move_thread.finished.connect(self.on_move_finished)
-            self.move_progress.canceled.connect(self.move_thread.stop)
+            self.move_progress.canceled.connect(self._cancel_move)
+
+            self._begin_operation("move")
             self._set_moving_busy(True)
             self.move_thread.start()
-        except OSError as e:
-            self._set_moving_busy(False)
+        except Exception as exc:
+            self._cleanup_move_objects()
+            self._end_operation("move")
             self._watch_current_item()
-            QMessageBox.critical(self, "错误", f"启动移动操作时出错: {str(e)}")
+            QMessageBox.critical(self, "错误", f"启动移动操作时出错: {exc}")
 
-    def on_move_finished(self):
-        self.reload_timer.stop()
-        current_was_moved = bool(
-            self.current_file_path and not os.path.exists(self.current_file_path)
+    @pyqtSlot(str)
+    def _on_move_error(self, message):
+        """在 GUI 线程记录工作线程错误，完成后统一显示。"""
+        self._move_error_messages.append(message)
+        self.status_bar.showMessage(message, 5000)
+
+
+    @pyqtSlot(str, str)
+    def _on_move_item_moved(self, old_path, new_path):
+        """记录单个成功移动结果，完成后由事件队列局部更新。"""
+        self._move_results.append((old_path, new_path))
+        self._queue_library_event(
+            "folder_moved", new_path, old_path=old_path
         )
-        if current_was_moved:
-            self.current_file_path = None
-            self._last_selected_item = None
-            self.clear_images()
-            for entry in self.fields_entries.values():
-                if isinstance(entry, QTextEdit):
-                    entry.clear()
-                elif isinstance(entry, QLabel):
-                    entry.setText("")
 
-        if self.move_progress is not None:
+    @pyqtSlot()
+    def _cancel_move(self):
+        thread = self.move_thread
+        if thread is not None and thread.isRunning():
+            thread.stop()
+            if self.move_progress is not None:
+                self.move_progress.setLabelText("正在取消，等待当前文件夹处理完成...")
+            self.status_bar.showMessage("正在取消文件移动...", 3000)
+
+
+    def _cleanup_move_objects(self):
+        """只清理移动相关 Qt 对象；可从成功、失败和启动异常路径重复调用。"""
+        progress = self.move_progress
+        self.move_progress = None
+        if progress is not None:
             try:
-                self.move_progress.canceled.disconnect()
+                progress.canceled.disconnect(self._cancel_move)
             except (RuntimeError, TypeError):
                 pass
             try:
-                self.move_progress.close()
-                self.move_progress.deleteLater()
+                progress.close()
+                progress.deleteLater()
             except RuntimeError:
                 pass
-            self.move_progress = None
 
-        # 先解除移动态, 再触发加载(加载会自行接管按钮禁用), 避免两套状态打架
+        thread = self.move_thread
+        self.move_thread = None
+        if thread is not None:
+            for signal, slot in (
+                (thread.error, self._on_move_error),
+                (thread.moved, self._on_move_item_moved),
+                (thread.finished, self.on_move_finished),
+            ):
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+            thread.deleteLater()
+
         self._set_moving_busy(False)
-        self.load_files_in_folder(
-            auto_select=current_was_moved, show_progress=False
-        )
-        if self.current_target_path:
-            self.load_target_files(self.current_target_path)
-        self._watch_current_item()
-        if self.move_thread:
-            self.move_thread.deleteLater()
-            self.move_thread = None
+
+
+
+
+    @pyqtSlot()
+    def on_move_finished(self):
+        thread = self.move_thread
+        canceled = bool(thread is not None and thread.is_stopped)
+        errors = list(self._move_error_messages)
+
+        # QThread.finished 到达时，线程内 moved_paths 已经完整。
+        # 用它补齐可能尚未投递到 GUI 事件队列的 moved 信号，避免漏掉局部更新。
+        successful_moves = []
+        seen_moves = set()
+        for old_path, new_path in (
+            list(getattr(thread, "moved_paths", []) or [])
+            + list(self._move_results)
+        ):
+            key = (
+                self._event_path_key(old_path),
+                self._event_path_key(new_path),
+            )
+            if key in seen_moves:
+                continue
+            seen_moves.add(key)
+            successful_moves.append((old_path, new_path))
+            self._queue_library_event(
+                "folder_moved", new_path, old_path=old_path
+            )
+
+        moved_count = len(successful_moves)
+        reload_target = self._target_reload_after_move
+        self._target_reload_after_move = False
+        self._move_error_messages = []
+        self._move_results = []
+
+        self._cleanup_move_objects()
+        self._end_operation("move")
+        QTimer.singleShot(0, self._watch_current_item)
+
+        # 只有移动开始时目标目录仍在异步加载，才重新读取目标目录的直属子文件夹。
+        # 这不是 NFO 全库扫描；正常情况下由 moved 结果直接追加目标项。
+        if reload_target and self.current_target_path:
+            QTimer.singleShot(
+                0,
+                lambda path=self.current_target_path: self.load_target_files(path),
+            )
+
+        if errors:
+            visible_errors = errors[:8]
+            details = "\n\n".join(visible_errors)
+            if len(errors) > len(visible_errors):
+                details += f"\n\n其余 {len(errors) - len(visible_errors)} 个错误已省略。"
+            QMessageBox.critical(self, "移动未完全成功", details)
+        elif canceled:
+            self.status_bar.showMessage(
+                f"文件移动已取消，已局部同步 {moved_count} 个成功项目",
+                5000,
+            )
+        else:
+            self.status_bar.showMessage(
+                f"文件移动完成，已局部同步 {moved_count} 个文件夹",
+                5000,
+            )
 
     # ================================================================
     #  目标目录
@@ -1798,42 +2792,28 @@ class NFOEditorQt6(NFOEditorQt):
     def has_unsaved_changes(self):
         if not self.current_file_path or not os.path.exists(self.current_file_path):
             return False
-        try:
-            tree = parse_xml_file(self.current_file_path)
-            root = tree.getroot()
-            for field in ["title", "plot", "series", "rating"]:
-                current_value = self.fields_entries[field].toPlainText().strip()
-                elem = root.find(field)
-                original = elem.text.strip() if elem is not None and elem.text else ""
-                if current_value != original:
-                    return True
+        if self._loaded_snapshot is None:
+            try:
+                root = parse_xml_file(self.current_file_path).getroot()
+                self._loaded_snapshot = self._snapshot_from_root(root)
+            except (ET.ParseError, OSError):
+                return False
+        return self._capture_editor_snapshot() != self._loaded_snapshot
 
-            current_actors = set(
-                a.strip() for a in self.fields_entries["actors"].toPlainText().strip().split(",")
-                if a.strip()
-            )
-            original_actors = {
-                actor.find("name").text.strip()
-                for actor in root.findall("actor")
-                if actor.find("name") is not None and actor.find("name").text
-            }
-            if current_actors != original_actors:
-                return True
-
-            current_tags = set(
-                t.strip() for t in self.fields_entries["tags"].toPlainText().strip().split(",")
-                if t.strip()
-            )
-            original_tags = {
-                tag.text.strip() for tag in root.findall("tag")
-                if tag is not None and tag.text
-            }
-            if current_tags != original_tags:
-                return True
+    def _confirm_unsaved_changes(self, action_text="继续"):
+        if not self.has_unsaved_changes():
+            return True
+        reply = QMessageBox.question(
+            self,
+            "保存更改",
+            f"当前 NFO 有未保存的更改。是否先保存再{action_text}？",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+        )
+        if reply == QMessageBox.Cancel:
             return False
-        except (ET.ParseError, OSError) as e:
-            print(f"检查更改状态时出错: {str(e)}")
-            return False
+        if reply == QMessageBox.Yes:
+            return self.save_changes()
+        return True
 
     # ================================================================
     #  图片显示 - 使用 AdaptiveImageLabel,直接传原图
@@ -1874,23 +2854,23 @@ class NFOEditorQt6(NFOEditorQt):
             self.thumb_resolution_label.setText("分辨率: 未知")
 
     def load_image(self, image_path, label, resolution_label=None):
-        """加载图片。AdaptiveImageLabel 会自动缩放,这里只传原图。"""
+        """单次解码图片并应用 EXIF 方向，再交给自适应标签缩放。"""
         try:
-            with Image.open(image_path) as img:
-                w, h = img.size
+            reader = QImageReader(image_path)
+            reader.setAutoTransform(True)
+            image = reader.read()
+            if image.isNull():
+                raise OSError(reader.errorString() or "无法读取图片")
             if resolution_label:
-                resolution_label.setText(f"分辨率: {w} × {h}")
-
-            pixmap = QPixmap(image_path)
+                resolution_label.setText(
+                    f"分辨率: {image.width()} × {image.height()}"
+                )
+            pixmap = QPixmap.fromImage(image)
             if pixmap.isNull():
-                label.setText("加载图片失败")
-                if resolution_label:
-                    resolution_label.setText("分辨率: 加载失败")
-                return
-            # 直接传原图,AdaptiveImageLabel.resizeEvent 会自动缩放
+                raise OSError("无法创建图片预览")
             label.setPixmap(pixmap)
-        except (OSError, Image.UnidentifiedImageError) as e:
-            label.setText(f"加载图片失败: {str(e)}")
+        except OSError as exc:
+            label.setText(f"加载图片失败: {exc}")
             if resolution_label:
                 resolution_label.setText("分辨率: 加载失败")
 
@@ -1912,12 +2892,15 @@ class NFOEditorQt6(NFOEditorQt):
     def rebuild_tree_from_paths(self, paths):
         self._last_selected_item = None
         self.file_tree.clear()
-        items = []
+        self._tree_item_index.clear()
+        pairs = []
         for nfo_path in paths:
             if os.path.exists(nfo_path):
-                items.append(QTreeWidgetItem(self._path_to_tree_values(nfo_path)))
-        if items:
-            self.file_tree.addTopLevelItems(items)
+                pairs.append((nfo_path, QTreeWidgetItem(self._path_to_tree_values(nfo_path))))
+        if pairs:
+            self.file_tree.addTopLevelItems([item for _, item in pairs])
+            for nfo_path, item in pairs:
+                self._tree_item_index[self._event_path_key(nfo_path)] = item
 
     # ================================================================
     #  排序 & 筛选
@@ -2041,218 +3024,232 @@ class NFOEditorQt6(NFOEditorQt):
     #  批量填充 & 新增
     # ================================================================
 
-    def batch_filling(self):
-        dialog = QDialog(self)
-        dialog.setAttribute(Qt.WA_DeleteOnClose)
-        dialog.setWindowTitle("批量填充")
-        dialog.resize(400, 600)
-        layout = QVBoxLayout(dialog)
+    def _selected_nfo_paths(self):
+        paths = []
+        for item in self.file_tree.selectedItems():
+            path = self._nfo_path_from_item(item)
+            if path and os.path.isfile(path):
+                paths.append(path)
+        return unique_paths(paths)
 
+    def _start_batch_nfo_operation(
+        self, paths, operation, *, field="", value=""
+    ):
+        if self.batch_thread is not None and self.batch_thread.isRunning():
+            QMessageBox.warning(self, "批量任务", "已有批量任务正在运行")
+            return False
+        if self._active_operations:
+            QMessageBox.warning(self, "批量任务", "当前有其他文件操作正在进行")
+            return False
+        if not paths:
+            QMessageBox.warning(self, "批量任务", "没有有效的 NFO 文件")
+            return False
+        if not self._confirm_unsaved_changes("执行批量操作"):
+            return False
+
+        self._batch_errors = []
+        self._batch_stats = None
+        self.batch_progress = QProgressDialog(
+            "准备批量处理...", "取消", 0, len(paths), self
+        )
+        self.batch_progress.setWindowModality(Qt.WindowModal)
+        self.batch_progress.setMinimumDuration(0)
+        self.batch_progress.setAutoClose(False)
+        self.batch_progress.setAutoReset(False)
+        self.batch_progress.setValue(0)
+
+        self.batch_thread = BatchNFOOperationThread(
+            paths, operation, field=field, value=value
+        )
+        self.batch_thread.progress.connect(self._on_batch_operation_progress)
+        self.batch_thread.changed.connect(self._on_batch_operation_changed)
+        self.batch_thread.error.connect(self._on_batch_operation_error)
+        self.batch_thread.completed.connect(self._on_batch_operation_completed)
+        self.batch_thread.finished.connect(self._on_batch_operation_thread_finished)
+        self.batch_progress.canceled.connect(self._cancel_batch_operation)
+
+        self._begin_operation("batch")
+        self._set_moving_busy(True)
+        self._clear_file_watches()
+        self.batch_thread.start()
+        return True
+
+    @pyqtSlot(int, int, str)
+    def _on_batch_operation_progress(self, current, total, filename):
+        if self.batch_progress is not None:
+            self.batch_progress.setMaximum(total)
+            self.batch_progress.setValue(current)
+            self.batch_progress.setLabelText(
+                f"正在处理 {current}/{total}: {filename}"
+            )
+
+    @pyqtSlot(str)
+    def _on_batch_operation_changed(self, nfo_path):
+        self._queue_library_event(
+            "nfo_changed", nfo_path, reload_current=True
+        )
+
+    @pyqtSlot(str, str)
+    def _on_batch_operation_error(self, nfo_path, message):
+        self._batch_errors.append(f"{nfo_path}: {message}")
+
+    @pyqtSlot(dict)
+    def _on_batch_operation_completed(self, stats):
+        self._batch_stats = dict(stats)
+
+    @pyqtSlot()
+    def _cancel_batch_operation(self):
+        if self.batch_thread is not None and self.batch_thread.isRunning():
+            self.batch_thread.stop()
+            if self.batch_progress is not None:
+                self.batch_progress.setLabelText(
+                    "正在取消，等待当前 NFO 写入完成..."
+                )
+
+    @pyqtSlot()
+    def _on_batch_operation_thread_finished(self):
+        stats = self._batch_stats or {
+            "total": 0, "processed": 0, "changed": 0,
+            "failed": len(self._batch_errors), "skipped": 0,
+            "canceled": True,
+        }
+        errors = list(self._batch_errors)
+
+        progress = self.batch_progress
+        self.batch_progress = None
+        if progress is not None:
+            try:
+                progress.canceled.disconnect(self._cancel_batch_operation)
+            except (RuntimeError, TypeError):
+                pass
+            progress.close()
+            progress.deleteLater()
+
+        thread = self.batch_thread
+        self.batch_thread = None
+        if thread is not None:
+            thread.deleteLater()
+
+        self._batch_errors = []
+        self._batch_stats = None
+        self._set_moving_busy(False)
+        self._end_operation("batch")
+        QTimer.singleShot(0, self._watch_current_item)
+
+        summary = (
+            f"处理 {stats.get('processed', 0)}/{stats.get('total', 0)}，"
+            f"修改 {stats.get('changed', 0)}，"
+            f"跳过 {stats.get('skipped', 0)}，"
+            f"失败 {stats.get('failed', 0)}"
+        )
+        if errors:
+            details = "\n".join(errors[:10])
+            if len(errors) > 10:
+                details += f"\n其余 {len(errors) - 10} 个错误已省略"
+            QMessageBox.warning(
+                self, "批量任务部分失败", f"{summary}\n\n{details}"
+            )
+        elif stats.get("canceled"):
+            self.status_bar.showMessage(f"批量任务已取消：{summary}", 6000)
+        else:
+            self.status_bar.showMessage(f"批量任务完成：{summary}", 6000)
+
+    def batch_filling(self):
+        if not self._selected_nfo_paths():
+            QMessageBox.warning(self, "警告", "请先选择要填充的 NFO")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("批量填充")
+        dialog.resize(400, 320)
+        layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel("选择填充替换字段:"))
         field_buttons = []
-        for field in ["series", "rating", "actor"]:
-            rb = QRadioButton(field)
+        for field in ("series", "rating", "actor"):
+            button = QRadioButton(field)
             if not field_buttons:
-                rb.setChecked(True)
-            field_buttons.append(rb)
-            layout.addWidget(rb)
+                button.setChecked(True)
+            field_buttons.append(button)
+            layout.addWidget(button)
 
         layout.addWidget(QLabel("填充替换值:"))
         value_entry = QLineEdit()
         layout.addWidget(value_entry)
 
-        log_text = QTextEdit()
-        layout.addWidget(log_text)
+        def selected_field():
+            for button in field_buttons:
+                if button.isChecked():
+                    return button.text()
+            return "series"
 
-        original_key_release = value_entry.keyReleaseEvent
-
-        def format_rating_input(widget, event):
-            try:
-                current = widget.text().strip()
-                if not current:
-                    original_key_release(event); return
-                key_text = event.text()
-                if key_text.isdigit():
-                    if "." in current:
-                        main = current.split(".")[0]
-                        formatted = f"{main}.{key_text}"
-                        try:
-                            widget.setText(formatted if float(formatted) <= 9.9 else "9.9")
-                        except ValueError:
-                            pass
-                    elif current.isdigit():
-                        try:
-                            widget.setText(f"{float(current):.1f}")
-                        except ValueError:
-                            pass
-                    widget.setCursorPosition(len(widget.text()))
-            except ValueError as e:
-                print(f"评分输入错误: {e}")
-            original_key_release(event)
-
-        def on_field_changed():
-            sel = None
-            for rb in field_buttons:
-                if rb.isChecked():
-                    sel = rb.text(); break
-            if sel == "rating":
-                value_entry.keyReleaseEvent = lambda e: format_rating_input(value_entry, e)
-                value_entry.setPlaceholderText("输入评分 (如: 8.5)")
+        def update_placeholder():
+            field = selected_field()
+            if field == "rating":
+                value_entry.setPlaceholderText("输入评分，例如 8.5")
+            elif field == "actor":
+                value_entry.setPlaceholderText("多个演员用逗号分隔")
             else:
-                value_entry.keyReleaseEvent = original_key_release
-                value_entry.setPlaceholderText(
-                    "输入演员名，多个用逗号分隔" if sel == "actor" else "输入填充值"
-                )
-            value_entry.setFocus()
+                value_entry.setPlaceholderText("输入系列名称")
 
         def apply_fill():
-            field = None
-            for rb in field_buttons:
-                if rb.isChecked():
-                    field = rb.text(); break
-            if not field:
+            value = value_entry.text().strip()
+            if not value:
+                QMessageBox.warning(dialog, "警告", "请输入填充值")
                 return
-            fill_value = value_entry.text().strip()
-            if not fill_value:
-                return
+            field = selected_field()
             if field == "rating":
                 try:
-                    float(fill_value)
+                    rating = float(value)
                 except ValueError:
                     QMessageBox.warning(dialog, "评分无效", "评分必须是有效数字")
                     return
-            selected = self.file_tree.selectedItems()
-            if not selected:
-                QMessageBox.warning(dialog, "警告", "请先选择要填充的文件")
-                return
+                if not 0 <= rating <= 10:
+                    QMessageBox.warning(dialog, "评分无效", "评分应在 0 到 10 之间")
+                    return
+            paths = self._selected_nfo_paths()
+            if self._start_batch_nfo_operation(
+                paths, "fill", field=field, value=value
+            ):
+                dialog.accept()
 
-            log = []
-            for item in selected:
-                values = [item.text(i) for i in range(3)]
-                nfo_path = (
-                    os.path.join(self.folder_path, values[0], values[1], values[2])
-                    if values[1]
-                    else os.path.join(self.folder_path, values[0], values[2])
-                )
-                try:
-                    tree = parse_xml_file(nfo_path)
-                    root = tree.getroot()
-
-                    if field == "actor":
-                        sync_actor_nodes(root, split_csv_values(fill_value))
-                        log.append(f"{nfo_path}: actor字段填充成功（已保留匹配演员的扩展信息）")
-                    elif field == "rating":
-                        re_ = root.find("rating")
-                        if re_ is None:
-                            re_ = ET.SubElement(root, "rating")
-                        re_.text = fill_value
-                        cr = int(float(fill_value) * 10)
-                        ce = root.find("criticrating")
-                        if ce is None:
-                            ce = ET.SubElement(root, "criticrating")
-                        ce.text = str(cr)
-                        log.append(f"{nfo_path}: rating填充成功 ({fill_value}, criticrating: {cr})")
-                    else:
-                        elem = root.find(field)
-                        if elem is None:
-                            elem = ET.SubElement(root, field)
-                        elem.text = fill_value
-                        log.append(f"{nfo_path}: {field}字段填充成功")
-
-                    write_xml_root_atomic(root, nfo_path)
-                    cd = parse_single_nfo(nfo_path)
-                    if cd:
-                        self.nfo_cache.set(nfo_path, cd)
-                except (ET.ParseError, OSError) as e:
-                    log.append(f"{nfo_path}: {field}字段填充失败 - {str(e)}")
-
-            log_text.setText("\n".join(log))
-            if self.current_file_path:
-                self.load_nfo_fields()
-
-        for rb in field_buttons:
-            rb.toggled.connect(on_field_changed)
-
-        apply_btn = QPushButton("应用填充")
+        for button in field_buttons:
+            button.toggled.connect(update_placeholder)
+        apply_btn = QPushButton("开始批量填充")
         apply_btn.clicked.connect(apply_fill)
         layout.addWidget(apply_btn)
-
-        on_field_changed()
         value_entry.returnPressed.connect(apply_fill)
+        update_placeholder()
         dialog.exec()
 
     def batch_add(self):
+        if not self._selected_nfo_paths():
+            QMessageBox.warning(self, "警告", "请先选择要新增标签的 NFO")
+            return
+
         dialog = QDialog(self)
-        dialog.setAttribute(Qt.WA_DeleteOnClose)
         dialog.setWindowTitle("批量新增标签")
-        dialog.resize(400, 500)
+        dialog.resize(400, 220)
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel("为选中的NFO文件批量新增标签:"))
-        layout.addWidget(QLabel("(仅新增 tag；不会覆盖原有 genre)"))
-        layout.addWidget(QLabel("多个标签请用逗号分隔"))
-        layout.addWidget(QLabel("输入新增标签:"))
+        layout.addWidget(QLabel("多个标签请用逗号分隔；仅新增 tag，不修改 genre。"))
         value_entry = QLineEdit()
-        value_entry.setPlaceholderText("例如: 新标签1, 新标签2, 新标签3")
+        value_entry.setPlaceholderText("例如: 新标签1, 新标签2")
         layout.addWidget(value_entry)
-        log_text = QTextEdit()
-        layout.addWidget(log_text)
 
         def apply_add():
-            add_value = value_entry.text().strip()
-            if not add_value:
-                QMessageBox.warning(dialog, "警告", "请输入标签内容"); return
-            selected = self.file_tree.selectedItems()
-            if not selected:
-                QMessageBox.warning(dialog, "警告", "请先选择要新增的文件"); return
+            value = value_entry.text().strip()
+            if not split_csv_values(value):
+                QMessageBox.warning(dialog, "警告", "请输入有效标签")
+                return
+            paths = self._selected_nfo_paths()
+            if self._start_batch_nfo_operation(
+                paths, "add_tags", value=value
+            ):
+                dialog.accept()
 
-            log = []
-            for item in selected:
-                values = [item.text(i) for i in range(3)]
-                nfo_path = (
-                    os.path.join(self.folder_path, values[0], values[1], values[2])
-                    if values[1]
-                    else os.path.join(self.folder_path, values[0], values[2])
-                )
-                try:
-                    tree = parse_xml_file(nfo_path)
-                    root = tree.getroot()
-                    existing = []
-                    for tag in root.findall("tag"):
-                        if tag is not None and tag.text:
-                            tt = tag.text.strip()
-                            if "," in tt:
-                                for st in tt.split(","):
-                                    st = st.strip()
-                                    if st:
-                                        existing.append(st)
-                            else:
-                                existing.append(tt)
-                    existing = list(dict.fromkeys(existing))
-                    requested_tags = split_csv_values(add_value)
-                    new_tags = [tag for tag in requested_tags if tag not in existing]
-                    if not new_tags:
-                        log.append(f"{nfo_path}: 所有标签已存在，跳过"); continue
-                    all_tags = existing + new_tags
-                    replace_text_nodes(root, "tag", all_tags)
-                    write_xml_root_atomic(root, nfo_path)
-                    cd = parse_single_nfo(nfo_path)
-                    if cd:
-                        self.nfo_cache.set(nfo_path, cd)
-                    log.append(f"{nfo_path}: 成功新增{len(new_tags)}个标签")
-                except (ET.ParseError, OSError) as e:
-                    log.append(f"{nfo_path}: 标签新增失败 - {str(e)}")
-
-            log_text.setText("\n".join(log))
-            if self.current_file_path:
-                self.load_nfo_fields()
-
-        btn_row = QHBoxLayout()
-        apply_btn = QPushButton("应用新增"); apply_btn.clicked.connect(apply_add)
-        close_btn = QPushButton("关闭"); close_btn.clicked.connect(dialog.close)
-        btn_row.addWidget(apply_btn); btn_row.addWidget(close_btn)
-        layout.addLayout(btn_row)
+        apply_btn = QPushButton("开始批量新增")
+        apply_btn.clicked.connect(apply_add)
+        layout.addWidget(apply_btn)
         value_entry.returnPressed.connect(apply_add)
-        value_entry.setFocus()
         dialog.exec()
 
     # ================================================================
@@ -2622,54 +3619,72 @@ class NFOEditorQt6(NFOEditorQt):
     #  图片裁剪 / 删除 / 其他工具
     # ================================================================
 
+
+    @pyqtSlot(str, str)
+    def _on_crop_images_saved(self, poster_path, thumb_path):
+        """裁剪工具已原子写入图片；只刷新当前影片图片区。"""
+        changed_path = poster_path or thumb_path
+        if changed_path:
+            self._queue_library_event(
+                "image_changed", os.path.dirname(changed_path)
+            )
+
+
     def open_image_and_crop(self, image_type):
         if not self.current_file_path:
             return
-        folder = os.path.dirname(self.current_file_path)
-        try:
-            image_files = [
-                f for f in os.listdir(folder)
-                if f.lower().endswith(".jpg") and image_type in f.lower()
-            ]
-        except OSError:
-            image_files = []
-        if not image_files:
-            QMessageBox.critical(self, "错误", f"未找到{image_type}图片"); return
+        if self._active_operations:
+            QMessageBox.warning(self, "图片裁剪", "当前有其他文件操作正在进行")
+            return
 
+        folder = os.path.dirname(self.current_file_path)
+        nfo_base = os.path.splitext(
+            os.path.basename(self.current_file_path)
+        )[0]
+        image_path = preferred_image_file(folder, image_type, nfo_base)
+        if not image_path:
+            QMessageBox.critical(self, "错误", f"未找到{image_type}图片")
+            return
+
+        self._begin_operation("crop")
         try:
             from cg_crop import EmbyPosterCrop
-            nfo_base = os.path.splitext(os.path.basename(self.current_file_path))[0]
-            image_path = preferred_image_file(folder, image_type, nfo_base)
-            if not image_path:
-                QMessageBox.critical(self, "错误", f"未找到{image_type}图片")
-                return
-            tree = ET.parse(self.current_file_path); root = tree.getroot()
-            has_subtitle = False; mark_type = "none"
+
+            root = parse_xml_file(self.current_file_path).getroot()
+            has_subtitle = False
+            mark_type = "none"
+            priority = {"none": 0, "wuma": 1, "leak": 2, "umr": 3}
             for tag in root.findall("tag"):
-                tt = tag.text.lower() if tag.text else ""
-                if "中文字幕" in tt:
+                tag_text = (tag.text or "").casefold()
+                if "中文字幕" in tag_text:
                     has_subtitle = True
-                elif "无码破解" in tt:
-                    mark_type = "umr"
-                elif "无码流出" in tt:
-                    mark_type = "leak"
-                elif "无码" in tt:
-                    mark_type = "wuma"
-                if mark_type != "none":
-                    break
-            crop_tool = EmbyPosterCrop(nfo_base_name=nfo_base)
+                candidate = "none"
+                if "无码破解" in tag_text:
+                    candidate = "umr"
+                elif "无码流出" in tag_text:
+                    candidate = "leak"
+                elif "无码" in tag_text:
+                    candidate = "wuma"
+                if priority[candidate] > priority[mark_type]:
+                    mark_type = candidate
+
+            crop_tool = EmbyPosterCrop(self, nfo_base_name=nfo_base)
+            crop_tool.imagesSaved.connect(self._on_crop_images_saved)
             crop_tool.load_initial_image(image_path)
             crop_tool.set_watermark_options(has_subtitle, mark_type)
             crop_tool.exec()
-            self._watch_current_item()
-            if self.show_images_checkbox.isChecked():
-                self.display_image()
         except ImportError:
             QMessageBox.critical(self, "错误", "找不到 cg_crop.py 文件")
-        except (ET.ParseError, OSError) as e:
-            QMessageBox.critical(self, "错误", f"裁剪工具出错: {str(e)}")
+        except (ET.ParseError, OSError) as exc:
+            QMessageBox.critical(self, "错误", f"裁剪工具出错: {exc}")
+        finally:
+            self._end_operation("crop")
+            QTimer.singleShot(0, self._watch_current_item)
+
 
     def delete_selected_folders(self):
+        if not self._confirm_unsaved_changes("删除文件夹"):
+            return
         selected = self.file_tree.selectedItems()
         if not selected:
             return
@@ -2705,37 +3720,121 @@ class NFOEditorQt6(NFOEditorQt):
             return
 
         deleted = 0
-        for folder in folders:
-            try:
-                if winshell is None:
-                    raise OSError("当前系统缺少 Windows 回收站支持（winshell/pywin32）")
-                winshell.delete_file(folder)
-                deleted += 1
-            except OSError as exc:
-                QMessageBox.warning(self, "警告", f"删除文件夹失败: {exc}")
+        self._begin_operation("delete")
+        self._clear_file_watches()
+        try:
+            for folder in folders:
+                try:
+                    if winshell is None:
+                        raise OSError(
+                            "当前系统缺少 Windows 回收站支持（winshell/pywin32）"
+                        )
+                    winshell.delete_file(folder)
+                    deleted += 1
+                    self._queue_library_event("folder_deleted", folder)
+                except OSError as exc:
+                    QMessageBox.warning(self, "警告", f"删除文件夹失败: {exc}")
+        finally:
+            self._end_operation("delete")
+            QTimer.singleShot(0, self._watch_current_item)
 
         if deleted:
-            if self.current_file_path and not os.path.exists(self.current_file_path):
-                self.current_file_path = None
-                self._last_selected_item = None
-                self._watch_current_item()
-            self.status_bar.showMessage(f"成功将 {deleted} 个文件夹移入回收站")
-            self.load_files_in_folder(auto_select=True, show_progress=False)
+            self.status_bar.showMessage(
+                f"成功将 {deleted} 个文件夹移入回收站，正在局部更新列表",
+                5000,
+            )
+
+
+
+    @pyqtSlot(str)
+    def _on_rename_operation_started(self, directory):
+        self._begin_operation("rename")
+        self._set_moving_busy(True)
+        self.status_bar.showMessage(
+            f"批量改名正在处理: {directory}", 5000
+        )
+
+    @pyqtSlot(str)
+    def _on_rename_nfo_changed(self, nfo_path):
+        self._queue_library_event("nfo_changed", nfo_path)
+
+    @pyqtSlot(str, str)
+    def _on_rename_folder_renamed(self, old_path, new_path):
+        self._queue_library_event(
+            "folder_renamed", new_path, old_path=old_path
+        )
+
+
+    @pyqtSlot(bool)
+    def _on_rename_operation_finished(self, success):
+        self._set_moving_busy(False)
+        self._end_operation("rename")
+        if success:
+            self.status_bar.showMessage(
+                "批量改名完成，正在应用局部变更", 5000
+            )
+        else:
+            self.status_bar.showMessage(
+                "批量改名已取消或部分失败；已完成项目仍会局部同步", 5000
+            )
+
+
+    def _on_rename_tool_destroyed(self, *_):
+        self._rename_tool = None
+        self._set_moving_busy(False)
+        # 窗口异常关闭时也不能让操作锁永久残留。
+        self._end_operation("rename")
+
 
     def open_batch_rename_tool(self):
+        if not self._confirm_unsaved_changes("打开批量改名工具"):
+            return
         if not self.folder_path:
-            QMessageBox.critical(self, "错误", "请先选择NFO目录"); return
+            QMessageBox.critical(self, "错误", "请先选择NFO目录")
+            return
         if not os.path.isdir(self.folder_path):
-            QMessageBox.critical(self, "错误", f"目录不存在: {self.folder_path}"); return
+            QMessageBox.critical(
+                self, "错误", f"目录不存在: {self.folder_path}"
+            )
+            return
+
+        existing = self._rename_tool
+        if existing is not None and existing.isVisible():
+            existing.activateWindow()
+            existing.raise_()
+            return
+
         try:
             from cg_rename import RenameToolGUI
+
             rename_tool = RenameToolGUI(parent=self)
             rename_tool.path_entry.setText(self.folder_path)
+            rename_tool.setAttribute(Qt.WA_DeleteOnClose)
+            rename_tool.operationStarted.connect(
+                self._on_rename_operation_started
+            )
+            rename_tool.nfoChanged.connect(
+                self._on_rename_nfo_changed
+            )
+            rename_tool.folderRenamed.connect(
+                self._on_rename_folder_renamed
+            )
+            rename_tool.operationFinished.connect(
+                self._on_rename_operation_finished
+            )
+            rename_tool.destroyed.connect(
+                self._on_rename_tool_destroyed
+            )
+            self._rename_tool = rename_tool
             rename_tool.show()
         except ImportError:
-            QMessageBox.critical(self, "错误", "找不到重命名工具模块(cg_rename.py)")
+            QMessageBox.critical(
+                self, "错误", "找不到重命名工具模块(cg_rename.py)"
+            )
         except OSError as e:
-            QMessageBox.critical(self, "错误", f"启动重命名工具时出错: {str(e)}")
+            QMessageBox.critical(
+                self, "错误", f"启动重命名工具时出错: {str(e)}"
+            )
 
     def show_photo_wall(self):
         if not self.folder_path:
@@ -2788,7 +3887,7 @@ class NFOEditorQt6(NFOEditorQt):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
-        menu.addAction("刷新").triggered.connect(self.load_files_in_folder)
+        menu.addAction("刷新").triggered.connect(self.request_full_refresh)
         if self.file_tree.selectedItems():
             menu.addSeparator()
             menu.addAction("打开NFO").triggered.connect(self.open_selected_nfo)
@@ -2829,6 +3928,10 @@ class NFOEditorQt6(NFOEditorQt):
     # ================================================================
 
     def closeEvent(self, event):
+        if not self._confirm_unsaved_changes("关闭程序"):
+            event.ignore()
+            return
+
         try:
             running_threads = []
             if self.load_thread is not None and self.load_thread.isRunning():
@@ -2839,35 +3942,54 @@ class NFOEditorQt6(NFOEditorQt):
                 self.move_thread.stop()
                 if not self.move_thread.wait(5000):
                     running_threads.append("文件移动")
+            if self.batch_thread is not None and self.batch_thread.isRunning():
+                self.batch_thread.stop()
+                if not self.batch_thread.wait(5000):
+                    running_threads.append("批量NFO修改")
             if self.target_load_thread is not None and self.target_load_thread.isRunning():
                 self.target_load_thread.stop()
                 if not self.target_load_thread.wait(5000):
                     running_threads.append("目标目录加载")
 
+            rename_tool = self._rename_tool
+            rename_worker = getattr(rename_tool, "worker", None) if rename_tool else None
+            if rename_worker is not None and rename_worker.isRunning():
+                rename_worker.requestInterruption()
+                if not rename_worker.wait(5000):
+                    running_threads.append("批量改名")
+
             if running_threads:
                 QMessageBox.warning(
-                    self, "操作仍在进行",
-                    f"{', '.join(running_threads)}尚未安全停止，请等待操作完成后再关闭。",
+                    self,
+                    "操作仍在进行",
+                    f"{', '.join(running_threads)}尚未安全停止，请稍后再关闭。",
                 )
                 event.ignore()
                 return
 
             if hasattr(self, "event_timer"):
                 self.event_timer.stop()
-            directories = self.file_watcher.directories()
-            files = self.file_watcher.files()
-            if directories:
-                self.file_watcher.removePaths(directories)
-            if files:
-                self.file_watcher.removePaths(files)
-            if self.move_progress is not None:
+            self.reload_timer.stop()
+            self._clear_file_watches()
+
+            for progress_name in ("move_progress", "batch_progress"):
+                progress = getattr(self, progress_name, None)
+                if progress is not None:
+                    try:
+                        progress.close()
+                        progress.deleteLater()
+                    except RuntimeError:
+                        pass
+                    setattr(self, progress_name, None)
+
+            if rename_tool is not None:
                 try:
-                    self.move_progress.close()
-                    self.move_progress.deleteLater()
+                    rename_tool.close()
                 except RuntimeError:
                     pass
-                self.move_progress = None
             self.nfo_cache.clear()
+            self._nfo_path_index.clear()
+            self._tree_item_index.clear()
         except (OSError, RuntimeError) as exc:
             print(f"清理资源时出错: {exc}")
         super().closeEvent(event)
