@@ -406,7 +406,7 @@ class NFOEditorQt(QMainWindow):
         self.current_target_path = None
         self.fields_entries = {}
 
-        self.setWindowTitle("大锤 NFO Editor v9.8.2")
+        self.setWindowTitle("大锤 NFO Editor v9.8.3")
         self.resize(1400, 900)
         self.setMinimumSize(1000, 650)
 
