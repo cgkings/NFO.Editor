@@ -2951,15 +2951,18 @@ class NFOEditorQt6(NFOEditorQt):
         return os.path.normpath(os.path.join(*parts))
 
     def _restore_tree_selection(self, item):
+        """取消切换后恢复原文件；不保留可能触发重复回调的其他选中行。"""
         self._selection_change_guard = True
         try:
             blocker = QSignalBlocker(self.file_tree)
-            if item is not None:
-                self.file_tree.setCurrentItem(item)
-                self.file_tree.scrollToItem(item)
-            else:
+            try:
                 self.file_tree.clearSelection()
-            del blocker
+                if item is not None:
+                    self.file_tree.setCurrentItem(item)
+                    item.setSelected(True)
+                    self.file_tree.scrollToItem(item)
+            finally:
+                del blocker
         finally:
             self._selection_change_guard = False
 
@@ -2970,7 +2973,13 @@ class NFOEditorQt6(NFOEditorQt):
         if not selected:
             return
 
-        item = selected[0]
+        # ExtendedSelection 模式下 selectedItems()[0] 未必是刚刚操作的文件。
+        current_item = self.file_tree.currentItem()
+        item = (
+            current_item
+            if current_item is not None and current_item.isSelected()
+            else selected[0]
+        )
         new_path = self._nfo_path_from_item(item)
         if not new_path:
             return
@@ -2978,9 +2987,30 @@ class NFOEditorQt6(NFOEditorQt):
             self._last_selected_item = item
             return
 
-        previous_item = self._last_selected_item
-        if not self._confirm_unsaved_changes("切换文件"):
+        previous_path = self.current_file_path
+        # QMessageBox.question 会开启嵌套 Qt 事件循环，期间文件监视器可能
+        # 刷新/重建 QTreeWidget，旧的 QTreeWidgetItem C++ 对象会失效。
+        # 弹窗期间不允许选择信号重入；返回后只按 NFO 路径重新查找当前行。
+        self._selection_change_guard = True
+        try:
+            confirmed = self._confirm_unsaved_changes("切换文件")
+        finally:
+            self._selection_change_guard = False
+
+        if not confirmed:
+            previous_item = (
+                self._find_tree_item_by_nfo_path(previous_path)
+                if previous_path else None
+            )
             self._restore_tree_selection(previous_item)
+            self._last_selected_item = previous_item
+            return
+
+        # 在弹窗的嵌套事件循环期间，当前文件也可能因刷新而变化。
+        if previous_path and not same_path(self.current_file_path, previous_path):
+            return
+        item = self._find_tree_item_by_nfo_path(new_path)
+        if item is None:
             return
 
         if not os.path.exists(new_path):
@@ -3019,16 +3049,16 @@ class NFOEditorQt6(NFOEditorQt):
             "plot": text_of("plot"),
             "series": read_series_text(root),
             "rating": text_of("rating"),
-            "actors": [
+            "actors": split_csv_values(", ".join(
                 (actor.findtext("name") or "").strip()
                 for actor in root.findall("actor")
                 if (actor.findtext("name") or "").strip()
-            ],
-            "tags": [
+            )),
+            "tags": split_csv_values(", ".join(
                 (tag.text or "").strip()
                 for tag in root.findall("tag")
                 if (tag.text or "").strip()
-            ],
+            )),
         }
 
     def _capture_editor_snapshot(self):
@@ -3090,7 +3120,10 @@ class NFOEditorQt6(NFOEditorQt):
                 (release_elem.text or "").strip()
                 if release_elem is not None else ""
             )
-            self._loaded_snapshot = self._snapshot_from_root(root)
+            # 应以用户实际看到的控件值作为“尚未编辑”的基准。
+            # XML 中重复的 actor/tag 会在 UI 的 CSV 解析中去重；如果直接
+            # 拿原始 XML 列表作基准，用户一字未改也会误报未保存修改。
+            self._loaded_snapshot = self._capture_editor_snapshot()
         except (ET.ParseError, OSError) as exc:
             self._loaded_snapshot = None
             QMessageBox.critical(self, "错误", f"加载NFO文件失败: {exc}")
@@ -4577,6 +4610,7 @@ class NFOEditorQt6(NFOEditorQt):
             return
 
         self._begin_operation("crop")
+        crop_tool = None
         try:
             from cg_crop import EmbyPosterCrop
 
@@ -4608,6 +4642,10 @@ class NFOEditorQt6(NFOEditorQt):
         except (ET.ParseError, OSError) as exc:
             QMessageBox.critical(self, "错误", f"裁剪工具出错: {exc}")
         finally:
+            # 对话框是 self 的子 QObject；exec() 结束不会自动回收它。
+            # 反复打开大图后若不 deleteLater，会保留整套裁剪控件及大图内存。
+            if crop_tool is not None:
+                crop_tool.deleteLater()
             self._end_operation("crop")
             QTimer.singleShot(0, self._watch_current_item)
 
