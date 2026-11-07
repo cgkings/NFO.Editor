@@ -1,1306 +1,3949 @@
+# -*- coding: utf-8 -*-
+"""大锤 NFO/STRM 多版本查重。版本号统一管理于 nfo_version.py。
+Windows / Python 3.10+ / PySide6。
+直接运行 cg_dedupe.py，或双击 构建exe.bat 打包。
+GUI 与查重核心均位于单个 Python 文件中。
+"""
+from __future__ import annotations
+
+import json
+import datetime
+import secrets
+import stat
+import queue
+import ntpath
 import os
 import re
-import sys
+import shutil
+import sqlite3
 import subprocess
-from PySide6 import QtWidgets, QtGui, QtCore
-from PySide6.QtCore import Qt
-from nfo_utils import canonical_path, is_path_within, normalize_scan_roots, paths_form_multi_disc_set
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import sys
+import threading
+import time
+import urllib.parse
 import xml.etree.ElementTree as ET
-from multiprocessing import cpu_count, freeze_support
-import signal
-from threading import Lock
+from collections import defaultdict
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from fractions import Fraction
+from pathlib import Path
+from typing import Callable
+
+DATA_DIR_NAME = "CGDedupe_Data"
 
 
-# 应用常量
-class AppConstants:
-    """应用常量定义"""
-    MAX_DIRECTORIES = 9
-    DEFAULT_BATCH_SIZE = 1000
-    PROGRESS_UPDATE_INTERVAL = 200  # 毫秒
-    BUTTON_HEIGHT = 20
-    SIMILARITY_THRESHOLD_MIN = 50
-    SIMILARITY_THRESHOLD_MAX = 100
-    DEFAULT_SIMILARITY_THRESHOLD = 80
-    MAX_OPEN_FOLDERS_WARNING = 5
-    
-    # 窗口设置
-    WINDOW_MIN_WIDTH = 700
-    WINDOW_MIN_HEIGHT = 500
-    WINDOW_DEFAULT_WIDTH = 900
-    WINDOW_DEFAULT_HEIGHT = 650
+APP_TITLE = "大锤 NFO / STRM 多版本查重"
 
 
-class AppTheme:
-    """集中管理应用主题颜色"""
+from nfo_version import get_app_version
 
-    def __init__(self):
-        # 商务风配色常量 - 扩展版
-        self.colors = {
-            "primary": "#2c3e50",  # 深蓝灰色(主色)
-            "secondary": "#3498db",  # 中蓝色(辅助色)
-            "light": "#ecf0f1",  # 浅灰色(背景)
-            "border": "#d5d8dc",  # 边框颜色
-            "success": "#27ae60",  # 成功色
-            "warning": "#e74c3c",  # 警告色
-            "text": "#2c3e50",  # 文本颜色
-            "light_text": "#7f8c8d",  # 浅色文本
-            "group_bg": "#d6eaf8",  # 淡蓝色组背景
-            "item1_bg": "#e8f8f5",  # 浅绿色第一项背景
-            "item2_bg": "#fef9e7",  # 浅黄色其他项背景
-            "row_alt": "#ffffff",  # 交替行色
-        }
-
-    def get_button_style(self, is_action=False):
-        """获取按钮样式"""
-        return f"""
-            QPushButton {{
-                background-color: {self.colors["secondary"]};
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 8px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{
-                background-color: #2980b9;
-            }}
-            QPushButton:pressed {{
-                background-color: #1f6da8;
-            }}
-        """
-
-    def get_directory_button_style(self):
-        """获取目录按钮样式"""
-        return f"""
-            QPushButton {{
-                text-align: left;
-                padding: 8px 10px;
-                background-color: white;
-                border: 1px solid {self.colors["border"]};
-                border-radius: 4px;
-            }}
-            QPushButton:hover {{
-                background-color: {self.colors["light"]};
-                border: 1px solid {self.colors["secondary"]};
-            }}
-        """
-
-    def get_tree_widget_style(self):
-        """获取树形控件样式"""
-        return f"""
-            QTreeWidget {{
-                border: 1px solid {self.colors["border"]};
-                border-radius: 4px;
-                background-color: white;
-                alternate-background-color: {self.colors["light"]};
-                gridline-color: {self.colors["border"]};
-            }}
-            QTreeWidget::item {{
-                padding: 6px;
-                border-bottom: 1px solid {self.colors["border"]};
-                min-height: 24px;
-            }}
-            QTreeWidget::item:selected {{
-                background-color: {self.colors["secondary"]};
-                color: white;
-            }}
-            QHeaderView::section {{
-                background-color: {self.colors["primary"]};
-                color: white;
-                padding: 8px;
-                border: none;
-                font-weight: bold;
-            }}
-            QHeaderView::section:hover {{
-                background-color: #34495e;
-            }}
-        """
-
-    def get_progress_bar_style(self):
-        """获取进度条样式"""
-        return f"""
-            QProgressBar {{
-                border: none;
-                border-radius: 4px;
-                background-color: {self.colors["light"]};
-                text-align: center;
-                height: 18px;
-                font-size: 12px;
-            }}
-            QProgressBar::chunk {{
-                background-color: {self.colors["success"]};
-                border-radius: 4px;
-            }}
-        """
-
-    def get_label_style(self, is_tip=False, is_stats=False):
-        """获取标签样式"""
-        if is_tip:
-            return f"""
-                QLabel {{
-                    color: {self.colors["light_text"]};
-                    padding: 4px;
-                    font-size: 14px;
-                    border-bottom: 1px solid {self.colors["border"]};
-                    margin-bottom: 5px;
-                }}
-            """
-        elif is_stats:
-            return f"""
-                QLabel {{
-                    color: {self.colors["primary"]};
-                    font-weight: bold;
-                    padding: 4px;
-                    margin-top: 5px;
-                }}
-            """
-        else:
-            return f"""
-                QLabel {{
-                    color: {self.colors["text"]};
-                }}
-            """
+APP_VERSION = get_app_version("dedupe")
 
 
-class CustomSpinner(QtWidgets.QWidget):
-    valueChanged = QtCore.Signal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.current_index = 0
-        self.options = ["番号", "系列"]
-        self.initUI()
-
-    def initUI(self):
-        layout = QtWidgets.QHBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        # 文本显示区域
-        self.display = QtWidgets.QLineEdit()
-        self.display.setReadOnly(True)
-        self.display.setText(self.options[0])
-        self.display.setAlignment(Qt.AlignCenter)
-
-        # 按钮容器
-        button_container = QtWidgets.QWidget()
-        button_layout = QtWidgets.QVBoxLayout()
-        button_layout.setContentsMargins(0, 0, 0, 0)
-        button_layout.setSpacing(0)
-
-        # 上下箭头按钮
-        self.up_button = QtWidgets.QPushButton("▲")
-        self.down_button = QtWidgets.QPushButton("▼")
-
-        # 设置按钮大小
-        self.up_button.setFixedHeight(AppConstants.BUTTON_HEIGHT)
-        self.down_button.setFixedHeight(AppConstants.BUTTON_HEIGHT)
-
-        # 添加按钮到布局
-        button_layout.addWidget(self.up_button)
-        button_layout.addWidget(self.down_button)
-        button_container.setLayout(button_layout)
-        button_container.setFixedWidth(24)
-
-        # 添加到主布局
-        layout.addWidget(self.display)
-        layout.addWidget(button_container)
-        self.setLayout(layout)
-
-        # 连接信号
-        self.up_button.clicked.connect(self.previous_item)
-        self.down_button.clicked.connect(self.next_item)
-
-        # 统一使用样式表
-        self.setStyleSheet(
-            """
-            QLineEdit {
-                border: 1px solid #e2e8f0;
-                border-right: none;
-                border-top-left-radius: 4px;
-                border-bottom-left-radius: 4px;
-                padding: 5px;
-                background: white;
-                min-width: 60px;
-            }
-            QPushButton {
-                border: 1px solid #e2e8f0;
-                background: white;
-                font-size: 8px;
-                padding: 0px;
-            }
-            QPushButton:hover {
-                background: #f8fafc;
-            }
-            QPushButton:pressed {
-                background: #f1f5f9;
-            }
-            """
-        )
-
-    def previous_item(self):
-        self.current_index = (self.current_index - 1) % len(self.options)
-        self.display.setText(self.options[self.current_index])
-        self.valueChanged.emit()
-
-    def next_item(self):
-        self.current_index = (self.current_index + 1) % len(self.options)
-        self.display.setText(self.options[self.current_index])
-        self.valueChanged.emit()
-
-    def get_current_value(self):
-        return self.options[self.current_index]
+VIDEO_EXTS = frozenset({
+    ".mkv", ".mp4", ".avi", ".mov", ".m4v", ".wmv", ".ts", ".m2ts",
+    ".mts", ".mpg", ".mpeg", ".flv", ".webm", ".rm", ".rmvb",
+    ".vob", ".3gp", ".divx", ".iso",
+})
 
 
-class MatchModeWidget(QtWidgets.QWidget):
-    """匹配模式选择控件"""
-    modeChanged = QtCore.Signal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.initUI()
-
-    def initUI(self):
-        layout = QtWidgets.QVBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(5)
-
-        # 匹配模式选择
-        self.exact_radio = QtWidgets.QRadioButton("完全匹配")
-        self.partial_radio = QtWidgets.QRadioButton("部分匹配")
-        self.exact_radio.setChecked(True)
-
-        # 部分匹配阈值设置
-        threshold_layout = QtWidgets.QHBoxLayout()
-        self.threshold_label = QtWidgets.QLabel("相似度:")
-        self.threshold_spin = QtWidgets.QSpinBox()
-        self.threshold_spin.setRange(AppConstants.SIMILARITY_THRESHOLD_MIN, 
-                                   AppConstants.SIMILARITY_THRESHOLD_MAX)
-        self.threshold_spin.setValue(AppConstants.DEFAULT_SIMILARITY_THRESHOLD)
-        self.threshold_spin.setSuffix("%")
-        self.threshold_spin.setEnabled(False)
-
-        threshold_layout.addWidget(self.threshold_label)
-        threshold_layout.addWidget(self.threshold_spin)
-        threshold_layout.addStretch()
-
-        layout.addWidget(self.exact_radio)
-        layout.addWidget(self.partial_radio)
-        layout.addLayout(threshold_layout)
-
-        self.setLayout(layout)
-
-        # 连接信号
-        self.exact_radio.toggled.connect(self.on_mode_changed)
-        self.partial_radio.toggled.connect(self.on_mode_changed)
-        self.threshold_spin.valueChanged.connect(self.modeChanged.emit)
-
-    def on_mode_changed(self):
-        self.threshold_spin.setEnabled(self.partial_radio.isChecked())
-        self.modeChanged.emit()
-
-    def is_exact_match(self):
-        return self.exact_radio.isChecked()
-
-    def get_threshold(self):
-        return self.threshold_spin.value() / 100.0
+MEDIA_EXTS = VIDEO_EXTS | {".strm"}
 
 
-class DirectoryButton(QtWidgets.QPushButton):
-    rightClicked = QtCore.Signal()
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
-        )
-
-    def setText(self, text):
-        """设置按钮文本，优化显示"""
-        if text:
-            display_text = self._get_display_text(text)
-            super().setText(display_text)
-            self.setToolTip(text)
-        else:
-            super().setText("")
-            self.setToolTip("")
-
-    def _get_display_text(self, text):
-        """获取显示文本，处理路径显示"""
-        try:
-            # 去除末尾的路径分隔符
-            cleaned_text = text.rstrip("/\\")
-            # 获取目录名
-            display_text = os.path.basename(cleaned_text)
-            # 如果为空（如根目录），返回原文本
-            return display_text or text
-        except Exception:
-            return text
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.RightButton:
-            self.rightClicked.emit()
-        else:
-            super().mousePressEvent(event)
+COLORS = {
+    "navy": "#1B2A43", "bg": "#F4F7FC", "paper": "#FFFFFF",
+    "ink": "#24324A", "muted": "#70819B", "line": "#DFE6F0",
+    "blue": "#366CE9", "blue_hover": "#2459CE", "pale": "#E8F0FF",
+    "green": "#177E64", "amber": "#AD6A1B", "red": "#B44153",
+}
 
 
-class NfoFile:
-    """NFO文件处理类"""
+# 基于 Number-Tags-v2.2.6.user.js 的 canon/extract 规则，并保留原版本
+# T-xx-xxx、6位日期番号和 CD1/CD2 多碟处理。只分析文件名/NFO 文本，
+# 不访问 STRM 指向的 CD2/115 云盘文件。
+FC2_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])FC2[-_. ]*(?:PPV[-_. ]*)?(\d{5,9})(?![A-Za-z0-9])", re.I
+)
 
-    # 编码尝试顺序
-    ENCODINGS = ["utf-8", "gbk", "cp936", "latin1"]
+T_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])T[-_. ]?(\d{2,3})[-_. ]?(\d{3})(?![A-Za-z0-9])", re.I
+)
 
-    # 番号匹配正则表达式
-    CODE_PATTERNS = [
-        (r"([A-Za-z]{2,15})-?(\d{2,5})", False),  # 标准番号如 MIDE-954 或 MY-948
-        (r"([A-Za-z]{2,15})(\d{2,5})", False),  # 无连字符格式如 MIDE954
-        (r"FC2-?PPV-?(\d{6,7})", True),  # FC2格式
-        (r"T-?(\d{2,3})-?(\d{3})", True),  # T28系列特殊格式
-        (r"(\d{6})-(\d{3})", True),  # 全数字格式如 050525-001
-    ]
+DATE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(\d{6})[-_](\d{3,4})(?![A-Za-z0-9])"
+)
 
-    # CD标识模式，用于排除重复检测
-    CD_PATTERNS = [
-        r"[-_\s]*cd[12]?[-_\s]*",  # 匹配 cd1, cd2, -cd1, _cd2 等
-        r"[-_\s]*disc[12]?[-_\s]*",  # 匹配 disc1, disc2 等
-        r"[-_\s]*[第]?[一二1-2][张碟盘][-_\s]*",  # 匹配中文 第一张、第二盘 等
-    ]
+NUMERIC_PAIR_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(\d{5,9})[-_](\d{2,5})(?![A-Za-z0-9])"
+)
 
-    @staticmethod
-    def safe_read_file(file_path):
-        """安全地读取文件，尝试多种编码，增强异常处理"""
-        if not os.path.exists(file_path):
-            return None, None
-        
-        if not os.access(file_path, os.R_OK):
-            print(f"文件无读取权限 {file_path}")
-            return None, None
+# MKBD-S94 等字母数字混合后缀；不能截取成 MKBD-94。
+SPECIAL_MODEL_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]*)[-_]([A-Za-z]\d{2,8})(?![A-Za-z0-9])",
+    re.I,
+)
 
-        for encoding in NfoFile.ENCODINGS:
-            try:
-                with open(file_path, "r", encoding=encoding) as f:
-                    return f.read(), encoding
-            except UnicodeDecodeError:
+# AB-CD-123、300NTK-670、ABC-123-A/B 等含明确连接符的编码。
+SEPARATED_NUMBER_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"((?:\d{1,4})?[A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z][A-Za-z0-9]*)*)"
+    r"[-_. ](\d{1,8})(?:[-_]([A-Za-z0-9]{1,4}))?"
+    r"(?![A-Za-z0-9])", re.I,
+)
+
+# SSIS001、300NTK670 等无连接符编码；至少两位字母以过滤 H265。
+COMPACT_NUMBER_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])((?:\d{1,4})?[A-Za-z]{2,12})(\d{1,8})"
+    r"(?:[-_]([A-Za-z0-9]{1,4}))?(?![A-Za-z0-9])", re.I,
+)
+
+# 已识别的分碟后缀只是文件分段，不应分裂为不同番号。
+DISC_SUFFIX_PATTERN = re.compile(r"^(?:CD|DISC|DISK|PART)0?[1-9]$", re.I)
+
+# 文件名中的 U/C 一般用作发行版本标记。仅在 NFO 配对时允许其
+# 回退匹配同一基础番号，不将 A/B 或其他有区分意义的后缀混为一组。
+RELEASE_SUFFIXES_FOR_NFO = frozenset({"U", "C"})
+
+
+IGNORED_PREFIX = {
+    "AV", "AAC", "HDR", "UHD", "FHD", "QHD", "WEB", "HEVC", "AVC",
+    "BLURAY", "REMUX", "DVD", "H264", "H265", "X264", "X265",
+    "XVID", "DIVX", "VIDEO", "FPS", "DISC", "DISK", "PART", "CD",
+    "FC", "DOLBY", "FULLHD", "MPV", "CLOUDDRIVE",
+}
+
+
+DISC_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:CD|DISC|DISK|PART)[-_. ]*0?([1-9])(?!\d)"
+    r"|第([一二三四五六七八九])(?:部|张|碟|盘)",
+    re.I
+)
+
+
+WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:[/\\]")
+
+
+ANY_URI = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def application_dir() -> Path:
+    """返回程序真实所在目录，不使用 PyInstaller onefile 的临时解压目录。
+
+    .py 开发运行：cg_dedupe.py 所在目录。
+    PyInstaller onefile / onedir：sys.executable（EXE）所在目录。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def program_data_dir() -> Path:
+    """计算用户数据目录，但不创建，首次扫描前不会产生任何文件。
+
+    .py 模式：脚本所在目录 / CGDedupe_Data
+    EXE 模式：exe 所在目录 / CGDedupe_Data
+    不能用 sys._MEIPASS（onefile 解压临时目录）存放可写数据。
+    """
+    return application_dir() / DATA_DIR_NAME
+
+
+def ensure_program_data_dir() -> Path:
+    """仅从后台工作线程调用，首次开始扫描时生成便携数据目录。
+
+    若 EXE / .py 所在目录没有写入权限，明确报错而不悄悄改写 APPDATA。
+    """
+    directory = program_data_dir()
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe = directory / f".write_test_{os.getpid()}_{secrets.token_hex(4)}"
+        with open(probe, "xb") as stream:
+            stream.write(b"ok")
+        probe.unlink()
+    except OSError as error:
+        raise OSError(
+            f"程序旁的数据目录不可写：{directory}\n"
+            "请将程序放到具有写入权限的位置，不要放在 Program Files 等受保护目录。"
+        ) from error
+    return directory
+
+
+
+def resource_path(name: str) -> str:
+    """分发资源路径：优先 PyInstaller bundle，其次 EXE 旁边；开发时取 .py 旁边。"""
+    if getattr(sys, "frozen", False):
+        bundle_root = getattr(sys, "_MEIPASS", None)
+        if bundle_root:
+            bundled = Path(bundle_root) / name
+            if bundled.is_file():
+                return str(bundled)
+        return str(application_dir() / name)
+    return str(Path(__file__).resolve().parent / name)
+
+
+def ffprobe_binary() -> str | None:
+    """兼容源码旁、EXE 旁及 PyInstaller _internal/bin 下的 ffprobe。"""
+    candidates = (
+        resource_path("ffprobe.exe"),
+        resource_path("bin/ffprobe.exe"),
+        resource_path("tools/ffprobe.exe"),
+        str(application_dir() / "ffprobe.exe"),
+        str(application_dir() / "tools" / "ffprobe.exe"),
+        str(application_dir() / "bin" / "ffprobe.exe"),
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return shutil.which("ffprobe.exe") or shutil.which("ffprobe")
+
+
+def nt_key(path: str) -> str:
+    """纯字符串 Windows 路径归一化；不触发 CD2 的网络/文件系统 I/O。"""
+    return ntpath.normcase(ntpath.normpath(str(path)))
+
+
+def is_nested_path(path: str, root: str, *, allow_equal=False) -> bool:
+    try:
+        normalized = nt_key(path)
+        base = nt_key(root)
+        common = ntpath.commonpath([normalized, base])
+        return common == base and (allow_equal or normalized != base)
+    except (OSError, ValueError):
+        return False
+
+
+def unique_scan_roots(roots: list[str]) -> list[str]:
+    unique = []
+    for root in roots:
+        if not root:
+            continue
+        absolute = os.path.abspath(root)
+        if nt_key(absolute) not in {nt_key(item) for item in unique}:
+            unique.append(absolute)
+    return [root for root in unique if not any(
+        root != other and is_nested_path(root, other)
+        for other in unique
+    )]
+
+
+def extract_number(value: str | None) -> str:
+    """从 NFO/文件名提取规范番号；不同作品的 A/B 等后缀必须保留。
+
+    参考 Number Tags 的 canon/extract，但不会用通用规则吞掉 FC2 前缀。
+    保留先前的小于3位数字补零规则及 T / 日期识别。
+    """
+    if not value:
+        return ""
+    value = str(value).strip()
+    value = value.translate(str.maketrans({
+        "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-",
+        "−": "-", "＿": "_",
+    }))
+
+    match = FC2_PATTERN.search(value)
+    if match:
+        return f"FC2-PPV-{match.group(1)}"
+
+    match = T_PATTERN.search(value)
+    if match:
+        return f"T-{match.group(1)}-{match.group(2)}"
+
+    match = DATE_PATTERN.search(value)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+
+    match = NUMERIC_PAIR_PATTERN.search(value)
+    if match:
+        return f"{match.group(1)}_{match.group(2)}"
+
+    match = SPECIAL_MODEL_PATTERN.search(value)
+    if match:
+        prefix = match.group(1).upper()
+        if prefix not in IGNORED_PREFIX:
+            return f"{prefix}-{match.group(2).upper()}"
+
+    for pattern in (SEPARATED_NUMBER_PATTERN, COMPACT_NUMBER_PATTERN):
+        for match in pattern.finditer(value):
+            prefix = match.group(1).upper().replace("_", "-")
+            compact = prefix.replace("-", "")
+            if sum(letter.isalpha() for letter in compact) < 2:
                 continue
-            except PermissionError:
-                print(f"文件权限错误 {file_path}")
-                return None, None
-            except FileNotFoundError:
-                print(f"文件不存在 {file_path}")
-                return None, None
-            except Exception as e:
-                print(f"读取文件出错 {file_path}: {str(e)}")
-                return None, None
-
-        print(f"无法以任何编码打开文件 {file_path}")
-        return None, None
-
-    @staticmethod
-    def extract_code(text):
-        """从文本中提取番号"""
-        if not text:
-            return None
-
-        for pattern, is_special in NfoFile.CODE_PATTERNS:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                if is_special:
-                    if "FC2" in pattern:
-                        return match.group(0).upper()
-                    elif "T-?" in pattern:
-                        return f"T-{match.group(1)}-{match.group(2)}".upper()
-                    elif r"(\d{6})-(\d{3})" == pattern:
-                        return f"{match.group(1)}-{match.group(2)}"
-                    else:
-                        return match.group(0).upper()
-                else:
-                    return f"{match.group(1)}-{match.group(2)}".upper()
-        return None
-
-    @staticmethod
-    def similarity(str1, str2):
-        """计算两个字符串的相似度，修复缺失的方法"""
-        if not str1 or not str2:
-            return 0.0
-        
-        # 使用SequenceMatcher计算相似度
-        return SequenceMatcher(None, str1.lower(), str2.lower()).ratio()
-
-    @staticmethod
-    def should_exclude_cd_duplicate(file_paths):
-        """仅排除明确由 CD1/CD2（或 Disc1/Disc2）组成的多碟集合。"""
-        return paths_form_multi_disc_set(file_paths)
+            if compact in IGNORED_PREFIX:
+                continue
+            digits = match.group(2)
+            # 与旧版相同：少于三位的序号补足三位。
+            number = digits.zfill(3) if len(digits) <= 3 else digits
+            suffix = (match.group(3) or "").upper()
+            if DISC_SUFFIX_PATTERN.fullmatch(suffix):
+                suffix = ""
+            return f"{prefix}-{number}" + (f"-{suffix}" if suffix else "")
+    return ""
 
 
+def number_equivalence_key(code: str) -> str:
+    """参考 buildKeys 的明确等价关系；返回用于查重的稳定单键。
 
-class NfoDuplicateLogic:
-    """处理NFO文件查重的核心逻辑类"""
+    - 数字厂牌前缀：300NTK-670 == NTK-670
+    - 复合前缀连接符：AB-CD-123 == ABCD-123
+    - 数字序号前导零：ABC-001 == ABC-1
+    - 字母后缀必须参与匹配：ABC-123-A != ABC-123-B
+    - FC2 和纯数字组合有独立命名空间，不与普通字母番号混合。
+    """
+    if not code:
+        return code
+    code = code.strip().upper()
+    match = re.fullmatch(r"FC2-PPV-(\d{5,9})", code)
+    if match:
+        return f"FC2-PPV-{match.group(1)}"
 
-    # 字段常量
-    FIELD_NUM = "番号"
-    FIELD_SERIES = "系列"
+    match = re.fullmatch(r"(\d{5,9})[-_](\d{2,5})", code)
+    if match:
+        # 保留两段数字的分界，避免不同分段的纯数字编号误碰撞。
+        return f"NUM:{match.group(1)}_{match.group(2)}"
 
-    def get_nfo_files_generator(self, directories):
-        """获取 NFO；自动去除重复/嵌套扫描根，并按真实路径去重。"""
-        seen = set()
-        for directory in normalize_scan_roots(directories):
-            try:
-                for root, dirs, files in os.walk(directory):
-                    dirs.sort(key=str.lower)
-                    for file in sorted(files, key=str.lower):
-                        if not file.lower().endswith(".nfo"):
-                            continue
-                        path = os.path.join(root, file)
-                        key = canonical_path(path)
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        yield path
-            except PermissionError:
-                print(f"无权限访问目录: {directory}")
-            except OSError as e:
-                print(f"遍历目录出错 {directory}: {e}")
-
-    def process_nfo_file(self, args):
-        """
-        处理单个NFO文件，提取指定字段值
-
-        Args:
-            args (tuple): (文件路径, 要查找的字段)
-
-        Returns:
-            tuple: (提取的值, 文件路径) 或 (None, 文件路径)表示未找到
-        """
-        nfo_file, field = args
-
-        # 检查文件是否存在
-        if not os.path.exists(nfo_file):
-            return None, nfo_file
-
-        # 读取文件内容
-        content, encoding = NfoFile.safe_read_file(nfo_file)
-        if content is None:
-            return None, nfo_file
-
-        # 解析XML
-        try:
-            tree = ET.fromstring(content)
-            result = self._extract_field_value(tree, field, nfo_file)
-            return result, nfo_file
-
-        except ET.ParseError as e:
-            print(f"XML解析错误 {nfo_file}: {e}")
-        except Exception as e:
-            print(f"处理文件错误 {nfo_file}: {e}")
-
-        return None, nfo_file
-
-    def _extract_field_value(self, tree, field, nfo_file):
-        """从XML树中提取字段值"""
-        if field == self.FIELD_NUM:
-            return self._extract_num_field(tree, nfo_file)
-        elif field == self.FIELD_SERIES:
-            return self._extract_series_field(tree)
-        return None
-
-    def _extract_num_field(self, tree, nfo_file):
-        """提取番号字段"""
-        # 优先级1: <num>标签
-        num_elem = tree.find("num")
-        if num_elem is not None and num_elem.text:
-            return num_elem.text.strip()
-
-        # 优先级2: 标题字段
-        for tag_name in ["title", "originaltitle", "sorttitle"]:
-            elem = tree.find(tag_name)
-            if elem is not None and elem.text:
-                code = NfoFile.extract_code(elem.text)
-                if code:
-                    return code
-
-        # 优先级3: 文件名
-        filename = os.path.basename(nfo_file)
-        code = NfoFile.extract_code(filename)
+    match = re.fullmatch(r"T-(\d{2,3})-(\d{3})", code)
+    if match:
         return code
 
-    def _extract_series_field(self, tree):
-        """提取系列字段"""
-        series_elem = tree.find("series")
-        if series_elem is not None and series_elem.text:
-            return series_elem.text.strip()
-        return None
+    match = re.fullmatch(r"([A-Z][A-Z0-9]*)-([A-Z]\d{2,8})", code)
+    if match:
+        # MKBD-S94 与 MKBDS94 的紧凑形式在用户脚本中可以匹配。
+        return match.group(1) + match.group(2)[0] + "-" + match.group(2)[1:]
 
-    def find_duplicates_with_similarity(self, field_value_map, is_exact_match, threshold):
-        """根据匹配模式查找重复项，重构减少重复代码"""
-        if is_exact_match:
-            return self._find_exact_duplicates(field_value_map)
-        else:
-            return self._find_partial_duplicates(field_value_map, threshold)
+    match = re.fullmatch(
+        r"([A-Z0-9]+(?:-[A-Z][A-Z0-9]*)*)-(\d{1,8})(?:-([A-Z0-9]{1,4}))?",
+        code,
+    )
+    if not match:
+        return code
 
-    def _find_exact_duplicates(self, field_value_map):
-        """查找完全匹配的重复项"""
-        duplicates = {}
-        for value, paths in field_value_map.items():
-            if len(paths) > 1 and not self._should_exclude_duplicate(paths):
-                duplicates[value] = paths
-        return duplicates
+    compact_prefix = match.group(1).replace("-", "")
+    studio_stripped = re.sub(
+        r"^\d{1,4}(?=[A-Z]{2,})", "", compact_prefix
+    )
+    suffix = (match.group(3) or "")
+    if DISC_SUFFIX_PATTERN.fullmatch(suffix):
+        suffix = ""
+    return f"{studio_stripped}-{int(match.group(2))}" + (
+        f"-{suffix}" if suffix else ""
+    )
 
-    def _find_partial_duplicates(self, field_value_map, threshold):
-        """按相似关系的连通分量分组，避免 A~B、B~C 时漏掉 C。"""
-        values = sorted(field_value_map.keys(), key=lambda value: value.casefold())
-        parent = list(range(len(values)))
 
-        def find(index):
-            while parent[index] != index:
-                parent[index] = parent[parent[index]]
-                index = parent[index]
-            return index
+def filename_release_base_key(code: str) -> str:
+    """只供 NFO 配对：若文件名后缀为 U/C，可回退到无后缀的 NFO。
 
-        def union(left, right):
-            left_root = find(left)
-            right_root = find(right)
-            if left_root != right_root:
-                parent[right_root] = left_root
+    不能用于重复分组；ABC-123-A/B 始终被当作不同的番号。
+    """
+    if not code:
+        return ""
+    base, delim, suffix = code.rpartition("-")
+    if delim and suffix.upper() in RELEASE_SUFFIXES_FOR_NFO:
+        return number_equivalence_key(base)
+    return ""
 
-        for left in range(len(values)):
-            for right in range(left + 1, len(values)):
-                if NfoFile.similarity(values[left], values[right]) >= threshold:
-                    union(left, right)
 
-        components = {}
-        for index, value in enumerate(values):
-            components.setdefault(find(index), []).append(value)
+def preferred_number_label(entries: list[MediaEntry]) -> str:
+    """分组标签优先采用已扫描到的无数字前缀番号，保留所有原始记录。"""
+    codes = {entry.code for entry in entries if entry.code}
+    return min(
+        codes,
+        key=lambda code: (
+            bool(re.match(r"^\d{1,4}[A-Z]{2,12}-\d+$", code, re.I)),
+            len(code),
+            code.casefold(),
+        ),
+    )
 
-        duplicates = {}
-        for group_values in components.values():
-            all_paths = []
-            for value in group_values:
-                all_paths.extend(field_value_map[value])
-            all_paths = sorted(dict.fromkeys(all_paths), key=canonical_path)
-            if len(all_paths) <= 1 or self._should_exclude_duplicate(all_paths):
+
+def normalize_series(value: str | None) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip()).casefold()
+
+
+def read_nfo(path: str, *, strict: bool = False) -> dict[str, str]:
+    try:
+        # 限制大小，避免异常文件拖慢 SSD 查重。
+        with open(path, "rb") as handle:
+            raw = handle.read(2 * 1024 * 1024 + 1)
+        if len(raw) > 2 * 1024 * 1024:
+            raise ValueError("NFO 超过 2 MiB，已跳过")
+    except (OSError, ValueError):
+        if strict:
+            raise
+        return {}
+    try:
+        root = ET.fromstring(raw)
+    except (ET.ParseError, ValueError):
+        root = None
+        for encoding in ("utf-8-sig", "gb18030", "utf-16"):
+            try:
+                text = raw.decode(encoding)
+                text = re.sub(r"^\s*<\?xml[^>]*\?>", "", text, count=1)
+                root = ET.fromstring(text)
+                break
+            except (ET.ParseError, UnicodeError, ValueError):
                 continue
-            duplicates[group_values[0]] = all_paths
-        return duplicates
+        if root is None:
+            if strict:
+                raise ValueError("NFO XML 或字符编码无效")
+            return {}
+    data = {}
+    for tag in ("num", "title", "originaltitle", "sorttitle", "series"):
+        data[tag] = (root.findtext(tag) or "").strip()
+    if not data.get("series"):
+        data["series"] = (root.findtext("./set/name") or "").strip()
+    return data
 
 
-    def _should_exclude_duplicate(self, paths):
-        """统一的重复检测排除逻辑"""
-        return NfoFile.should_exclude_cd_duplicate(paths)
+def read_strm(path: str, *, strict: bool = False) -> str:
+    """STRM 是文本指针，读取少量本地字节，不访问指向的云端视频。"""
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(16 * 1024 + 1)
+        if len(raw) > 16 * 1024:
+            raise ValueError("STRM 超过 16 KiB，已跳过")
+    except (OSError, ValueError):
+        if strict:
+            raise
+        return ""
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encodings = ("utf-16",)
+    elif b"\x00" in raw:
+        encodings = ("utf-16-be",) if raw[::2].count(0) > raw[1::2].count(0) else ("utf-16-le",)
+    else:
+        encodings = ("utf-8-sig", "gb18030")
+    for encoding in encodings:
+        try:
+            content = raw.decode(encoding)
+            if "\x00" in content:
+                continue
+            for line in content.splitlines():
+                text = line.strip().strip('"').strip("'")
+                if text and not text.startswith("#"):
+                    return text
+        except UnicodeError:
+            continue
+    if strict:
+        raise ValueError("STRM 为空或编码无效")
+    return ""
 
 
-class DedupeWorker(QtCore.QThread):
-    """在独立 QThread 中执行扫描、解析和匹配，GUI 线程只接收信号。"""
+def normalize_strm_target(
+    strm_path: str, raw: str, from_prefix: str = "", to_prefix: str = ""
+) -> tuple[str, str]:
+    """返回 (地址, path/url/unmapped/invalid)；从不检查源文件是否存在。"""
+    raw = (raw or "").strip().strip('"').strip("'")
+    if not raw:
+        return "", "invalid"
+    if ANY_URI.match(raw):
+        try:
+            urllib.parse.urlsplit(raw)
+        except ValueError:
+            return raw, "invalid"
+    if raw.lower().startswith("file://"):
+        parts = urllib.parse.urlsplit(raw)
+        if parts.netloc and parts.netloc.lower() != "localhost":
+            raw = "\\\\" + parts.netloc + urllib.parse.unquote(parts.path).replace("/", "\\")
+        else:
+            raw = urllib.parse.unquote(parts.path)
+            if re.match(r"^/[A-Za-z]:/", raw):
+                raw = raw[1:]
+    elif ANY_URI.match(raw):
+        scheme = urllib.parse.urlsplit(raw).scheme.casefold()
+        return (raw, "url") if scheme in {"http", "https", "rtsp", "ftp", "smb"} else (raw, "unmapped")
 
-    progress = QtCore.Signal(int, int)
-    completed = QtCore.Signal(dict, int)
-    failed = QtCore.Signal(str)
+    # Linux 路径可手动映射到 CD2 本地盘符，例如 /115/视频 -> M:\视频
+    source = from_prefix.strip().replace("\\", "/").rstrip("/")
+    raw_unix = raw.replace("\\", "/")
+    if source and to_prefix.strip() and (
+        raw_unix.casefold() == source.casefold()
+        or raw_unix.casefold().startswith(source.casefold() + "/")
+    ):
+        suffix = raw_unix[len(source):].lstrip("/")
+        segments = [part for part in suffix.split("/") if part]
+        raw = ntpath.join(to_prefix.strip(), *segments)
+    if WINDOWS_DRIVE.match(raw) or raw.startswith("\\\\") or raw.startswith("//"):
+        return ntpath.normpath(raw), "path"
+    if ntpath.splitdrive(raw)[0] or raw.startswith("\\"):
+        return raw, "unmapped"
+    if raw.startswith("/"):
+        return raw, "unmapped"
+    return ntpath.normpath(ntpath.join(ntpath.dirname(strm_path), raw)), "path"
 
-    def __init__(self, logic, directories, field, exact_match, threshold, batch_size):
-        super().__init__()
-        self.logic = logic
-        self.directories = list(directories)
-        self.field = field
-        self.exact_match = exact_match
-        self.threshold = threshold
-        self.batch_size = max(1, int(batch_size))
+
+def get_disc_number(text: str) -> int | None:
+    match = DISC_PATTERN.search(text)
+    if not match:
+        return None
+    if match.group(1):
+        return int(match.group(1))
+    return "一二三四五六七八九".index(match.group(2)) + 1
+
+
+def get_edition_group(path: str, disc: int | None) -> str:
+    """同一套 CD1/CD2/CD3 作为一个版本，避免误算三部重复。"""
+    if disc is None:
+        return ""
+    folder = ntpath.dirname(path)
+    folder_name = ntpath.basename(folder)
+    clean_stem = DISC_PATTERN.sub("", ntpath.splitext(ntpath.basename(path))[0])
+    clean_stem = clean_stem.strip(" ._-").casefold()
+    clean_folder = ""
+    if get_disc_number(folder_name) is not None:
+        clean_folder = DISC_PATTERN.sub("", folder_name).strip(" ._-").casefold()
+        folder = ntpath.dirname(folder)
+    return f"discs:{nt_key(folder)}|{clean_folder}|{clean_stem}"
+
+
+def determine_key(nfo: dict, media_path: str, target: str, mode: str) -> str:
+    if mode == "系列":
+        return normalize_series(nfo.get("series"))
+    candidates = (
+        nfo.get("num", ""),
+        ntpath.splitext(ntpath.basename(media_path))[0],
+        ntpath.basename(ntpath.dirname(media_path)),
+        nfo.get("title", ""),
+        nfo.get("originaltitle", ""),
+        nfo.get("sorttitle", ""),
+        ntpath.basename(ntpath.dirname(ntpath.dirname(media_path))),
+        ntpath.splitext(ntpath.basename(target))[0] if target else "",
+    )
+    for candidate in candidates:
+        result = extract_number(candidate)
+        if result:
+            return result
+    return ""
+
+
+def paired_nfo(
+    media_path: str, nfo_paths: list[str],
+    parsed: dict[str, dict] | None = None,
+    stem_index: dict[str, list[str]] | None = None,
+    number_index: dict[str, list[str]] | None = None,
+    *, allow_fallback: bool = True,
+) -> str:
+    """建立 O(1) 的同名/NFO 编码索引，避免同目录万级文件的 O(N²) 配对。"""
+    if not nfo_paths:
+        return ""
+    parsed = parsed or {}
+    stem = ntpath.splitext(ntpath.basename(media_path))[0].casefold()
+    movie_code = extract_number(stem)
+
+    def is_compatible(path: str) -> bool:
+        info = parsed.get(path, {})
+        known = extract_number(info.get("num")) or extract_number(ntpath.basename(path))
+        if not movie_code or not known:
+            return True
+        known_key = number_equivalence_key(known)
+        return (
+            number_equivalence_key(movie_code) == known_key
+            or filename_release_base_key(movie_code) == known_key
+        )
+
+    if stem_index is None:
+        exact_candidates = [
+            path for path in nfo_paths
+            if ntpath.splitext(ntpath.basename(path))[0].casefold() == stem
+        ]
+    else:
+        exact_candidates = stem_index.get(stem, [])
+    for path in exact_candidates:
+        if is_compatible(path):
+            return path
+    if movie_code:
+        if number_index is None:
+            number_candidates = [
+                path for path in nfo_paths
+                if number_equivalence_key(
+                    extract_number(parsed.get(path, {}).get("num"))
+                    or extract_number(ntpath.basename(path))
+                ) in {
+                    number_equivalence_key(movie_code),
+                    filename_release_base_key(movie_code),
+                }
+            ]
+        else:
+            # 兼容由旧代码构建的原始番号索引及新版等价键索引。
+            number_candidates = number_index.get(movie_code, [])
+            if not number_candidates:
+                number_candidates = number_index.get(number_equivalence_key(movie_code), [])
+            if not number_candidates:
+                release_key = filename_release_base_key(movie_code)
+                if release_key:
+                    number_candidates = number_index.get(release_key, [])
+        if len(number_candidates) > 1:
+            # 如果一个目录同时有 NTK-670 和 300NTK-670 的 NFO，
+            # 优先选择与文件名原始番号完全一致的 NFO，避免配错元数据。
+            exact = [
+                path for path in number_candidates
+                if (extract_number(parsed.get(path, {}).get("num"))
+                    or extract_number(ntpath.basename(path))) == movie_code
+            ]
+            if len(exact) == 1:
+                return exact[0]
+        if len(number_candidates) == 1:
+            return number_candidates[0]
+    # movie.nfo 是目录元数据；仅在目录作品无歧义时允许兜底。
+    generic = [path for path in nfo_paths
+               if ntpath.basename(path).casefold() == "movie.nfo" and is_compatible(path)]
+    if allow_fallback and len(generic) == 1:
+        return generic[0]
+    if allow_fallback and len(nfo_paths) == 1 and is_compatible(nfo_paths[0]):
+        return nfo_paths[0]
+    return ""
+
+
+@dataclass
+class MediaEntry:
+    identifier: int
+    code: str
+    media_path: str       # 实际 .strm / .mp4 / .mkv 等本地扫描文件
+    media_type: str       # STRM / 视频 / NFO
+    nfo_path: str
+    raw_target: str       # STRM 的原始首行，或实际视频路径
+    target: str           # 用于播放/ffprobe 的地址
+    target_kind: str      # path / url / unmapped / invalid / nfo
+    folder: str
+    edition_group: str    # 多碟的归并组
+    disc: int | None = None
+    info: dict = field(default_factory=dict)
+    info_status: str = "未读取"
+    nfo_num: str = ""     # 仅用于未识别番号日志；来自现有 NFO 解析或缓存
+
+    def distinct_version_key(self) -> str:
+        if self.target and self.target_kind in ("path", "url"):
+            return target_identity(self.target, self.target_kind)
+        if self.target and self.target_kind == "unmapped":
+            return "unmapped:" + self.target
+        # 共用 NFO 不代表共用视频；无效 STRM 也必须保留各自的记录身份。
+        return "media:" + nt_key(self.media_path)
+
+
+def target_identity(target: str, kind: str | None = None) -> str:
+    """Windows 路径忽略大小写；URL 保留路径、查询及签名的大小写。"""
+    kind = kind or ("url" if ANY_URI.match(target) else "path")
+    return "url:" + target if kind == "url" else "path:" + nt_key(target)
+
+
+def version_groups(entries: list[MediaEntry]) -> list[list[MediaEntry]]:
+    """同源引用和同套多碟均合并；两种关系同时生效，避免假重复。"""
+    parent = list(range(len(entries)))
+    seen = {}
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, entry in enumerate(entries):
+        keys = [entry.distinct_version_key()]
+        if entry.edition_group:
+            keys.append(entry.edition_group)
+        for key in keys:
+            if key in seen:
+                parent[find(i)] = find(seen[key])
+            else:
+                seen[key] = i
+    groups = defaultdict(list)
+    for i, entry in enumerate(entries):
+        groups[find(i)].append(entry)
+    return list(groups.values())
+
+
+def version_count(entries: list[MediaEntry]) -> int:
+    return len(version_groups(entries))
+
+
+def group_matches_query(code: str, entries: list[MediaEntry], query: str) -> bool:
+    return not query or query in code.casefold() or any(
+        query in row.code.casefold() or query in row.folder.casefold()
+        or query in row.target.casefold() or query in row.media_path.casefold()
+        for row in entries
+    )
+
+
+def number_sort_key(code: str) -> tuple:
+    """番号自然升序：ABC-2 排在 ABC-10 前，不改变原有查重分组。"""
+    pieces = re.split(r"([0-9]+)", code.casefold())
+    return tuple(
+        (1, int(piece)) if piece.isascii() and piece.isdecimal() else (0, piece)
+        for piece in pieces if piece
+    )
+
+
+def unique_group_folders(entries: list[MediaEntry]) -> list[str]:
+    """按文件夹全路径（Windows 不区分大小写）去重；不访问 CD2。"""
+    folders = []
+    seen = set()
+    for entry in entries:
+        folder = entry.folder
+        if not folder:
+            continue
+        key = nt_key(folder)
+        if key not in seen:
+            seen.add(key)
+            folders.append(folder)
+    return folders
+
+
+def group_duplicates(
+    entries: list[MediaEntry], *, mode: str, fuzzy=False,
+    threshold=0.8, stop_event: threading.Event | None = None,
+):
+    buckets: dict[str, list[MediaEntry]] = defaultdict(list)
+    for entry in entries:
+        if entry.code:
+            key = (number_equivalence_key(entry.code)
+                   if mode != "系列" else entry.code)
+            buckets[key].append(entry)
+
+    # 只针对“番号”使用油猴脚本的明确等价键，不进行模糊匹配。
+    # 保留每条 entry.code 的原始番号；显示名优先选无数字前缀的版本。
+    if mode != "系列":
+        return {
+            preferred_number_label(rows): rows
+            for rows in buckets.values()
+            if version_count(rows) >= 2
+        }
+    if not fuzzy or len(buckets) < 2:
+        return {key: rows for key, rows in buckets.items() if version_count(rows) >= 2}
+
+    values = sorted(buckets)
+    parent = list(range(len(values)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left, right):
+        a, b = find(left), find(right)
+        if a != b:
+            parent[b] = a
+
+    # 相似匹配仅限系列；用长度过滤减少无意义的比较。
+    for left in range(len(values)):
+        if stop_event is not None and stop_event.is_set():
+            return {}
+        first = values[left]
+        for right in range(left + 1, len(values)):
+            if right % 128 == 0 and stop_event is not None and stop_event.is_set():
+                return {}
+            second = values[right]
+            if 2 * min(len(first), len(second)) / (len(first) + len(second)) < threshold:
+                continue
+            matcher = SequenceMatcher(None, first, second, autojunk=False)
+            if matcher.quick_ratio() >= threshold and matcher.ratio() >= threshold:
+                union(left, right)
+    combined: dict[int, list[MediaEntry]] = defaultdict(list)
+    for index, key in enumerate(values):
+        combined[find(index)].extend(buckets[key])
+    result = {}
+    for group in combined.values():
+        if version_count(group) >= 2:
+            key = min((entry.code for entry in group), key=str.casefold)
+            result[key] = group
+    return result
+
+
+class LocalTextCache:
+    """SQLite 仅由扫描管理线程写入；只读快照供本地小文件线程共享。"""
+
+    def __init__(self, path: Path):
+        self.connection = sqlite3.connect(str(path), timeout=8)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA synchronous=NORMAL")
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS local_text_cache ("
+            "path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, "
+            "size INTEGER NOT NULL, payload TEXT NOT NULL)"
+        )
+        self.connection.commit()
+        # 一次顺序读，避免每个文件执行一次 SELECT。只缓存 NFO/STRM 元数据。
+        self.snapshot = {row[0]: row[1:] for row in self.connection.execute(
+            "SELECT path, mtime_ns, size, payload FROM local_text_cache")}
+        self.pending = []
+
+    def store_many(self, rows):
+        self.pending.extend(rows)
+        if len(self.pending) >= 512:
+            self.flush()
+
+    def flush(self):
+        if self.pending:
+            self.connection.executemany(
+                "INSERT OR REPLACE INTO local_text_cache VALUES (?, ?, ?, ?)", self.pending)
+            self.connection.commit()
+            self.pending.clear()
+
+    def close(self):
+        try:
+            self.flush()
+        finally:
+            self.connection.close()
+
+
+def iter_scan_folders(roots, stop_event, errors):
+    """单次 scandir 枚举；不跟随链接/junction，不访问 STRM 目标。"""
+    for root in unique_scan_roots(roots):
+        stack = [root]
+        while stack and not stop_event.is_set():
+            folder = stack.pop()
+            nfos, media, children = [], [], []
+            try:
+                with os.scandir(folder) as items:
+                    for item in items:
+                        if stop_event.is_set():
+                            return
+                        try:
+                            if item.is_symlink():
+                                continue
+                            if item.is_dir(follow_symlinks=False):
+                                if os.name == "nt" and (
+                                    item.stat(follow_symlinks=False).st_file_attributes & 0x400
+                                ):
+                                    continue
+                                children.append(item.path)
+                                continue
+                            ext = ntpath.splitext(item.name)[1].casefold()
+                            if ext != ".nfo" and ext not in MEDIA_EXTS:
+                                continue
+                            if not item.is_file(follow_symlinks=False):
+                                continue
+                            if ext == ".nfo":
+                                nfos.append(item)
+                            else:
+                                media.append(item)
+                        except OSError as error:
+                            if len(errors) < 25:
+                                errors.append(f"{item.path}：{error}")
+            except OSError as error:
+                if len(errors) < 25:
+                    errors.append(f"{folder}：{error}")
+                continue
+            # 稳定的目录遍历顺序；文件在各目录任务内排序。
+            stack.extend(sorted(children, key=str.casefold, reverse=True))
+            yield folder, nfos, media
+
+
+def read_scan_folder(job, snapshot, mode, source_prefix, mount_prefix, stop_event):
+    folder, nfo_items, media_items = job
+    nfo_items.sort(key=lambda item: item.name.casefold())
+    media_items.sort(key=lambda item: item.name.casefold())
+    changed, errors, records = [], [], []
+    hits = {"nfo": 0, "strm": 0}
+    reads = {"nfo": 0, "strm": 0}
+
+    def load(item, kind):
+        if stop_event.is_set():
+            return {} if kind == "nfo" else ""
+        try:
+            st = item.stat(follow_symlinks=False)
+            key = nt_key(item.path)
+            cached = snapshot.get(key)
+            if cached and cached[:2] == (st.st_mtime_ns, st.st_size):
+                try:
+                    value = json.loads(cached[2])
+                    if ((kind == "nfo" and isinstance(value, dict)) or
+                            (kind == "strm" and isinstance(value, str))):
+                        hits[kind] += 1
+                        return value
+                except (ValueError, TypeError):
+                    pass
+            reads[kind] += 1
+            value = (read_nfo(item.path, strict=True) if kind == "nfo"
+                     else read_strm(item.path, strict=True))
+            # DirEntry.stat 有缓存；此处有意 fresh stat，避免读取期间变动被缓存。
+            after = os.stat(item.path, follow_symlinks=False)
+            if (after.st_mtime_ns, after.st_size) == (st.st_mtime_ns, st.st_size):
+                changed.append((key, st.st_mtime_ns, st.st_size,
+                                json.dumps(value, ensure_ascii=False)))
+            return value
+        except (OSError, ValueError) as error:
+            if len(errors) < 25:
+                errors.append(f"{item.path}：{error}")
+            return {} if kind == "nfo" else ""
+
+    nfos = [item.path for item in nfo_items]
+    parsed = {}
+    for item in nfo_items:
+        if stop_event.is_set():
+            break
+        parsed[item.path] = load(item, "nfo")
+    stem_index, number_index = defaultdict(list), defaultdict(list)
+    for path in nfos:
+        stem_index[ntpath.splitext(ntpath.basename(path))[0].casefold()].append(path)
+        number = extract_number(parsed.get(path, {}).get("num")) or extract_number(ntpath.basename(path))
+        if number:
+            number_index[number_equivalence_key(number)].append(path)
+    # 番号提取一次即可复用：避免大目录上反复执行多轮正则表达式。
+    codes = set()
+    all_media_coded = True
+    for item in media_items:
+        raw_code = extract_number(item.name)
+        if raw_code:
+            codes.add(number_equivalence_key(raw_code))
+        else:
+            all_media_coded = False
+    allow_fallback = len(media_items) == 1 or (
+        len(codes) == 1 and all_media_coded
+    )
+    for item in media_items:
+        if stop_event.is_set():
+            break
+        media_path = item.path
+        is_strm = item.name.casefold().endswith(".strm")
+        nfo_path = paired_nfo(media_path, nfos, parsed, stem_index, number_index,
+                              allow_fallback=allow_fallback)
+        raw = load(item, "strm") if is_strm else media_path
+        target, kind = (normalize_strm_target(media_path, raw, source_prefix, mount_prefix)
+                        if is_strm else (media_path, "path"))
+        disc = get_disc_number(ntpath.splitext(item.name)[0])
+        if disc is None:
+            disc = get_disc_number(ntpath.basename(folder))
+        records.append(MediaEntry(
+            identifier=0, code=determine_key(parsed.get(nfo_path, {}), media_path, target, mode),
+            media_path=media_path, media_type="STRM" if is_strm else "视频",
+            nfo_path=nfo_path, raw_target=raw, target=target, target_kind=kind,
+            folder=folder, edition_group=get_edition_group(media_path, disc), disc=disc,
+            info_status={"unmapped": "待映射", "invalid": "STRM 无效"}.get(kind, "未读取"),
+            nfo_num=str(parsed.get(nfo_path, {}).get("num") or ""),
+        ))
+    # 有媒体的目录内，未配对 NFO 只是元数据，不能凭空多算一个媒体版本。
+    # 纯 NFO 目录继续支持旧版查重。
+    if not media_items:
+        for path in nfos:
+            if stop_event.is_set():
+                break
+            disc = get_disc_number(ntpath.splitext(ntpath.basename(path))[0])
+            if disc is None:
+                disc = get_disc_number(ntpath.basename(folder))
+            records.append(MediaEntry(
+                identifier=0, code=determine_key(parsed.get(path, {}), path, "", mode),
+                media_path=path, media_type="NFO", nfo_path=path, raw_target="", target="",
+                target_kind="nfo", folder=folder, edition_group=get_edition_group(path, disc),
+                disc=disc, info_status="仅 NFO",
+                nfo_num=str(parsed.get(path, {}).get("num") or ""),
+            ))
+    return records, changed, hits, reads, errors
+
+
+def scan_library(
+    roots: list[str], mode: str, source_prefix: str, mount_prefix: str,
+    stop_event: threading.Event, notify: Callable[[int, int], None],
+    cache_path: Path | None = None, cache_report: dict | None = None,
+    *, scan_workers: int = 1,
+) -> tuple[list[MediaEntry], int, int, int, list[str]]:
+    """本地文件有界并行；SQLite 在管理线程；目标视频零 I/O。"""
+    entries, errors = [], []
+    cache = None
+    snapshot = {}
+    if cache_path is not None:
+        try:
+            cache = LocalTextCache(cache_path)
+            snapshot = cache.snapshot
+        except (OSError, sqlite3.Error) as error:
+            errors.append(f"本地文本缓存不可用，本次直接读取：{error}")
+    nfo_total = strm_total = video_total = visited = processed = 0
+    stats = {"hits": 0, "parsed": 0, "strm_hits": 0, "strm_read": 0}
+    workers = max(1, min(int(scan_workers), 16))
+    pending = []
+    last_notify = time.monotonic()
+
+    def consume(result):
+        nonlocal processed, cache, last_notify
+        records, changed, hits, reads, notices = result
+        entries.extend(records)
+        processed += hits["nfo"] + reads["nfo"]
+        stats["hits"] += hits["nfo"]
+        stats["parsed"] += reads["nfo"]
+        stats["strm_hits"] += hits["strm"]
+        stats["strm_read"] += reads["strm"]
+        errors.extend(notices[:max(0, 25 - len(errors))])
+        if cache is not None:
+            try:
+                cache.store_many(changed)
+            except sqlite3.Error as error:
+                errors.append(f"缓存写入失败，本次继续扫描：{error}")
+                try:
+                    cache.connection.close()
+                finally:
+                    cache = None
+        now = time.monotonic()
+        if now - last_notify >= 0.15:
+            notify(visited, processed)
+            last_notify = now
+
+    try:
+        # 仅保留最多 2*workers 个目录任务，不把整库 Future 堆进内存。
+        executor = (ThreadPoolExecutor(max_workers=workers, thread_name_prefix="CGDedupe-Local")
+                    if workers > 1 else nullcontext())
+        with executor as pool:
+            try:
+                for job in iter_scan_folders(roots, stop_event, errors):
+                    if stop_event.is_set():
+                        break
+                    visited += 1
+                    nfo_total += len(job[1])
+                    strm_total += sum(item.name.casefold().endswith(".strm") for item in job[2])
+                    video_total += sum(not item.name.casefold().endswith(".strm") for item in job[2])
+                    if pool is None:
+                        consume(read_scan_folder(job, snapshot, mode, source_prefix, mount_prefix, stop_event))
+                        continue
+                    pending.append(pool.submit(read_scan_folder, job, snapshot, mode,
+                                               source_prefix, mount_prefix, stop_event))
+                    if len(pending) >= workers * 2:
+                        # 按提交顺序归并，保证每次扫描 ID/显示顺序稳定。
+                        consume(pending.pop(0).result())
+                for future in pending:
+                    if stop_event.is_set():
+                        future.cancel()
+                    if not future.cancelled():
+                        consume(future.result())
+            except BaseException:
+                stop_event.set()
+                for future in pending:
+                    future.cancel()
+                raise
+    finally:
+        if cache_report is not None:
+            cache_report.update(stats)
+        if cache is not None:
+            try:
+                cache.close()
+            except sqlite3.Error as error:
+                errors.append(f"缓存保存失败：{error}")
+    for identifier, entry in enumerate(entries, 1):
+        entry.identifier = identifier
+    notify(visited, processed)
+    return entries, nfo_total, strm_total, video_total, errors
+
+
+def classify_resolution(width: int, height: int) -> str:
+    if width >= 3800 or height >= 2100:
+        return "4K"
+    if width >= 2500 or height >= 1400:
+        return "2K"
+    if width >= 1900 or height >= 1000:
+        return "1080p"
+    if width >= 1200 or height >= 680:
+        return "720p"
+    return "SD" if width and height else "—"
+
+
+def format_fps(value) -> str:
+    try:
+        rate = float(Fraction(str(value or "0/0")))
+        if 0 < rate <= 500:
+            return f"{rate:.2f}".rstrip("0").rstrip(".") + " fps"
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return "—"
+
+
+def parse_ffprobe_result(data: dict) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("ffprobe JSON 根节点不是对象")
+    streams = [stream for stream in (data.get("streams") or []) if isinstance(stream, dict)]
+    video = next((stream for stream in streams
+                  if stream.get("codec_type") == "video"
+                  and not (stream.get("disposition") or {}).get("attached_pic")), {})
+    audio = sorted({
+        str(stream.get("codec_name") or "").upper()
+        for stream in streams if stream.get("codec_type") == "audio"
+    })
+    fmt = data.get("format") or {}
+    try:
+        width = int(video.get("width") or 0)
+        height = int(video.get("height") or 0)
+    except (TypeError, ValueError):
+        width = height = 0
+
+    def to_int(value):
+        try:
+            return int(value) or None
+        except (ValueError, TypeError):
+            return None
+
+    def to_float(value):
+        try:
+            return float(value) or None
+        except (ValueError, TypeError):
+            return None
+
+    fps = format_fps(video.get("avg_frame_rate"))
+    if fps == "—":
+        fps = format_fps(video.get("r_frame_rate"))
+    return {
+        "width": width,
+        "height": height,
+        "resolution": classify_resolution(width, height),
+        "fps": fps,
+        "codec": str(video.get("codec_name") or "—").upper(),
+        "audio": "、".join(audio),
+        "size": to_int(fmt.get("size")),
+        "duration": to_float(fmt.get("duration")),
+        "bitrate": to_int(video.get("bit_rate") or fmt.get("bit_rate")),
+        "hdr": ("HDR" if str(video.get("color_transfer") or "").casefold()
+                in {"smpte2084", "arib-std-b67"} else ""),
+        "verified": bool(width and height),
+    }
+
+
+def filename_hint(path: str) -> dict:
+    """无法实测时明确显示问号，绝不将文件名推测当作真实参数。"""
+    name = ntpath.basename(path).casefold()
+    quality = "—"
+    for regex, label in (
+        (r"(?<![A-Za-z0-9])(?:2160p|4k|uhd)(?![A-Za-z0-9])", "4K?"),
+        (r"(?<![A-Za-z0-9])(?:1080p|fhd)(?![A-Za-z0-9])", "1080p?"),
+        (r"(?<![A-Za-z0-9])720p(?![A-Za-z0-9])", "720p?"),
+    ):
+        if re.search(regex, name):
+            quality = label
+            break
+    match = re.search(r"(?<!\d)(24|25|30|50|60|120)\s*(?:fps|帧)(?![A-Za-z0-9])", name)
+    return {
+        "resolution": quality,
+        "fps": f"{match.group(1)} fps?" if match else "—",
+        "verified": False,
+    }
+
+
+def human_size(value) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if number < 0:
+        return "—"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if number < 1024 or unit == "TB":
+            return f"{number:.0f} B" if unit == "B" else f"{number:.1f} {unit}"
+        number /= 1024
+    return "—"
+
+
+def human_duration(value) -> str:
+    try:
+        seconds = round(float(value))
+    except (ValueError, TypeError):
+        return "—"
+    if seconds <= 0:
+        return "—"
+    hours, leftover = divmod(seconds, 3600)
+    minutes, seconds = divmod(leftover, 60)
+    return (f"{hours}:{minutes:02d}:{seconds:02d}" if hours
+            else f"{minutes}:{seconds:02d}")
+
+
+class Interrupted(Exception):
+    """正常取消后台任务，不属于扫描/探测错误。"""
+
+
+def run_ffprobe(
+    binary: str, target: str, stop_event: threading.Event, timeout=15
+) -> dict:
+    """ffprobe 是外部子进程，超时/停止都杀掉它，避免 CD2 挂载 I/O 卡死应用。"""
+    command = [
+        binary, "-hide_banner", "-v", "error",
+        "-probesize", "2000000", "-analyzeduration", "1000000",
+        "-show_entries",
+        ("stream=codec_type,codec_name,width,height,avg_frame_rate,"
+         "r_frame_rate,bit_rate,color_transfer:stream_disposition=attached_pic:format=duration,size,bit_rate"),
+        "-of", "json", "-i", target,
+    ]
+    proc = subprocess.Popen(
+        command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    started = time.monotonic()
+    try:
+        while True:
+            if stop_event.is_set():
+                raise Interrupted()
+            if time.monotonic() - started > timeout:
+                raise TimeoutError(f"视频探测超过 {timeout} 秒")
+            try:
+                stdout, stderr = proc.communicate(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if proc.returncode:
+            raise OSError(
+                stderr.decode("utf-8", errors="replace").strip()[:180]
+                or f"ffprobe 返回错误 {proc.returncode}"
+            )
+        info = parse_ffprobe_result(json.loads(stdout.decode("utf-8", "replace")))
+        if not info.get("verified"):
+            raise ValueError("视频中未发现可识别的视频轨道")
+        return info
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                # 不阻塞 GUI；ffprobe 已收到 kill。
+                pass
+
+
+class MediaIndex:
+    """本地视频参数库；兼容旧版原始路径键，不检查云端源文件。"""
+
+    def __init__(self, file_path: Path):
+        self.connection = sqlite3.connect(str(file_path), timeout=8)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA synchronous=NORMAL")
+        self.connection.execute("CREATE TABLE IF NOT EXISTS video_cache ("
+                                "target TEXT PRIMARY KEY, recorded_at REAL NOT NULL, details_json TEXT NOT NULL)")
+        self.connection.commit()
+        self.pending = 0
+
+    def get(self, target: str, *, maximum_age_days=14) -> dict | None:
+        return self.get_many([target], maximum_age_days=maximum_age_days).get(target)
+
+    def get_many(self, targets: list[str], *, maximum_age_days=14) -> dict[str, dict]:
+        unique = list(dict.fromkeys(targets))
+        keys = list(dict.fromkeys(key for target in unique
+                                 for key in (target_identity(target), target)))
+        found = {}
+        cutoff = time.time() - maximum_age_days * 86400
+        for offset in range(0, len(keys), 400):
+            batch = keys[offset:offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            for key, payload in self.connection.execute(
+                f"SELECT target, details_json FROM video_cache WHERE recorded_at >= ? "
+                f"AND target IN ({placeholders})", [cutoff, *batch],
+            ):
+                try:
+                    data = json.loads(payload)
+                    if isinstance(data, dict) and data.get("verified"):
+                        found[key] = data
+                except (TypeError, ValueError):
+                    pass
+        return {target: found.get(target_identity(target), found.get(target))
+                for target in unique if target_identity(target) in found or target in found}
+
+    def forget(self, targets: list[str]):
+        keys = {key for target in targets for key in (target, target_identity(target))}
+        self.connection.executemany("DELETE FROM video_cache WHERE target=?", [(key,) for key in keys])
+        self.connection.commit()
+        self.pending = 0
+
+    def store(self, target: str, details: dict):
+        if not details.get("verified"):
+            return
+        self.connection.execute(
+            "INSERT OR REPLACE INTO video_cache VALUES (?, ?, ?)",
+            (target_identity(target), time.time(), json.dumps(details, ensure_ascii=False)))
+        self.pending += 1
+        if self.pending >= 32:
+            self.flush()
+
+    def flush(self):
+        self.connection.commit()
+        self.pending = 0
+
+    def close(self):
+        try:
+            self.flush()
+        finally:
+            self.connection.close()
+
+
+def append_unrecognized_scan_log(
+    records: list[MediaEntry], field_mode: str,
+) -> str:
+    """在扫描工作线程写入未识别记录，不访问云端源视频。
+
+    只追加真正未识别的记录。每条包含当前扫描时间、文件/NFO 路径、
+    已缓存的 NFO 原始 num，以及当前识别规则未命中的原因。
+    完整扫描且有未识别记录时才创建日志；不向发布包写入任何用户数据。
+    """
+    unknown = [entry for entry in records if not entry.code]
+    if not unknown:
+        return ""
+
+    log_file = program_data_dir() / "logs" / "scan_unrecognized.jsonl"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.datetime.now(
+        datetime.timezone.utc
+    ).astimezone().isoformat()
+    scan_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
+    with open(log_file, "a", encoding="utf-8", newline="\n") as handle:
+        for entry in unknown:
+            number = entry.nfo_num.strip()
+            if field_mode == "系列":
+                reason = "未能从关联 NFO 的 series 字段确定系列"
+            elif number and not extract_number(number):
+                reason = "NFO 的 num 字段未符合现有番号规则，其他候选名称也未命中"
+            elif not entry.nfo_path:
+                reason = "未关联 NFO，文件名及目录名等候选未识别出番号"
+            else:
+                reason = "关联 NFO 及文件名、目录名等候选均未识别出番号"
+            event = {
+                "time": timestamp,
+                "scan_id": scan_id,
+                "field_mode": field_mode,
+                "media_type": entry.media_type,
+                "media_path": entry.media_path,
+                "nfo_path": entry.nfo_path,
+                "nfo_num": number[:512],
+                "reason": reason,
+            }
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+    return str(log_file)
+
+
+def json_load(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def json_save(path: Path, value: dict):
+    """原子替换配置文件；调用方应确保程序旁数据目录已创建。"""
+    temp = path.with_name(path.name + f".{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(str(temp), str(path))
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+class ConfigWriter(threading.Thread):
+    """后台写设置、记录人工取消日志，Qt 主线程不做磁盘写入。"""
+
+    def __init__(self):
+        super().__init__(name="CGDedupe-SettingsWriter", daemon=False)
+        self.pending: "queue.Queue[tuple[str, Path | None, dict]]" = queue.Queue()
+        self.stop_event = threading.Event()  # set() = 队列清空后退出
+
+    def submit(self, path: Path, value: dict):
+        self.pending.put(("json", path, dict(value)))
+
+    def submit_merge_event(self, operation_id: str, stage: str, **details):
+        self.pending.put(("merge_event", None, {
+            "operation_id": operation_id, "stage": stage, "details": details
+        }))
 
     def run(self):
-        executor = None
+        while not self.stop_event.is_set() or not self.pending.empty():
+            try:
+                kind, path, payload = self.pending.get(timeout=0.15)
+            except queue.Empty:
+                continue
+            try:
+                if kind == "json" and path is not None:
+                    # 第一次点击扫描后才会有写入任务；目录创建在后台。
+                    ensure_program_data_dir()
+                    json_save(path, payload)
+                elif kind == "merge_event":
+                    append_merge_delete_log(
+                        payload["operation_id"], payload["stage"],
+                        **payload["details"],
+                    )
+            except (OSError, ValueError) as error:
+                if sys.stderr is not None:
+                    print(f"无法保存设置/日志：{error}", file=sys.stderr)
+            finally:
+                self.pending.task_done()
+
+
+def find_onecommander_executable() -> str | None:
+    """尝试发现 OneCommander，用于多目录打开新标签。
+
+    检测不到时回退旧版的 os.startfile，交由 Windows 注册的文件管理器接管。
+    只在 FolderOpenWorker 子线程运行，避免 GUI 主线程访问注册表/磁盘。
+    """
+    for executable in ("OneCommander.exe", "onecommander.exe"):
+        discovered = shutil.which(executable)
+        if discovered:
+            return str(discovered)
+
+    if sys.platform != "win32":
+        return None
+
+    # App Paths 是 Windows 常见的 exe 注册方式，不假定用户安装在固定位置。
+    try:
+        import winreg
+    except ImportError:
+        winreg = None
+    if winreg is not None:
+        registry_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OneCommander.exe"
+        for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            try:
+                with winreg.OpenKey(root, registry_path) as key:
+                    registered, _type = winreg.QueryValueEx(key, "")
+                candidate = str(registered).strip().strip('"')
+                if candidate.casefold().endswith("onecommander.exe") and os.path.isfile(candidate):
+                    return candidate
+            except (FileNotFoundError, PermissionError, OSError):
+                continue
+
+    # 普通 MSI / 用户级安装位置；没发现时仍使用系统关联打开。
+    candidates = []
+    program_files = os.environ.get("PROGRAMFILES")
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if program_files:
+        candidates.append(os.path.join(program_files, "OneCommander", "OneCommander.exe"))
+    if local_appdata:
+        candidates.extend((
+            os.path.join(local_appdata, "Programs", "OneCommander", "OneCommander.exe"),
+            os.path.join(local_appdata, "OneCommander", "OneCommander.exe"),
+            os.path.join(local_appdata, "Microsoft", "WindowsApps", "OneCommander.exe"),
+        ))
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+class MergeDeleteBlocked(Exception):
+    """完整预检不通过，禁止任何删除。"""
+
+
+def merge_delete_log_path() -> Path:
+    """合并删除审计日志：程序目录/CGDedupe_Data/logs/merge_delete.jsonl。"""
+    return program_data_dir() / "logs" / "merge_delete.jsonl"
+
+
+def append_merge_delete_log(operation_id: str, stage: str, **data):
+    """删除前写入审计日志并落盘；日志写入失败则不能启动删除。
+
+    JSON Lines 每行一条记录，记录每次预检、拦截、实际删除及部分完成。
+    """
+    path = merge_delete_log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "time": datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(),
+        "operation_id": operation_id,
+        "stage": stage,
+        **data,
+    }
+    with open(path, "a", encoding="utf-8", newline="\n") as out:
+        out.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        out.flush()
+        os.fsync(out.fileno())
+
+
+def check_merge_stop(stop_event: threading.Event):
+    if stop_event.is_set():  # 线程全局统一：set() = 请求停止
+        raise Interrupted()
+
+
+def guard_merge_path(path: str, *, directory: bool = False):
+    """拒绝根目录、符号链接、junction，防止误删到其它位置。"""
+    if not path or not ntpath.isabs(path):
+        # Linux CI 的临时绝对路径也能用纯逻辑测试；正式程序仅运行 Windows。
+        if os.name == "nt" or not os.path.isabs(path):
+            raise MergeDeleteBlocked(f"目标不是绝对路径：{path}")
+    full = os.path.normpath(path)
+    drive, rest = ntpath.splitdrive(ntpath.normpath(path))
+    if drive and rest in ("\\", "/", ""):
+        raise MergeDeleteBlocked(f"拒绝删除磁盘根目录或网络共享根目录：{path}")
+    if os.path.islink(full) or (
+        hasattr(os.path, "isjunction") and os.path.isjunction(full)
+    ):
+        raise MergeDeleteBlocked(f"目标是链接或目录联接，拒绝删除：{path}")
+    try:
+        st = os.lstat(full)
+    except OSError as error:
+        raise MergeDeleteBlocked(f"目标不可访问：{path}，{error}") from error
+    # 其他目录 reparse point 也必须拒绝；防止 rmtree 穿过重解析点。
+    attrs = getattr(st, "st_file_attributes", 0)
+    reparse_bit = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if attrs & reparse_bit:
+        raise MergeDeleteBlocked(f"目标是重解析点，拒绝删除：{path}")
+    if directory and not os.path.isdir(full):
+        raise MergeDeleteBlocked(f"目标文件夹不存在：{path}")
+    if not directory and not os.path.isfile(full):
+        raise MergeDeleteBlocked(f"目标文件不是普通文件：{path}")
+    return st
+
+
+def guard_merge_ancestor_links(path: str, stop_event: threading.Event):
+    """禁止目标路径经由上层目录的 symlink / junction 跳转到别处。
+
+    跳过盘符根目录本身：M:\\ 可以是合法的 CD2 虚拟盘根。
+    """
+    current = os.path.dirname(os.path.abspath(path))
+    while current and os.path.dirname(current) != current:
+        check_merge_stop(stop_event)
+        if os.path.islink(current) or (
+            hasattr(os.path, "isjunction") and os.path.isjunction(current)
+        ):
+            raise MergeDeleteBlocked(f"目标的上级目录是符号链接/junction：{current}")
         try:
-            nfo_files = list(self.logic.get_nfo_files_generator(self.directories))
-            total = len(nfo_files)
-            self.progress.emit(0, total)
-            if not total:
-                self.completed.emit({}, 0)
-                return
+            attrs = getattr(os.lstat(current), "st_file_attributes", 0)
+        except OSError as error:
+            raise MergeDeleteBlocked(f"无法核查目标的上级目录：{current}，{error}") from error
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if attrs & reparse_flag:
+            raise MergeDeleteBlocked(f"目标的上级目录是重解析点：{current}")
+        current = os.path.dirname(current)
 
-            batches = [
-                nfo_files[i:i + self.batch_size]
-                for i in range(0, total, self.batch_size)
-            ]
-            field_value_map = {}
-            processed = 0
-            executor = ThreadPoolExecutor(max_workers=min(32, max(1, cpu_count())))
-            futures = {
-                executor.submit(self._process_batch, batch): batch
-                for batch in batches
-            }
-            for future in as_completed(futures):
-                if self.isInterruptionRequested():
-                    for pending in futures:
-                        pending.cancel()
-                    return
-                batch = futures[future]
-                batch_results = future.result()
-                for key, values in batch_results.items():
-                    field_value_map.setdefault(key, []).extend(values)
-                processed += len(batch)
-                self.progress.emit(processed, total)
 
-            duplicates = self.logic.find_duplicates_with_similarity(
-                field_value_map, self.exact_match, self.threshold
+def check_folder_has_only_selected_media(
+    folder: str, allowed_media_paths: list[str], stop_event: threading.Event,
+    *, allow_other_media: bool = False,
+) -> dict:
+    """完整递归检查目录内的媒体，禁止在不知情时整目录删除。
+
+    预检使用 allow_other_media=True：发现其它视频/STRM 时返回其数量，
+    自动改为只删除指定文件。实际执行整目录删除时必须使用严格模式。
+    所有扫描均在后台线程运行，拒绝目录链接及异常大的目录。
+    """
+    check_merge_stop(stop_event)
+    guard_merge_path(folder, directory=True)
+    allowed = {nt_key(path) for path in allowed_media_paths}
+    discovered = set()
+    file_total = 0
+    folder_total = 0
+    other_media_count = 0
+    other_media_example = ""
+
+    def fail_walk(error):
+        raise MergeDeleteBlocked(f"不能完整读取待删目录，拒绝删除：{error}")
+
+    for current, directories, names in os.walk(
+        folder, topdown=True, followlinks=False, onerror=fail_walk,
+    ):
+        check_merge_stop(stop_event)
+        guard_merge_path(current, directory=True)
+        folder_total += 1
+        if folder_total > 2000:
+            raise MergeDeleteBlocked("待删文件夹下有超过2000个子目录，请人工检查")
+        for name in directories:
+            check_merge_stop(stop_event)
+            child = os.path.join(current, name)
+            guard_merge_path(child, directory=True)
+        for name in names:
+            check_merge_stop(stop_event)
+            target = os.path.join(current, name)
+            file_total += 1
+            if file_total > 100000:
+                raise MergeDeleteBlocked("待删文件夹包含超过10万个文件，拒绝整目录删除")
+            if os.path.islink(target):
+                raise MergeDeleteBlocked(f"文件夹含符号链接，拒绝递归删除：{target}")
+            try:
+                attributes = getattr(os.lstat(target), "st_file_attributes", 0)
+            except OSError as error:
+                raise MergeDeleteBlocked(f"无法核查目录中文件：{target}，{error}") from error
+            if attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+                raise MergeDeleteBlocked(f"目录中有重解析点文件，拒绝整目录删除：{target}")
+            extension = os.path.splitext(name)[1].casefold()
+            if extension in MEDIA_EXTS:
+                key = nt_key(target)
+                if key not in allowed:
+                    if not allow_other_media:
+                        raise MergeDeleteBlocked(f"目录里还有其他 STRM/视频文件：{target}")
+                    other_media_count += 1
+                    if not other_media_example:
+                        other_media_example = target
+                else:
+                    discovered.add(key)
+
+    missing = allowed - discovered
+    if missing:
+        raise MergeDeleteBlocked(
+            "待删文件夹中未找到目标视频/STRM，禁止删除：" + "；".join(sorted(missing))
+        )
+    return {
+        "files": file_total, "directories": folder_total,
+        "other_media_count": other_media_count,
+        "other_media_example": other_media_example,
+    }
+
+
+def choose_cleanup_mode(
+    folder: str, media_path: str, scan_roots: list[str],
+    stop_event: threading.Event, *, force_file_reason: str = "",
+) -> tuple[str, dict | None, str]:
+    """只在确认可以安全删除整个目录时返回 folder，否则退回到单文件。
+
+    不删除扫描根目录。权限不足、目录过大或遇到重解析点，均不能
+    证明整目录安全，因此只删除明确选中的媒体文件。
+    """
+    check_merge_stop(stop_event)
+    if force_file_reason:
+        return "file", None, force_file_reason
+    if any(nt_key(folder) == nt_key(root) for root in scan_roots):
+        return "file", None, "所在目录就是扫描根目录，必须保留目录"
+    try:
+        stats = check_folder_has_only_selected_media(
+            folder, [media_path], stop_event, allow_other_media=True,
+        )
+    except MergeDeleteBlocked as error:
+        return "file", None, f"无法证明整目录可安全删除：{error}"
+    count = stats["other_media_count"]
+    if count:
+        return (
+            "file", stats,
+            f"所在目录还有 {count} 个其他视频/STRM，"
+            f"例如：{stats['other_media_example']}",
+        )
+    return "folder", stats, "目录内没有其他视频/STRM，可删除整个目录"
+
+
+def file_fingerprint(st) -> dict:
+    return {"size": st.st_size, "mtime_ns": st.st_mtime_ns,
+            "device": st.st_dev, "inode": st.st_ino}
+
+
+def check_snapshot_matches(path: str, fingerprint: dict):
+    st = guard_merge_path(path, directory=False)
+    if file_fingerprint(st) != fingerprint:
+        raise MergeDeleteBlocked(
+            f"扫描后文件已经发生变化，禁止删除，请重新扫描：{path}"
+        )
+
+
+# 分享冲突 WinError 32 / 文件锁定 WinError 33：只针对已确认的单个视频源重试。
+# 首次删除失败后稍作等待，让 mpvnet 或 CD2 有机会释放文件句柄。
+VIDEO_FILE_LOCK_RETRY_DELAYS = (1.5, 2.0, 2.5)
+
+
+def remove_video_file_with_retry(
+    path: str, fingerprint: dict, stop_event: threading.Event, operation_id: str,
+):
+    """仅对 WinError 32/33 有限重试，绝不强制结束其他进程。
+
+    每次尝试前重新检查文件快照，防止等待期间文件被替换。
+    如果最后仍被占用，原样保留 STRM/目录，不执行后续清理。
+    此函数只允许在删除工作线程运行，所有等待均可被 Event 取消。
+    """
+    for attempt in range(len(VIDEO_FILE_LOCK_RETRY_DELAYS) + 1):
+        check_merge_stop(stop_event)
+        check_snapshot_matches(path, fingerprint)
+        try:
+            os.remove(path)
+            return
+        except OSError as error:
+            code = getattr(error, "winerror", None)
+            if code not in (32, 33):
+                raise
+            if attempt == len(VIDEO_FILE_LOCK_RETRY_DELAYS):
+                raise MergeDeleteBlocked(
+                    f"真实视频仍被播放器、CD2 或其他进程占用（WinError {code}），"
+                    f"已尝试 {attempt + 1} 次；未继续执行后续清理步骤。"
+                    f"请确认相关播放器已完全退出、CD2 已释放句柄，再重试：{path}"
+                ) from error
+            pause = VIDEO_FILE_LOCK_RETRY_DELAYS[attempt]
+            append_merge_delete_log(
+                operation_id, "SOURCE_VIDEO_LOCK_RETRY",
+                path=path, winerror=code, attempt=attempt + 1,
+                next_retry_delay_seconds=pause,
             )
-            self.completed.emit(duplicates, total)
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        finally:
-            if executor is not None:
-                executor.shutdown(wait=True, cancel_futures=True)
-
-    def _process_batch(self, batch):
-        results = {}
-        for nfo_file in batch:
-            if self.isInterruptionRequested():
-                break
-            value, path = self.logic.process_nfo_file((nfo_file, self.field))
-            if value:
-                results.setdefault(value, []).append(path)
-        return results
+            if stop_event.wait(pause):
+                raise Interrupted()
 
 
-class NfoDuplicateOperations:
-    def __init__(self, ui_instance):
-        self.ui = ui_instance
-        self.result_lock = Lock()
-        self.progress_lock = Lock()
-        self.processed_files = 0
-        self.batch_size = AppConstants.DEFAULT_BATCH_SIZE
-        self.current_sort_column = 0
-        self.current_sort_order = Qt.AscendingOrder
-        self.worker = None
+def build_merge_delete_plan(
+    entry: MediaEntry,
+    records: list[MediaEntry],
+    scan_roots: list[str],
+    old_prefix: str,
+    mapped_prefix: str,
+    stop_event: threading.Event,
+    *,
+    operation_id: str,
+) -> dict:
+    """一次性预检所有目标；成功前不修改任何文件。"""
+    check_merge_stop(stop_event)
+    kind = entry.media_type
+    if kind not in ("STRM", "视频"):
+        raise MergeDeleteBlocked("只允许合并删除 STRM 或普通视频条目")
+    if kind == "STRM" and (
+        entry.target_kind != "path"
+        or os.path.splitext(entry.target)[1].casefold() not in VIDEO_EXTS
+    ):
+        raise MergeDeleteBlocked("STRM 没有映射到明确的本地视频文件，已拒绝")
+    if kind == "视频" and os.path.splitext(entry.media_path)[1].casefold() not in VIDEO_EXTS:
+        raise MergeDeleteBlocked("普通视频文件扩展名无效")
+    if not any(is_nested_path(entry.folder, root, allow_equal=True) for root in scan_roots):
+        raise MergeDeleteBlocked("目标文件不在当前扫描目录内，禁止删除")
 
-    def select_directories(self, index=-1):
-        """选择目录，index=-1表示新增，否则表示替换指定位置"""
-        directory = QtWidgets.QFileDialog.getExistingDirectory(
-            self.ui,
-            "选择目录",
-            ".",
-            QtWidgets.QFileDialog.ShowDirsOnly
-            | QtWidgets.QFileDialog.DontUseNativeDialog,
+    guard_merge_ancestor_links(entry.media_path, stop_event)
+    media_st = guard_merge_path(entry.media_path, directory=False)
+    guard_merge_path(entry.folder, directory=True)
+    if nt_key(os.path.dirname(entry.media_path)) != nt_key(entry.folder):
+        raise MergeDeleteBlocked("记录中媒体路径和所在文件夹不一致")
+
+    source_path = entry.target if kind == "STRM" else entry.media_path
+    target_folder = os.path.dirname(source_path)
+    check_merge_stop(stop_event)
+
+    # 防止 STRM 内容被用户或其他程序修改后仍误删旧扫描结果。
+    if kind == "STRM":
+        actual_raw = read_strm(entry.media_path)
+        actual_target, actual_type = normalize_strm_target(
+            entry.media_path, actual_raw, old_prefix, mapped_prefix,
         )
-        if directory and os.path.exists(directory):
-            if index >= 0:
-                if index < len(self.ui.selected_directories):
-                    self.ui.selected_directories[index] = directory
-                    self.ui.update_directory_display()
-            else:
-                self.ui.add_directory(directory)
-
-    def find_duplicates(self):
-        """启动真正的后台查重任务，避免 GUI 主线程等待 futures。"""
-        if not self.ui.selected_directories:
-            QtWidgets.QMessageBox.warning(self.ui, "错误", "请先选择至少一个目录！")
-            return
-        if self.worker is not None and self.worker.isRunning():
-            return
-
-        selected_field = self.ui.field_spinner.get_current_value()
-        is_exact_match = self.ui.match_mode_widget.is_exact_match()
-        threshold = self.ui.match_mode_widget.get_threshold()
-
-        self.ui.start_button.setEnabled(False)
-        self.ui.start_button.setText("正在查找...")
-        self.ui.progress_bar.setRange(0, 0)
-        self.ui.progress_bar.setFormat("正在扫描文件...")
-        self.ui.result_stats_label.setText("")
-
-        self.worker = DedupeWorker(
-            self.ui.logic,
-            self.ui.selected_directories,
-            selected_field,
-            is_exact_match,
-            threshold,
-            self.batch_size,
-        )
-        self.worker.progress.connect(self._on_worker_progress)
-        self.worker.completed.connect(self._on_worker_completed)
-        self.worker.failed.connect(self._on_worker_failed)
-        self.worker.finished.connect(self._cleanup_worker)
-        self.worker.start()
-
-    def _on_worker_progress(self, current, total):
-        if total <= 0:
-            self.ui.progress_bar.setRange(0, 0)
-            self.ui.progress_bar.setFormat("正在扫描文件...")
-            return
-        self.ui.progress_bar.setRange(0, total)
-        self.ui.progress_bar.setValue(current)
-        self.ui.progress_bar.setFormat("处理中: %v/%m (%p%)")
-
-    def _on_worker_completed(self, duplicates, total_files):
-        if total_files == 0:
-            QtWidgets.QMessageBox.information(
-                self.ui, "提示", "在所选目录中未找到NFO文件。"
+        if actual_type != "path" or nt_key(actual_target) != nt_key(entry.target):
+            raise MergeDeleteBlocked(
+                f"STRM 指向内容已变化，必须重新扫描后再删除：{entry.media_path}"
             )
-            self.ui.result_list.clear()
-            self.ui.result_stats_label.setText("")
-            self.ui.progress_bar.setRange(0, 1)
-            self.ui.progress_bar.setValue(0)
-            self.ui.progress_bar.setFormat("完成")
-        else:
-            self.ui.progress_bar.setRange(0, total_files)
-            self.ui.progress_bar.setValue(total_files)
-            self.display_duplicates(duplicates)
-        self._reset_ui_state()
+        # 源视频与 STRM 刮削目录存在父子关系时，强制只删除两个明确文件。
+        # 不因目录关系拦截合法的同目录 STRM，但绝不递归删除其目录。
 
-    def _on_worker_failed(self, message):
-        QtWidgets.QMessageBox.critical(self.ui, "查重失败", message)
-        self.ui.progress_bar.setRange(0, 1)
-        self.ui.progress_bar.setValue(0)
-        self.ui.progress_bar.setFormat("失败")
-        self._reset_ui_state()
+    # STRM: 仅校验指向的真实视频文件本身，绝不对其父目录进行
+    # os.walk/scandir/其它媒体检查，也不删除源视频所在文件夹。
+    # 云盘的挂载目录可能本身使用 Windows reparse point；
+    # 对 STRM 源目录递归核查祖先会误拦截合法的挂载路径。
+    # 刮削路径仍严格检查链接、扫描根及目录内其它媒体。
+    video_st = guard_merge_path(source_path, directory=False) if kind == "STRM" else media_st
 
-    def _cleanup_worker(self):
-        if self.worker is not None:
-            self.worker.deleteLater()
-            self.worker = None
-        self._reset_ui_state()
-
-    def _reset_ui_state(self):
-        self.ui.start_button.setEnabled(True)
-        self.ui.start_button.setText("开始查重")
-
-    def display_duplicates(self, duplicates):
-        """显示重复项结果"""
-        self.ui.result_list.clear()
-
-        # 准备排序数据
-        sort_data = []
-        for field_value, paths in duplicates.items():
-            if len(paths) > 1:
-                sort_data.append((field_value, paths, len(paths)))
-
-        # 根据当前排序设置进行排序
-        self._sort_data(sort_data)
-
-        group_count = 0
-        total_files = 0
-
-        for field_value, paths, file_count in sort_data:
-            group_count += 1
-            total_files += file_count
-            self._create_duplicate_group_item(field_value, paths, file_count)
-
-        self._update_result_stats(group_count, total_files)
-
-    def _create_duplicate_group_item(self, field_value, paths, file_count):
-        """创建重复组项目"""
-        first_directory = (
-            self.ui.selected_directories[0] if self.ui.selected_directories else None
+    # 同一源文件如果被其它已扫描媒体引用，仍要拒绝：
+    # 删掉它会破坏其它 STRM。这和源目录有无其它视频是两回事。
+    refs = [
+        other.media_path for other in records
+        if other.identifier != entry.identifier
+        and other.target_kind == "path" and nt_key(other.target) == nt_key(source_path)
+    ]
+    if refs:
+        raise MergeDeleteBlocked(
+            f"另有 {len(refs)} 条扫描记录引用同一真实视频，禁止删除。例如：{refs[0]}"
         )
 
-        # 对路径排序
-        sorted_paths = sorted(
-            paths,
-            key=lambda x: (
-                0 if first_directory and is_path_within(x, first_directory) else 1,
-                x,
+    if kind == "STRM":
+        # STRM 指向的源视频一律仅删除其文件，不遍历、不清空源视频目录。
+        video_folder_stats = None
+        overlaps_source = (
+            is_nested_path(target_folder, entry.folder, allow_equal=True)
+            or is_nested_path(entry.folder, target_folder, allow_equal=True)
+        )
+        cleanup_mode, scrape_stats, cleanup_reason = choose_cleanup_mode(
+            entry.folder, entry.media_path, scan_roots, stop_event,
+            force_file_reason=(
+                "STRM 与源视频目录有包含关系，仅删除两个明确文件"
+                if overlaps_source else ""
             ),
         )
-
-        # 创建根项
-        root_item = self._create_root_item(field_value, file_count, sorted_paths)
-        
-        # 添加子项
-        self._add_child_items(root_item, sorted_paths[1:], first_directory)
-        
-        root_item.setExpanded(True)
-
-    def _create_root_item(self, field_value, file_count, sorted_paths):
-        """创建根项目"""
-        root_item = QtWidgets.QTreeWidgetItem(self.ui.result_list)
-        root_item.setText(0, field_value)
-        root_item.setText(1, str(file_count))
-        root_item.setText(2, sorted_paths[0] if sorted_paths else "")
-        root_item.setFont(0, QtGui.QFont("", weight=QtGui.QFont.Weight.Bold))
-
-        # 设置背景色
-        root_item.setBackground(0, QtGui.QColor(self.ui.theme.colors["group_bg"]))
-        root_item.setBackground(1, QtGui.QColor(self.ui.theme.colors["group_bg"]))
-        root_item.setBackground(2, QtGui.QColor(self.ui.theme.colors["item1_bg"]))
-
-        # 存储数据用于排序
-        root_item.setData(0, QtCore.Qt.UserRole, 
-                         {"value": field_value, "is_group": True, "paths": sorted_paths})
-        root_item.setData(1, QtCore.Qt.UserRole, {"count": file_count})
-        root_item.setData(2, QtCore.Qt.UserRole, 
-                         {"is_file": True, "path": sorted_paths[0] if sorted_paths else ""})
-
-        return root_item
-
-    def _add_child_items(self, root_item, remaining_paths, first_directory):
-        """添加子项目"""
-        use_alt_bg = True
-        for path in remaining_paths:
-            child_item = QtWidgets.QTreeWidgetItem(root_item)
-            child_item.setText(2, path)
-
-            bg_color = (
-                QtGui.QColor(self.ui.theme.colors["item2_bg"])
-                if use_alt_bg
-                else QtGui.QColor(self.ui.theme.colors["row_alt"])
-            )
-            child_item.setBackground(2, bg_color)
-            use_alt_bg = not use_alt_bg
-
-            if first_directory and is_path_within(path, first_directory):
-                child_item.setForeground(
-                    2, QtGui.QColor(self.ui.theme.colors["secondary"])
-                )
-
-            child_item.setData(
-                2, QtCore.Qt.UserRole, {"is_file": True, "path": path}
-            )
-
-    def _update_result_stats(self, group_count, total_files):
-        """更新结果统计"""
-        if group_count == 0:
-            QtWidgets.QMessageBox.information(self.ui, "结果", "未找到重复项。")
-            self.ui.result_stats_label.setText("")
-        else:
-            match_mode = ("完全匹配" if self.ui.match_mode_widget.is_exact_match() 
-                         else f"部分匹配({self.ui.match_mode_widget.get_threshold()*100:.0f}%)")
-            self.ui.result_stats_label.setText(
-                f"找到 {group_count} 组重复项，共 {total_files} 个文件 ({match_mode})"
-            )
-
-        self.ui.progress_bar.setFormat(
-            f"完成：找到 {group_count} 组重复项" if group_count > 0 else "完成"
+    else:
+        cleanup_mode, video_folder_stats, cleanup_reason = choose_cleanup_mode(
+            target_folder, source_path, scan_roots, stop_event,
         )
+        scrape_stats = None
 
-    def _sort_data(self, sort_data):
-        """根据当前排序设置对数据进行排序"""
-        reverse = self.current_sort_order == Qt.DescendingOrder
-        
-        sort_key = self._get_sort_key()
-        sort_data.sort(key=sort_key, reverse=reverse)
+    return {
+        "operation_id": operation_id,
+        "identifier": entry.identifier,
+        "code": entry.code,
+        "media_type": kind,
+        "media_path": entry.media_path,
+        "source_video": source_path,
+        "video_folder": target_folder,
+        "scrape_folder": entry.folder if kind == "STRM" else "",
+        "cleanup_mode": cleanup_mode,
+        "cleanup_reason": cleanup_reason,
+        "cleanup_folder": entry.folder if kind == "STRM" else target_folder,
+        "media_fingerprint": file_fingerprint(media_st),
+        "video_fingerprint": file_fingerprint(video_st),
+        "video_folder_contents": video_folder_stats,
+        "scrape_folder_contents": scrape_stats,
+        "source_folder_enumerated": (
+            kind != "STRM" and video_folder_stats is not None
+        ),
+        "source_folder_deletion": (
+            "仅删除指定真实视频文件" if kind == "STRM" else
+            ("删除视频所在文件夹" if cleanup_mode == "folder" else "仅删除指定视频文件")
+        ),
+        "scrape_folder_deletion": (
+            ("删除整个刮削文件夹" if cleanup_mode == "folder" else "仅删除指定 STRM 文件")
+            if kind == "STRM" else "不适用"
+        ),
+        "root_directories": list(scan_roots),
+    }
 
-    def _get_sort_key(self):
-        """获取排序键函数"""
-        if self.current_sort_column == 0:  # 按字段值排序
-            return lambda x: x[0].lower()
-        elif self.current_sort_column == 1:  # 按文件数量排序
-            return lambda x: x[2]
-        elif self.current_sort_column == 2:  # 按第一个路径排序
-            return lambda x: x[1][0] if x[1] else ""
-        else:
-            return lambda x: x[0].lower()  # 默认排序
 
-    def on_header_clicked(self, logical_index):
-        """处理表头点击事件"""
-        if logical_index == self.current_sort_column:
-            # 切换排序顺序
-            self.current_sort_order = (
-                Qt.DescendingOrder if self.current_sort_order == Qt.AscendingOrder 
-                else Qt.AscendingOrder
+def execute_merge_delete(
+    plan: dict,
+    entry: MediaEntry,
+    records: list[MediaEntry],
+    scan_roots: list[str],
+    old_prefix: str,
+    mapped_prefix: str,
+    stop_event: threading.Event,
+):
+    """确认后再次预检。STRM 先删除源视频，再删除选中的 STRM 或目录。
+
+    不遍历、更不删除 STRM 源视频的父目录；存在其它媒体时仅删文件。
+    部分失败写入日志，绝不假报成功。
+    """
+    operation_id = plan["operation_id"]
+    # 二次检查：用户确认过程中可能已经有新视频进入文件夹。
+    fresh = build_merge_delete_plan(
+        entry, records, scan_roots, old_prefix, mapped_prefix,
+        stop_event, operation_id=operation_id,
+    )
+    # 第二次预检时还要核对用户在确认框中看到的*完整删除目标*；
+    # 不能仅比文件大小/修改时间，否则同尺寸文件有机会被调换。
+    for key in ("media_path", "source_video", "video_folder", "scrape_folder", "cleanup_folder"):
+        if nt_key(fresh.get(key, "")) != nt_key(plan.get(key, "")):
+            raise MergeDeleteBlocked(
+                f"确认期间删除目标路径已变化（{key}），已取消；请重新预检"
             )
-        else:
-            # 更改排序列
-            self.current_sort_column = logical_index
-            self.current_sort_order = Qt.AscendingOrder
-
-        # 重新显示结果（如果有数据）
-        if self.ui.result_list.topLevelItemCount() > 0:
-            self._re_sort_current_results()
-
-    def _re_sort_current_results(self):
-        """重新排序当前结果"""
-        # 收集当前所有数据
-        sort_data = []
-        for i in range(self.ui.result_list.topLevelItemCount()):
-            item = self.ui.result_list.topLevelItem(i)
-            
-            # 从UserRole数据中获取信息
-            value_data = item.data(0, QtCore.Qt.UserRole)
-            count_data = item.data(1, QtCore.Qt.UserRole)
-            
-            if value_data and value_data.get("is_group"):
-                field_value = value_data.get("value", item.text(0))
-                paths = value_data.get("paths", [])
-                file_count = count_data.get("count", len(paths)) if count_data else len(paths)
-                sort_data.append((field_value, paths, file_count))
-
-        # 重新排序并显示
-        if sort_data:
-            duplicates = {item[0]: item[1] for item in sort_data}
-            self.display_duplicates(duplicates)
-
-    def open_folder(self, item, column):
-        """处理项目双击事件，打开对应文件夹"""
-        data = item.data(column, QtCore.Qt.UserRole)
-        if not data:
-            return
-
-        if column == 0 and data.get("is_group"):
-            self._open_group_folders(data.get("paths", []))
-        elif data.get("is_file"):
-            path = data.get("path")
-            if path:
-                self._open_single_folder(os.path.dirname(path))
-
-    def _open_single_folder(self, folder_path):
-        """打开单个文件夹"""
-        try:
-            if sys.platform == "win32":
-                os.startfile(folder_path)
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", folder_path])
+    if (fresh["identifier"] != plan["identifier"]
+            or fresh["media_type"] != plan["media_type"]):
+        raise MergeDeleteBlocked("确认期间媒体记录已变化，已取消")
+    if fresh["cleanup_mode"] != plan["cleanup_mode"]:
+        raise MergeDeleteBlocked(
+            "确认期间目录内视频情况已变化，删除方式改变；已取消，请重新确认"
+        )
+    if fresh["video_fingerprint"] != plan["video_fingerprint"] or (
+        fresh["media_fingerprint"] != plan["media_fingerprint"]
+    ):
+        raise MergeDeleteBlocked("预检之后目标文件已变化，操作已取消")
+    check_merge_stop(stop_event)
+    append_merge_delete_log(
+        operation_id, "EXECUTE_START", plan=fresh,
+        note="开始不可逆操作；在此之前不做任何删除"
+    )
+    finished_steps = []
+    try:
+        if entry.media_type == "STRM":
+            # 用户指定顺序：先删除真实视频文件，再删除 STRM 或其专属目录。
+            remove_video_file_with_retry(
+                fresh["source_video"], plan["video_fingerprint"],
+                stop_event, operation_id,
+            )
+            finished_steps.append(f"真实视频单文件：{fresh['source_video']}")
+            append_merge_delete_log(
+                operation_id, "VIDEO_DELETED",
+                path=fresh["source_video"], completed=finished_steps,
+            )
+            check_merge_stop(stop_event)
+            if fresh["cleanup_mode"] == "folder":
+                # 再次确保无其他视频；确认期间出现新视频则停止。
+                check_folder_has_only_selected_media(
+                    fresh["scrape_folder"], [fresh["media_path"]], stop_event,
+                )
+            check_snapshot_matches(fresh["media_path"], plan["media_fingerprint"])
+            check_merge_stop(stop_event)
+            if fresh["cleanup_mode"] == "folder":
+                shutil.rmtree(fresh["scrape_folder"])
+                label = f"STRM 刮削目录：{fresh['scrape_folder']}"
+                stage = "SCRAPE_FOLDER_DELETED"
+                target = fresh["scrape_folder"]
             else:
-                subprocess.Popen(["xdg-open", folder_path])
-        except Exception as e:
-            QtWidgets.QMessageBox.warning(self.ui, "错误", f"无法打开文件夹: {str(e)}")
-
-    def _open_group_folders(self, paths):
-        """打开一组文件夹"""
-        if not paths:
-            return
-
-        unique_folders = set()
-        for path in paths:
-            folder = os.path.dirname(path)
-            unique_folders.add(folder)
-
-        if len(unique_folders) > AppConstants.MAX_OPEN_FOLDERS_WARNING:
-            reply = QtWidgets.QMessageBox.question(
-                self.ui,
-                "确认",
-                f"将要打开 {len(unique_folders)} 个文件夹，是否继续？",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                QtWidgets.QMessageBox.No,
+                os.remove(fresh["media_path"])
+                label = f"STRM 单文件：{fresh['media_path']}"
+                stage = "STRM_FILE_DELETED"
+                target = fresh["media_path"]
+            finished_steps.append(label)
+            append_merge_delete_log(
+                operation_id, stage, path=target, completed=finished_steps,
             )
-            if reply == QtWidgets.QMessageBox.No:
+        else:
+            if fresh["cleanup_mode"] == "folder":
+                check_folder_has_only_selected_media(
+                    fresh["video_folder"], [fresh["media_path"]], stop_event,
+                )
+            check_snapshot_matches(fresh["media_path"], plan["media_fingerprint"])
+            check_merge_stop(stop_event)
+            if fresh["cleanup_mode"] == "folder":
+                shutil.rmtree(fresh["video_folder"])
+                label = f"视频所在文件夹：{fresh['video_folder']}"
+                stage = "VIDEO_FOLDER_DELETED"
+                target = fresh["video_folder"]
+            else:
+                remove_video_file_with_retry(
+                    fresh["media_path"], plan["media_fingerprint"],
+                    stop_event, operation_id,
+                )
+                label = f"视频单文件：{fresh['media_path']}"
+                stage = "VIDEO_FILE_DELETED"
+                target = fresh["media_path"]
+            finished_steps.append(label)
+            append_merge_delete_log(
+                operation_id, stage, path=target, completed=finished_steps,
+            )
+        # 删除已完成后将路径从视频技术参数缓存移除，避免显示过期信息。
+        try:
+            index = MediaIndex(program_data_dir() / "video_index.sqlite3")
+            try:
+                index.forget([fresh["source_video"]])
+            finally:
+                index.close()
+        except (OSError, sqlite3.Error) as error:
+            append_merge_delete_log(
+                operation_id, "CACHE_INVALIDATION_FAILED", reason=str(error),
+            )
+        append_merge_delete_log(
+            operation_id, "COMPLETE", completed=finished_steps,
+        )
+        return finished_steps
+    except (Interrupted, OSError, ValueError, MergeDeleteBlocked) as error:
+        stage = "PARTIAL" if finished_steps else "FAILED"
+        append_merge_delete_log(
+            operation_id, stage, completed=finished_steps,
+            error=str(error),
+        )
+        raise MergeDeleteBlocked(
+            f"删除未完成：{error}；已完成步骤："
+            + ("；".join(finished_steps) if finished_steps else "无")
+        ) from error
+
+
+from PySide6 import QtCore, QtGui, QtWidgets
+
+
+from PySide6.QtCore import Qt
+
+
+class ScanWorker(QtCore.QThread):
+    progress = QtCore.Signal(int, int)
+    result = QtCore.Signal(object)
+    error = QtCore.Signal(str)
+
+    def __init__(self, roots, field_mode, from_prefix, to_prefix, fuzzy=False, threshold=0.8,
+                 scan_workers=1):
+        super().__init__()
+        self.roots = list(roots)
+        self.field_mode = field_mode
+        self.from_prefix = from_prefix
+        self.to_prefix = to_prefix
+        self.fuzzy = fuzzy
+        self.threshold = threshold
+        self.scan_workers = scan_workers
+        self.stop_event = threading.Event()  # set() = 请求停止
+
+    def stop(self):
+        self.stop_event.set()
+
+    def run(self):
+        try:
+            # 首次扫描时创建用户数据目录：GUI 线程绝不进行磁盘写入。
+            ensure_program_data_dir()
+            if self.stop_event.is_set():
                 return
+            cache_stats = {}
+            records, nfo, strm, video, errors = scan_library(
+                self.roots, self.field_mode, self.from_prefix, self.to_prefix,
+                self.stop_event, self.progress.emit,
+                cache_path=program_data_dir() / "nfo_cache.sqlite3",
+                cache_report=cache_stats, scan_workers=self.scan_workers,
+            )
+            if not self.stop_event.is_set():
+                if self.field_mode == "系列" and self.fuzzy:
+                    distinct = len({entry.code for entry in records if entry.code})
+                    if distinct > 600:
+                        errors.append(
+                            f"系列名有 {distinct} 种，为避免近似匹配 O(N²) 耗时过长，本次改用精确匹配。"
+                        )
+                        self.fuzzy = False
+                matches = group_duplicates(
+                    records, mode=self.field_mode,
+                    fuzzy=self.fuzzy, threshold=self.threshold,
+                    stop_event=self.stop_event,
+                )
+                restored = 0
+                index = None
+                try:
+                    indexed = {
+                        row.target for group in matches.values() for row in group
+                        if row.target and row.target_kind in ("path", "url")
+                    }
+                    index = MediaIndex(program_data_dir() / "video_index.sqlite3")
+                    saved = index.get_many(sorted(indexed))
+                    for row in records:
+                        if self.stop_event.is_set():
+                            break
+                        info = saved.get(row.target)
+                        if info is not None:
+                            row.info = dict(info)
+                            row.info_status = "缓存命中（14天）"
+                            restored += 1
+                except (OSError, sqlite3.Error) as exc:
+                    errors.append(f"视频参数缓存读取失败：{exc}")
+                finally:
+                    if index is not None:
+                        index.close()
+                if not self.stop_event.is_set():
+                    # 扫描完成后仅对 code 为空的条目追加诊断日志；在 QThread 内写盘。
+                    unknown_log_path = ""
+                    try:
+                        unknown_log_path = append_unrecognized_scan_log(
+                            records, self.field_mode
+                        )
+                    except OSError as error:
+                        # 诊断日志故障不应该破坏既有的查重扫描结果。
+                        errors.append(f"未识别番号日志写入失败：{error}")
+                    self.result.emit({
+                        "records": records, "matches": matches,
+                        "counts": (nfo, strm, video), "errors": errors,
+                        "text_cache": cache_stats, "video_cache_restored": restored,
+                        "unrecognized_log_path": unknown_log_path,
+                    })
+        except Exception as error:
+            self.error.emit(f"{type(error).__name__}: {error}")
 
-        for folder in unique_folders:
-            self._open_single_folder(folder)
 
-    def clear_results_on_change(self):
-        """当选择器变化时清空结果"""
-        self.ui.result_list.clear()
-        self.ui.result_stats_label.setText("")
+class ProbeWorker(QtCore.QThread):
+    """有界视频探测队列。
+
+    Qt 信号只从管理 QThread 发出，GUI 更新留给主线程。
+    外层 QThread 负责 SQLite 缓存；线程池仅调用 ffprobe 子进程。
+    同时存在的 ffprobe 最大 1～2 个，不一次提交所有任务。
+    所有停止事件都是 set() 表示请求停止。
+    """
+    progress = QtCore.Signal(int, int, str)
+    batch_ready = QtCore.Signal(object)  # [(target, info, state)]
+    error = QtCore.Signal(str)
+    statistics = QtCore.Signal(object)
+
+    def __init__(
+        self, jobs: list[tuple[str, str]], cache_path: Path, *,
+        refresh: bool = False, timeout: float = 15, concurrency: int = 1,
+    ):
+        super().__init__()
+        self.jobs = list(jobs)
+        self.cache_path = cache_path
+        self.refresh = refresh
+        self.timeout = timeout
+        self.concurrency = max(1, min(int(concurrency), 2))
+        self.stop_event = threading.Event()  # set -> 请求取消待运行及在运行的 ffprobe
+
+    def stop(self):
+        self.stop_event.set()
+
+    def _probe_one(self, binary, target):
+        if self.stop_event.is_set():
+            return {}, "已停止"
+        try:
+            info = run_ffprobe(binary, target, self.stop_event, timeout=self.timeout)
+            return info, "视频实测"
+        except Interrupted:
+            return {}, "已停止"
+        except (OSError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            return filename_hint(target), f"探测失败：{str(exc)[:120]}"
+
+    def run(self):
+        cache = None
+        results = []
+        pending = {}
+        counts = {"total": len(self.jobs), "finished": 0, "cached": 0,
+                  "measured": 0, "failed": 0, "stopped": False}
+        sent_progress_at = 0.0
+        last_batch = time.monotonic()
+
+        def deliver(target, info, state):
+            nonlocal sent_progress_at, last_batch
+            counts["finished"] += 1
+            if state.startswith("缓存命中"):
+                counts["cached"] += 1
+            elif info.get("verified"):
+                counts["measured"] += 1
+            else:
+                counts["failed"] += 1
+            results.append((target, info, state))
+            now = time.monotonic()
+            if len(results) >= 32 or now - last_batch >= 0.25:
+                self.batch_ready.emit(list(results))
+                results.clear()
+                last_batch = now
+            if now - sent_progress_at > 0.15 or counts["finished"] == counts["total"]:
+                self.progress.emit(
+                    counts["finished"], counts["total"],
+                    ntpath.basename(target),
+                )
+                sent_progress_at = now
+
+        try:
+            binary = ffprobe_binary()
+            saved = {}
+            try:
+                cache = MediaIndex(self.cache_path)
+                if not self.refresh:
+                    saved = cache.get_many([target for target, kind in self.jobs])
+            except (OSError, sqlite3.Error) as exc:
+                # 缓存故障不能让实际探测一同失效。
+                self.error.emit(f"缓存不可用，将继续直接探测：{exc}")
+            index = 0
+            total = len(self.jobs)
+
+            # 无 ffprobe 时也优先读取本地 SQLite 缓存。
+            if not binary:
+                for target, kind in self.jobs:
+                    if self.stop_event.is_set():
+                        break
+                    stored = saved.get(target)
+                    if stored is not None and stored.get("verified"):
+                        deliver(target, stored, "缓存命中（14天）")
+                    else:
+                        deliver(target, filename_hint(target), "未找到 ffprobe.exe")
+            else:
+                with ThreadPoolExecutor(
+                    max_workers=self.concurrency, thread_name_prefix="CGDedupe-CD2Probe"
+                ) as pool:
+                    while index < total or pending:
+                        if self.stop_event.is_set():
+                            for future in pending:
+                                future.cancel()
+                            # 仍须等待运行中的 ffprobe 收到 stop_event 并结束。
+                            if not pending:
+                                break
+
+                        while (not self.stop_event.is_set()
+                               and len(pending) < self.concurrency and index < total):
+                            target, kind = self.jobs[index]
+                            index += 1
+
+                            if kind not in ("path", "url"):
+                                deliver(target, filename_hint(target), "路径待映射")
+                                continue
+                            stored = saved.get(target)
+                            if stored is not None:
+                                deliver(target, stored, "缓存命中（14天）")
+                                continue
+
+                            future = pool.submit(self._probe_one, binary, target)
+                            pending[future] = target
+
+                        if not pending:
+                            if index >= total or self.stop_event.is_set():
+                                break
+                            continue
+
+                        done, _ = wait(
+                            tuple(pending), timeout=0.25, return_when=FIRST_COMPLETED
+                        )
+                        for future in done:
+                            target = pending.pop(future)
+                            if future.cancelled():
+                                continue
+                            try:
+                                info, state = future.result()
+                            except (OSError, RuntimeError, ValueError) as exc:
+                                info, state = filename_hint(target), f"探测失败：{exc}"
+                            if state == "已停止" or self.stop_event.is_set():
+                                continue
+                            if state == "视频实测":
+                                try:
+                                    if cache is not None:
+                                        cache.store(target, info)
+                                except sqlite3.Error:
+                                    state = "实测成功（缓存写入失败）"
+                            deliver(target, info, state)
+                            # 连续高频请求容易触发 115 风控；允许 stop 打断短间隔。
+                            if state.startswith("探测失败"):
+                                if self.stop_event.wait(0.8):
+                                    break
+
+            counts["stopped"] = self.stop_event.is_set()
+        except (OSError, sqlite3.Error, RuntimeError) as exc:
+            self.error.emit(f"视频参数读取失败：{exc}")
+        finally:
+            if results:
+                self.batch_ready.emit(list(results))
+            if cache is not None:
+                try:
+                    cache.close()
+                except sqlite3.Error as exc:
+                    self.error.emit(f"参数缓存保存失败：{exc}")
+            counts["stopped"] = self.stop_event.is_set()
+            self.statistics.emit(dict(counts))
 
 
-class DirectoryManager:
-    """目录管理类，优化目录操作逻辑"""
-    
-    def __init__(self, ui_instance):
-        self.ui = ui_instance
+class FolderOpenWorker(QtCore.QThread):
+    """在后台打开目录，不强制 Windows Explorer，恢复旧版系统关联方式。"""
 
-    def update_directory_button(self, index, directory):
-        """更新指定位置的目录按钮"""
-        if 0 <= index < len(self.ui.dir_buttons):
-            self.ui.dir_buttons[index].setText(directory)
+    errors = QtCore.Signal(str)
+    opened = QtCore.Signal(int, str)
 
-    def clear_all_buttons(self):
-        """清空所有目录按钮"""
-        for btn in self.ui.dir_buttons:
-            btn.setText("")
+    def __init__(self, folders: list[str]):
+        super().__init__()
+        self.folders = list(folders)
+        self.stop_event = threading.Event()  # set() 代表请求停止后续打开操作
 
-    def update_all_buttons(self, directories):
-        """更新所有目录按钮显示"""
-        self.clear_all_buttons()
-        for i, directory in enumerate(directories[:AppConstants.MAX_DIRECTORIES]):
-            self.update_directory_button(i, directory)
+    def stop(self):
+        self.stop_event.set()
+
+    def run(self):
+        opened_count = 0
+        failures = []
+        # OneCommander 官方支持：OneCommander.exe -o "完整路径" -newtab
+        # 多目录时优先用此命令保证打开为不同标签；单目录走系统注册关联，
+        # 与旧版 NFO 查重脚本的 os.startfile(folder) 完全一致。
+        onecommander = (
+            find_onecommander_executable() if len(self.folders) > 1 else None
+        )
+        manager = "OneCommander 新标签" if onecommander else "Windows 文件夹默认关联"
+        for folder in self.folders:
+            if self.stop_event.is_set():
+                break
+            # folder 来自本地扫描时保存的父目录，不能错误拼入 Explorer 的 /n 参数。
+            folder_path = ntpath.normpath(str(folder).strip())
+            if not ntpath.isabs(folder_path):
+                failures.append(f"非绝对路径，已拒绝打开：{folder}")
+                continue
+            try:
+                if not os.path.isdir(folder_path):
+                    raise FileNotFoundError(f"目标目录不存在或暂不可访问：{folder_path}")
+                if onecommander:
+                    try:
+                        subprocess.Popen(
+                            [onecommander, "-o", folder_path, "-newtab"],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                            close_fds=True,
+                        )
+                    except OSError:
+                        # 启动别名失效时，恢复原版系统文件夹关联处理。
+                        os.startfile(folder_path)
+                        manager = "Windows 文件夹默认关联（OneCommander 启动失败后回退）"
+                else:
+                    # 原版实现：保留 Windows 当前的文件夹关联/OneCommander 接管。
+                    os.startfile(folder_path)
+                opened_count += 1
+            except (OSError, ValueError) as exc:
+                failures.append(f"{folder_path}：{exc}")
+            if self.stop_event.wait(0.15):
+                break
+
+        if failures:
+            self.errors.emit("\n".join(failures[:8]))
+        self.opened.emit(opened_count, manager)
 
 
 class NfoDuplicateFinder(QtWidgets.QWidget):
-    def __init__(self, initial_directory=None):
+    """主窗口：继续使用原 cg_dedupe.py 的 PySide6，保留番号/系列、目录配置、查重。"""
+
+    MAX_DIRECTORIES = 9
+    COL = {
+        "title": 0, "count": 1, "path": 2, "quality": 3, "fps": 4,
+        "codec": 5, "size": 6, "duration": 7,
+        "play": 8, "open_folder": 9, "actions": 10,
+        "source": 11, "type": 12,
+    }
+
+    def __init__(self, initial_directory: str | None = None):
         super().__init__()
-        self.theme = AppTheme()
-        self.logic = NfoDuplicateLogic()
-        self.selected_directories = []
-        self.dir_buttons = []
-        self.directory_manager = DirectoryManager(self)
-        self.init_ui()
-        self.operations = NfoDuplicateOperations(self)
-        self.connect_signals()
-        self.load_directories()
-        if initial_directory and os.path.exists(initial_directory):
+        # 只计算路径并尝试读取旧便携配置；首次扫描前不创建数据目录。
+        self.data_dir = program_data_dir()
+        self._storage_active = self.data_dir.is_dir()
+        self.settings_file = self.data_dir / "settings.json"
+        self.cache_file = self.data_dir / "video_index.sqlite3"
+        self.merge_log_file = self.data_dir / "logs" / "merge_delete.jsonl"
+        self.settings = json_load(self.settings_file)
+        # 从旧版本继承已有的纯路径映射，不发起任何网络属性请求。
+        legacy_mapping = self.settings.pop("webdav", {})
+        legacy_mapping = legacy_mapping if isinstance(legacy_mapping, dict) else {}
+        mapping = self.settings.get("path_mapping")
+        mapping = mapping if isinstance(mapping, dict) else legacy_mapping
+        self.path_mapping = {key: str(mapping.get(key) or "")
+                             for key in ("source_prefix", "target_prefix")}
+        saved_roots = self.settings.get("directories", [])
+        if not isinstance(saved_roots, list):
+            saved_roots = []
+        self.directories = [
+            item for item in saved_roots if isinstance(item, str)
+        ][:self.MAX_DIRECTORIES]
+        self.last_directory = str(self.settings.get("last_directory") or Path.home())
+        self.writer = ConfigWriter()
+        self.writer.start()
+        self.worker = None
+        self.closing_requested = False
+        self.close_save_requested = False
+        self.records = []
+        self.duplicates = {}
+        self.records_by_id: dict[int, MediaEntry] = {}
+        self.rows_by_target: dict[str, list[MediaEntry]] = defaultdict(list)
+        self.tree_items: dict[int, QtWidgets.QTreeWidgetItem] = {}
+        self.group_items: dict[str, QtWidgets.QTreeWidgetItem] = {}
+        self.group_for_entry: dict[int, str] = {}
+        self.scan_counts = (0, 0, 0)
+        self.scan_errors = []
+        self._scan_started_at = time.monotonic()
+        self.sort_column = self.COL["title"]  # 默认按番号，而非版本数
+        self.sort_reverse = False                # A-Z / 数字升序
+        self._render_token = 0
+        self._render_offset = 0
+        self._render_groups = []
+        self._loaded_groups = set()
+        self._render_saved_id = None
+        self.folder_worker = None
+        self._current_probe_stats = {}
+
+        self._init_ui()
+        self._connect()
+        self._load_options()
+        if initial_directory:
             self.add_directory(initial_directory)
-
-    def init_ui(self):
-        self.setWindowTitle("大锤 NFO查重工具 v9.7.6")
-        self.setGeometry(100, 100, 
-                        AppConstants.WINDOW_DEFAULT_WIDTH, 
-                        AppConstants.WINDOW_DEFAULT_HEIGHT)
-        self.setMinimumSize(AppConstants.WINDOW_MIN_WIDTH, 
-                           AppConstants.WINDOW_MIN_HEIGHT)
-
-        self._load_app_icon()
-
-        # 主布局
-        main_layout = QtWidgets.QVBoxLayout()
-        main_layout.setSpacing(8)
-        main_layout.setContentsMargins(8, 8, 8, 8)
-
-        # 顶部区域布局
-        top_container = self._create_top_container()
-
-        # 提示文本标签
-        self.tip_label = QtWidgets.QLabel(
-            "使用说明：九宫格内已选目录，左键重选，右键删除；点击表头调整排序；自动排除CD1/CD2重复"
+        self._refresh_roots()
+        self._update_buttons()
+        # 后面的 _set_status 同时更新文字及悬停提示，无需设置两次。
+        self._set_status(
+            f"数据目录：{self.data_dir}"
+            + ("" if self._storage_active else "（首次扫描后自动生成）")
         )
-
-        # 结果列表
-        self.result_list = self._create_result_list()
-
-        # 进度条
-        self.progress_bar = QtWidgets.QProgressBar()
-        self.progress_bar.setValue(0)
-
-        # 结果统计标签
-        self.result_stats_label = QtWidgets.QLabel("")
-        self.result_stats_label.setAlignment(Qt.AlignRight)
-
-        # 添加所有组件到主布局
-        main_layout.addWidget(top_container)
-        main_layout.addWidget(self.tip_label)
-        main_layout.addWidget(self.result_list, 1)
-        main_layout.addWidget(self.result_stats_label)
-        main_layout.addWidget(self.progress_bar)
-
-        self.setLayout(main_layout)
-        self.apply_basic_styles()
-
-    def _create_top_container(self):
-        """创建顶部容器"""
-        top_container = QtWidgets.QWidget()
-        top_layout = QtWidgets.QHBoxLayout()
-        top_layout.setContentsMargins(0, 0, 0, 0)
-        top_layout.setSpacing(8)
-
-        # 左侧九宫格布局
-        self.grid_widget = self._create_directory_grid()
-
-        # 右侧控制区域
-        right_container = self._create_control_panel()
-
-        # 添加到顶部布局
-        top_layout.addWidget(self.grid_widget, 4)
-        top_layout.addWidget(right_container, 1)
-        top_container.setLayout(top_layout)
-
-        return top_container
-
-    def _create_directory_grid(self):
-        """创建目录九宫格"""
-        grid_widget = QtWidgets.QWidget()
-        self.grid_layout = QtWidgets.QGridLayout()
-        self.grid_layout.setSpacing(1)
-        self.grid_layout.setContentsMargins(1, 1, 1, 1)
-
-        for i in range(3):
-            self.grid_layout.setColumnStretch(i, 1)
-            self.grid_layout.setRowStretch(i, 1)
-
-        for i in range(AppConstants.MAX_DIRECTORIES):
-            btn = DirectoryButton()
-            self.dir_buttons.append(btn)
-            self.grid_layout.addWidget(btn, i // 3, i % 3)
-
-        grid_widget.setLayout(self.grid_layout)
-        return grid_widget
-
-    def _create_control_panel(self):
-        """创建控制面板"""
-        right_container = QtWidgets.QWidget()
-        right_layout = QtWidgets.QVBoxLayout()
-        right_layout.setContentsMargins(0, 1, 0, 1)
-        right_layout.setSpacing(8)
-
-        # 选择目录按钮
-        self.select_dir_button = QtWidgets.QPushButton("选择目录")
-        self.select_dir_button.setFixedSize(140, 40)
-
-        # 查重字段选择
-        self.field_spinner = CustomSpinner()
-        self.field_spinner.setFixedSize(140, 40)
-
-        # 匹配模式控件
-        self.match_mode_widget = MatchModeWidget()
-        self.match_mode_widget.setFixedWidth(140)
-
-        # 查找按钮
-        self.start_button = QtWidgets.QPushButton("开始查重")
-        self.start_button.setFixedSize(140, 40)
-
-        # 添加到右侧布局
-        right_layout.addWidget(self.select_dir_button, alignment=Qt.AlignTop)
-        right_layout.addWidget(self.field_spinner, alignment=Qt.AlignTop)
-        right_layout.addWidget(self.match_mode_widget, alignment=Qt.AlignTop)
-        right_layout.addStretch(1)
-        right_layout.addWidget(self.start_button, alignment=Qt.AlignBottom)
-
-        right_container.setLayout(right_layout)
-        return right_container
-
-    def _create_result_list(self):
-        """创建结果列表"""
-        result_list = QtWidgets.QTreeWidget()
-        result_list.setColumnCount(3)
-        result_list.setHeaderLabels(["重复番号/系列", "文件数", "文件路径"])
-        result_list.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        result_list.header().setStretchLastSection(True)
-        result_list.setIndentation(20)
-        result_list.setAnimated(True)
-        
-        # 设置列宽
-        result_list.setColumnWidth(0, 200)
-        result_list.setColumnWidth(1, 80)
-
-        return result_list
+        QtCore.QTimer.singleShot(0, self._center_window)
 
     def _load_app_icon(self):
-        """加载应用图标"""
-        try:
-            if getattr(sys, "frozen", False):
-                application_path = sys._MEIPASS
-            else:
-                application_path = os.path.dirname(os.path.abspath(__file__))
+        """同一 ICO 用于 EXE、主窗口、任务栏；无需生成 PNG 文件。
 
-            icon_path = os.path.join(application_path, "cg_dedupe.ico")
-            if os.path.exists(icon_path):
-                self.setWindowIcon(QtGui.QIcon(icon_path))
-        except Exception as e:
-            print(f"图标设置失败: {str(e)}")
-
-    def apply_basic_styles(self):
-        """应用基本样式"""
-        self.setStyleSheet(
-            f"""
-            QWidget {{
-                background-color: white;
-                color: {self.theme.colors["text"]};
-                font-family: 'Segoe UI', Arial, sans-serif;
-            }}
+        我们的原始多尺寸 ICO 内含 PNG 帧。直接从 ICO 的目录表取出
+        PNG 字节，再让 Qt 加载，避免 Windows 环境缺少 Qt ICO 插件。
+        若换成没有 PNG 帧的 ICO，则尝试 Qt 原生 ICO 解码。
         """
-        )
+        icon_path = Path(resource_path("cg_dedupe.ico"))
+        icon = QtGui.QIcon()
+        try:
+            raw = icon_path.read_bytes()
+            if len(raw) >= 6 and raw[:4] == b"\x00\x00\x01\x00":
+                count = int.from_bytes(raw[4:6], "little")
+                for index in range(min(count, 256)):
+                    item = 6 + index * 16
+                    if item + 16 > len(raw):
+                        break
+                    size = int.from_bytes(raw[item + 8:item + 12], "little")
+                    offset = int.from_bytes(raw[item + 12:item + 16], "little")
+                    if not size or offset + size > len(raw):
+                        continue
+                    image = raw[offset:offset + size]
+                    if image.startswith(b"\x89PNG\r\n\x1a\n"):
+                        pixmap = QtGui.QPixmap()
+                        if pixmap.loadFromData(image, "PNG") and not pixmap.isNull():
+                            icon.addPixmap(pixmap)
+        except OSError as error:
+            if sys.stderr is not None:
+                print(f"[CGDedupe] 无法读取图标：{error}", file=sys.stderr)
 
-        # 应用按钮样式
-        self.select_dir_button.setStyleSheet(self.theme.get_button_style())
-        self.start_button.setStyleSheet(self.theme.get_button_style())
-
-        # 目录按钮样式
-        for btn in self.dir_buttons:
-            btn.setStyleSheet(self.theme.get_directory_button_style())
-
-        # 提示标签样式
-        self.tip_label.setStyleSheet(self.theme.get_label_style(is_tip=True))
-
-        # 表格样式
-        self.result_list.setStyleSheet(self.theme.get_tree_widget_style())
-        self.result_list.setAlternatingRowColors(True)
-        self.result_list.setUniformRowHeights(True)
-
-        # 结果统计标签样式
-        self.result_stats_label.setStyleSheet(self.theme.get_label_style(is_stats=True))
-
-        # 进度条样式
-        self.progress_bar.setStyleSheet(self.theme.get_progress_bar_style())
-
-    def connect_signals(self):
-        """连接所有信号"""
-        # 目录按钮信号
-        for i, btn in enumerate(self.dir_buttons):
-            btn.clicked.connect(
-                lambda checked, idx=i: self.operations.select_directories(idx)
+        if icon.isNull() and icon_path.is_file():
+            icon = QtGui.QIcon(str(icon_path))
+        if icon.isNull() and getattr(sys, "frozen", False):
+            icon = QtWidgets.QFileIconProvider().icon(
+                QtCore.QFileInfo(str(sys.executable))
             )
-            btn.rightClicked.connect(lambda idx=i: self.remove_directory(idx))
+        if not icon.isNull():
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                app.setWindowIcon(icon)
+            self.setWindowIcon(icon)
+        elif sys.stderr is not None:
+            print("[CGDedupe] 找不到可用的窗口图标。", file=sys.stderr)
 
-        # 其他信号
-        self.select_dir_button.clicked.connect(
-            lambda: self.operations.select_directories()
+    def _init_ui(self):
+        """紧凑工作台：设置/统计/工具栏占可用窗口高度约 1/3 以内。"""
+        self.setWindowTitle(f"{APP_TITLE}  v{APP_VERSION}")
+        self.resize(1520, 860)
+        self.setMinimumSize(1090, 650)
+        self._load_app_icon()
+        self.setStyleSheet(f"""
+            QWidget {{
+                font-family: "Microsoft YaHei UI", "Segoe UI";
+                font-size: 12px; background: {COLORS['bg']}; color: {COLORS['ink']};
+            }}
+            QFrame#hero {{background:{COLORS['navy']}; border-radius:8px;}}
+            QLabel#hero_title {{
+                color:#FFFFFF; background:transparent; font-size:20px; font-weight:700;
+            }}
+            QLabel#hero_subtitle {{color:#B8CAE7; background:transparent;}}
+            QFrame#panel, QFrame#stat {{
+                background:white; border:1px solid {COLORS['line']}; border-radius:7px;
+            }}
+            QLabel#section, QLabel#muted, QLabel#stat_value {{
+                background:transparent;
+            }}
+            QLabel#section {{font-weight:700; font-size:13px;}}
+            QLabel#stat_value {{font-size:21px; font-weight:700;}}
+            QLabel#muted {{color:{COLORS['muted']}; font-size:11px;}}
+            QPushButton {{
+                background:#EAF0FA; border:0; border-radius:6px;
+                padding:5px 10px; min-height:19px; font-weight:600;
+            }}
+            QPushButton:hover {{background:#DDE9FC;}}
+            QPushButton:disabled {{background:#EFF2F7; color:#A3ADBB;}}
+            QPushButton#primary {{background:{COLORS['blue']}; color:white;}}
+            QPushButton#primary:hover {{background:{COLORS['blue_hover']};}}
+            QPushButton#primary:disabled {{background:#B9CBEF; color:#F7F9FE;}}
+            QPushButton#toggle {{
+                background:#EAF0FA; border:1px solid #CFDAE9; min-width:76px;
+            }}
+            QPushButton#toggle:checked {{
+                background:#2C68D6; border:1px solid #2456B7; color:white;
+            }}
+            QLineEdit, QComboBox, QSpinBox {{
+                border:1px solid {COLORS['line']}; border-radius:5px;
+                padding:5px 7px; background:white;
+            }}
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
+                border:1px solid {COLORS['blue']};
+            }}
+            QTreeWidget {{
+                background:white; alternate-background-color:#F8FAFE;
+                border:1px solid {COLORS['line']}; border-radius:6px;
+                selection-background-color:#DCE9FF; selection-color:{COLORS['ink']};
+            }}
+            QTreeWidget::item {{min-height:27px; padding:3px;}}
+            QTreeWidget::item:selected {{
+                background:#DCE9FF; color:{COLORS['ink']};
+            }}
+            QHeaderView::section {{
+                background:#EAF1FA; border:0; border-right:1px solid #DFE6F0;
+                padding:8px 5px; font-weight:700;
+            }}
+            QProgressBar {{
+                background:#EAF0FA; border:1px solid {COLORS['line']};
+                min-height:15px; border-radius:4px;
+            }}
+            QProgressBar::chunk {{background:{COLORS['blue']};}}
+            QToolTip {{background:white; color:{COLORS['ink']};}}
+        """)
+
+        main = QtWidgets.QVBoxLayout(self)
+        main.setContentsMargins(12, 10, 12, 10)
+        main.setSpacing(6)
+
+        hero = QtWidgets.QFrame()
+        hero.setObjectName("hero")
+        hero.setFixedHeight(50)
+        banner = QtWidgets.QHBoxLayout(hero)
+        banner.setContentsMargins(16, 5, 16, 5)
+        title = QtWidgets.QLabel("大锤  /  NFO · STRM 多版本查重")
+        title.setObjectName("hero_title")
+        subtitle = QtWidgets.QLabel("Windows  ·  本地快速查重  ·  CD2 按需探测")
+        subtitle.setObjectName("hero_subtitle")
+        banner.addWidget(title)
+        banner.addStretch()
+        banner.addWidget(subtitle)
+        main.addWidget(hero)
+
+        summary = QtWidgets.QHBoxLayout()
+        summary.setSpacing(7)
+        self.stat_labels = []
+        for name in ("扫描条目", "重复作品", "独立版本"):
+            card = QtWidgets.QFrame()
+            card.setObjectName("stat")
+            card.setFixedHeight(44)
+            line = QtWidgets.QHBoxLayout(card)
+            line.setContentsMargins(13, 3, 13, 3)
+            caption = QtWidgets.QLabel(name)
+            caption.setObjectName("muted")
+            value = QtWidgets.QLabel("—")
+            value.setObjectName("stat_value")
+            line.addWidget(caption)
+            line.addStretch()
+            line.addWidget(value)
+            self.stat_labels.append(value)
+            summary.addWidget(card, 1)
+        main.addLayout(summary)
+
+        scan_panel = QtWidgets.QFrame()
+        scan_panel.setObjectName("panel")
+        root = QtWidgets.QVBoxLayout(scan_panel)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(7)
+
+        row1 = QtWidgets.QHBoxLayout()
+        row1.setSpacing(8)
+        directory_label = QtWidgets.QLabel("扫描目录")
+        directory_label.setObjectName("section")
+        row1.addWidget(directory_label)
+        self.directory_list = QtWidgets.QComboBox()
+        self.directory_list.setMinimumWidth(270)
+        self.directory_list.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
-        self.field_spinner.valueChanged.connect(self.operations.clear_results_on_change)
-        self.match_mode_widget.modeChanged.connect(self.operations.clear_results_on_change)
-        self.start_button.clicked.connect(self.operations.find_duplicates)
-        self.result_list.itemDoubleClicked.connect(
-            lambda item, column: self.operations.open_folder(item, column)
+        self.directory_list.setMinimumContentsLength(23)
+        self.directory_list.setToolTip("支持添加最多9个本地目录，依次扫描全部已添加目录。")
+        row1.addWidget(self.directory_list, 3)
+        self.add_btn = QtWidgets.QPushButton("＋")
+        self.add_btn.setToolTip("添加扫描目录")
+        self.add_btn.setFixedWidth(37)
+        self.remove_btn = QtWidgets.QPushButton("－")
+        self.remove_btn.setToolTip("移除当前选中的扫描目录")
+        self.remove_btn.setFixedWidth(37)
+        row1.addWidget(self.add_btn)
+        row1.addWidget(self.remove_btn)
+        row1.addSpacing(12)
+        row1.addWidget(QtWidgets.QLabel("依据"))
+        self.field_combo = QtWidgets.QComboBox()
+        self.field_combo.addItems(("番号", "系列"))
+        row1.addWidget(self.field_combo)
+        row1.addWidget(QtWidgets.QLabel("至少"))
+        self.minimum_spin = QtWidgets.QSpinBox()
+        self.minimum_spin.setRange(2, 99)
+        self.minimum_spin.setValue(2)
+        self.minimum_spin.setFixedWidth(65)
+        row1.addWidget(self.minimum_spin)
+        self.fuzzy_check = QtWidgets.QCheckBox("系列近似")
+        self.fuzzy_check.setToolTip("仅适用于系列查重；番号始终精确匹配")
+        row1.addWidget(self.fuzzy_check)
+        self.threshold_spin = QtWidgets.QSpinBox()
+        self.threshold_spin.setRange(50, 100)
+        self.threshold_spin.setValue(80)
+        self.threshold_spin.setSuffix("%")
+        self.threshold_spin.setFixedWidth(70)
+        row1.addWidget(self.threshold_spin)
+        root.addLayout(row1)
+
+        row2 = QtWidgets.QHBoxLayout()
+        row2.setSpacing(8)
+        self.scan_btn = QtWidgets.QPushButton("开始快速查重")
+        self.scan_btn.setObjectName("primary")
+        self.stop_btn = QtWidgets.QPushButton("停止任务")
+        self.stop_btn.setToolTip("停止扫描或读取队列；不会强制销毁线程")
+        self.scan_tip = QtWidgets.QLabel("只读本地 STRM / NFO；CD1/CD2 计作一套版本")
+        self.scan_tip.setObjectName("muted")
+        row2.addWidget(self.scan_btn)
+        row2.addWidget(self.stop_btn)
+        row2.addWidget(self.scan_tip)
+        row2.addStretch()
+        row2.addWidget(QtWidgets.QLabel("本地扫描线程"))
+        self.scan_workers_spin = QtWidgets.QSpinBox()
+        self.scan_workers_spin.setRange(1, 16)
+        self.scan_workers_spin.setValue(1)
+        self.scan_workers_spin.setToolTip("仅用于本地 NFO/STRM 读取；默认1；可比较4/8的实际耗时；与CD2探测并发独立")
+        row2.addWidget(self.scan_workers_spin)
+        self.mapping_btn = QtWidgets.QPushButton("路径映射")
+        row2.addWidget(self.mapping_btn)
+        root.addLayout(row2)
+        main.addWidget(scan_panel)
+
+        toolbar = QtWidgets.QHBoxLayout()
+        toolbar.setSpacing(7)
+        self.info_btn = QtWidgets.QPushButton("读取选中 / 整组参数")
+        self.info_btn.setObjectName("primary")
+        self.info_btn.setToolTip("支持 Ctrl 多选、Shift 多选和选中番号组")
+        self.bulk_btn = QtWidgets.QPushButton("批量读取当前重复视频")
+        self.bulk_btn.setToolTip(
+            "读取当前筛选出的所有重复组的视频参数（不依赖分组是否展开）。"
+            "从本地缓存恢复无需访问 CD2；结果显示在番号组的「已读 X/Y」、分辨率和帧率列。"
         )
-        
-        # 表头点击信号
-        self.result_list.header().sectionClicked.connect(
-            self.operations.on_header_clicked
+        self.concurrent_spin = QtWidgets.QSpinBox()
+        self.concurrent_spin.setRange(1, 2)
+        self.concurrent_spin.setValue(1)
+        self.concurrent_spin.setFixedWidth(56)
+        self.concurrent_spin.setToolTip(
+            "CloudDrive2 / 115：推荐 1；允许最多 2 条同时探测。"
+            "不受 CD2 上传/预处理任务数量设置控制。"
+        )
+        self.refresh_check = QtWidgets.QPushButton("重测：关闭")
+        self.refresh_check.setObjectName("toggle")
+        self.refresh_check.setCheckable(True)
+        self.refresh_check.setToolTip(
+            f"参数缓存位置：{self.data_dir}\\video_index.sqlite3；"
+            "默认复用14天内的结果。开启后，下次读取会绕过缓存重新访问 CD2。"
+        )
+        self.fastplay_check = QtWidgets.QPushButton("首帧：默认")
+        self.fastplay_check.setObjectName("toggle")
+        self.fastplay_check.setCheckable(True)
+        self.fastplay_check.setToolTip(
+            "仅 mpvnet：关闭预缓冲等待；对 MKV/MP4 限制容器探测大小。"
+            "某些视频可能无法完整识别，取消勾选可恢复默认。"
+        )
+        self.filter_input = QtWidgets.QLineEdit()
+        self.filter_input.setPlaceholderText("筛选番号、视频路径、文件夹…")
+        self.filter_input.setClearButtonEnabled(True)
+        self.filter_input.setMinimumWidth(165)
+        toolbar.addWidget(self.info_btn)
+        toolbar.addWidget(self.bulk_btn)
+        toolbar.addWidget(QtWidgets.QLabel("探测并发"))
+        toolbar.addWidget(self.concurrent_spin)
+        toolbar.addWidget(self.refresh_check)
+        toolbar.addWidget(self.fastplay_check)
+        toolbar.addStretch()
+        toolbar.addWidget(self.filter_input, 1)
+        main.addLayout(toolbar)
+
+        self.tree = QtWidgets.QTreeWidget()
+        self.tree.setColumnCount(13)
+        self.tree.setHeaderLabels([
+            "番号 / 版本", "版本数", "重复文件路径", "分辨率", "帧率",
+            "编码", "大小", "时长",
+            "播放", "文件夹", "操作", "视频源路径", "类型",
+        ])
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setRootIsDecorated(True)
+        self.tree.setIndentation(20)
+        self.tree.setAnimated(False)
+        self.tree.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.tree.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.tree.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.setSortingEnabled(False)
+        self.tree.setExpandsOnDoubleClick(False)
+        self.tree.header().setSectionsClickable(True)
+        self.tree.header().setStretchLastSection(False)
+        self.tree.setToolTip(
+            "单击「文件夹」打开此目录（番号组则打开整组）；"
+            "单击「播放」启动 mpvnet；Ctrl+A 选中已加载行，"
+            "也可用「读取全部重复视频」批量处理当前结果。"
+        )
+        widths = [190, 58, 400, 105, 95, 78, 83, 74, 76, 86, 68, 340, 66]
+        for index, width in enumerate(widths):
+            self.tree.setColumnWidth(index, width)
+        # Stretch 模式会锁定该列宽度；统一改为可拖拽的 Interactive。
+        # 初始仍使用上方配置的 400px，用户之后可以自由拖动表头分隔线。
+        self.tree.header().setSectionResizeMode(
+            self.COL["path"], QtWidgets.QHeaderView.ResizeMode.Interactive
+        )
+        self.play_icon = self.style().standardIcon(
+            QtWidgets.QStyle.StandardPixmap.SP_MediaPlay
+        )
+        self.folder_icon = self.style().standardIcon(
+            QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon
+        )
+        self.action_icon = self.style().standardIcon(
+            QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView
+        )
+        main.addWidget(self.tree, 1)
+
+        footer = QtWidgets.QHBoxLayout()
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setMaximumWidth(320)
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(True)
+        self.status_label = QtWidgets.QLabel("准备就绪 · 选择本地刮削目录开始查重")
+        self.status_label.setObjectName("muted")
+        footer.addWidget(self.progress)
+        footer.addWidget(self.status_label, 1)
+        main.addLayout(footer)
+
+    def _connect(self):
+        self.add_btn.clicked.connect(self.choose_directory)
+        self.remove_btn.clicked.connect(self.remove_directory)
+        self.scan_btn.clicked.connect(self.start_scan)
+        self.mapping_btn.clicked.connect(self.edit_path_mapping)
+        self.scan_workers_spin.valueChanged.connect(self._save_settings)
+        self.stop_btn.clicked.connect(self.stop_task)
+        self.field_combo.currentTextChanged.connect(self._mode_changed)
+        self.minimum_spin.valueChanged.connect(self.render_results)
+        self.fuzzy_check.toggled.connect(self._fuzzy_changed)
+        self.threshold_spin.valueChanged.connect(self._threshold_changed)
+        self.filter_timer = QtCore.QTimer(self)
+        self.filter_timer.setSingleShot(True)
+        self.filter_timer.setInterval(180)
+        self.filter_timer.timeout.connect(self.render_results)
+        self.filter_input.textChanged.connect(lambda _text: self.filter_timer.start())
+        self.info_btn.clicked.connect(self.get_video_info)
+        self.bulk_btn.clicked.connect(self.get_all_video_info)
+        self.concurrent_spin.valueChanged.connect(self._save_settings)
+        self.refresh_check.toggled.connect(self._refresh_toggle_changed)
+        self.fastplay_check.toggled.connect(self._fastplay_toggle_changed)
+        self.tree.itemSelectionChanged.connect(self._selection_changed)
+        self.tree.itemDoubleClicked.connect(self._double_clicked)
+        self.tree.itemClicked.connect(self._cell_clicked)
+        self.tree.itemExpanded.connect(self._group_expanded)
+        self.tree.customContextMenuRequested.connect(self._context_menu)
+        self.tree.header().sectionClicked.connect(self._header_clicked)
+
+    def _refresh_toggle_changed(self, active: bool):
+        self.refresh_check.setText("重测：开启" if active else "重测：关闭")
+        self._set_status(
+            "下次读取将忽略缓存并重新探测 CD2 视频"
+            if active else "下次读取优先使用14天内的本地视频参数缓存"
         )
 
-    def add_directory(self, directory):
-        """添加新目录到网格"""
-        if (
-            directory not in self.selected_directories
-            and len(self.selected_directories) < AppConstants.MAX_DIRECTORIES
-        ):
-            self.selected_directories.append(directory)
-            self.update_directory_display()
-            self.save_directories()
+    def _fastplay_toggle_changed(self, active: bool):
+        self.fastplay_check.setText("首帧：加速" if active else "首帧：默认")
+        self._save_settings()
 
-    def remove_directory(self, index):
-        """移除指定位置的目录"""
-        if 0 <= index < len(self.selected_directories):
-            self.selected_directories.pop(index)
-            self.update_directory_display()
-            self.save_directories()
+    def _load_options(self):
+        # 信号连接已建立；加载期间必须阻止保存，避免覆盖尚未加载的字段。
+        blockers = [QtCore.QSignalBlocker(widget) for widget in (
+            self.field_combo, self.minimum_spin, self.fuzzy_check, self.threshold_spin,
+            self.concurrent_spin, self.fastplay_check, self.scan_workers_spin)]
+        try:
+            workers = int(self.settings.get("scan_workers", 1))
+        except (TypeError, ValueError):
+            workers = 1
+        self.scan_workers_spin.setValue(max(1, min(16, workers)))
+        self.field_combo.setCurrentText(self.settings.get("field", "番号"))
+        try:
+            minimum = int(self.settings.get("minimum", 2))
+        except (TypeError, ValueError):
+            minimum = 2
+        self.minimum_spin.setValue(max(2, min(99, minimum)))
+        self.fuzzy_check.setChecked(bool(self.settings.get("fuzzy", False)))
+        try:
+            threshold = int(self.settings.get("threshold", 80))
+        except (TypeError, ValueError):
+            threshold = 80
+        self.threshold_spin.setValue(max(50, min(100, threshold)))
+        self.concurrent_spin.setValue(1 if self.settings.get("probe_concurrency") not in (1, 2) else self.settings["probe_concurrency"])
+        self.fastplay_check.setChecked(bool(self.settings.get("fast_play", False)))
+        self.fastplay_check.setText("首帧：加速" if self.fastplay_check.isChecked() else "首帧：默认")
+        del blockers
+        self._update_fuzzy_ability()
 
-    def update_directory_display(self):
-        """更新目录显示，使用目录管理器"""
-        self.directory_manager.update_all_buttons(self.selected_directories)
-
-    def load_directories(self):
-        """加载保存的目录"""
-        settings = QtCore.QSettings("NfoDuplicateFinder", "Directories")
-        saved_directories = settings.value("directories", [])
-        self.selected_directories = (
-            [d for d in saved_directories if os.path.exists(d)]
-            if saved_directories
-            else []
-        )
-        self.update_directory_display()
-
-    def save_directories(self):
-        """保存目录列表"""
-        settings = QtCore.QSettings("NfoDuplicateFinder", "Directories")
-        settings.setValue("directories", self.selected_directories)
-
-    def closeEvent(self, event):
-        """关闭前等待后台扫描安全退出，避免销毁运行中的 QThread。"""
-        worker = getattr(self.operations, "worker", None) if hasattr(self, "operations") else None
-        if worker is not None and worker.isRunning():
-            worker.requestInterruption()
-            if not worker.wait(5000):
-                QtWidgets.QMessageBox.warning(
-                    self, "任务仍在运行", "查重任务尚未安全停止，请稍后再关闭窗口。"
-                )
-                event.ignore()
+    def edit_path_mapping(self):
+        if self._task_active() or self.closing_requested:
+            return
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("STRM 路径前缀映射")
+        layout = QtWidgets.QFormLayout(dialog)
+        source = QtWidgets.QLineEdit(self.path_mapping.get("source_prefix", ""))
+        target = QtWidgets.QLineEdit(self.path_mapping.get("target_prefix", ""))
+        source.setPlaceholderText("例如 /115/视频；STRM 已是本地盘符时可留空")
+        target.setPlaceholderText("例如 X:\\视频")
+        source.setMinimumWidth(420)
+        layout.addRow("STRM 原始前缀", source)
+        layout.addRow("CD2 本地前缀", target)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            old, new = source.text().strip(), target.text().strip()
+            if bool(old) != bool(new) or (new and not (WINDOWS_DRIVE.match(new) or new.startswith("\\\\"))):
+                QtWidgets.QMessageBox.warning(self, "映射无效", "两项应同时填写或留空；本地前缀须为盘符绝对路径或 UNC 路径。")
                 return
-        self.save_directories()
+            self.path_mapping = {"source_prefix": old, "target_prefix": new}
+            self._save_settings()
+            self._set_status("路径映射已保存；重新扫描后应用")
+
+    def _center_window(self):
+        screen = QtWidgets.QApplication.primaryScreen()
+        if screen is None:
+            return
+        # Qt6 的 availableGeometry() 和 QWidget frameGeometry() 都是逻辑像素。
+        available = screen.availableGeometry()
+        geometry = self.frameGeometry()
+        geometry.moveCenter(available.center())
+        self.move(geometry.topLeft())
+
+    def _set_status(self, text: str):
+        self.status_label.setText(text)
+        self.status_label.setToolTip(text)
+
+    def _save_settings(self):
+        self.settings.update({
+            "directories": list(self.directories),
+            "last_directory": self.last_directory,
+            "field": self.field_combo.currentText(),
+            "minimum": self.minimum_spin.value(),
+            "fuzzy": self.fuzzy_check.isChecked(),
+            "threshold": self.threshold_spin.value(),
+            "path_mapping": dict(self.path_mapping),
+            "probe_concurrency": self.concurrent_spin.value(),
+            "scan_workers": self.scan_workers_spin.value(),
+            "fast_play": self.fastplay_check.isChecked(),
+        })
+        # 首次扫描前仅更新内存；扫描后由后台线程落盘。
+        if self._storage_active:
+            self.writer.submit(self.settings_file, self.settings)
+
+    def _refresh_roots(self):
+        previous = self.directory_list.currentText() if self.directory_list.count() else ""
+        self.directory_list.blockSignals(True)
+        self.directory_list.clear()
+        for directory in self.directories:
+            self.directory_list.addItem(directory)
+            self.directory_list.setItemData(
+                self.directory_list.count() - 1, directory, Qt.ItemDataRole.ToolTipRole
+            )
+        self.directory_list.setCurrentIndex(
+            self.directories.index(previous) if previous in self.directories else
+            (len(self.directories) - 1 if self.directories else -1)
+        )
+        self.directory_list.blockSignals(False)
+        self.directory_list.setToolTip(
+            f"当前有 {len(self.directories)} 个扫描目录，开始查重会扫描所有目录。"
+        )
+
+    def choose_directory(self):
+        # 首次扫描之前选择仅保存在内存；扫描时写入程序同级数据目录。
+        # 让原生对话框处理路径有效性；不要先在 GUI 线程 stat 可能离线的挂载盘。
+        initial = self.last_directory or str(Path.home())
+        selected = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "选择 NFO / STRM 扫描目录", initial
+        )
+        if selected:
+            self.last_directory = selected
+            self.add_directory(selected)
+
+    def add_directory(self, directory: str):
+        directory = os.path.abspath(directory)
+        if nt_key(directory) in {nt_key(root) for root in self.directories}:
+            self._set_status(f"目录已在扫描范围：{directory}")
+            return
+        if len(self.directories) >= self.MAX_DIRECTORIES:
+            QtWidgets.QMessageBox.warning(self, "目录数量限制", "最多允许九个扫描目录。")
+            return
+        self.directories.append(directory)
+        self._refresh_roots()
+        self._save_settings()
+
+    def remove_directory(self):
+        index = self.directory_list.currentIndex()
+        if index < 0 or index >= len(self.directories):
+            return
+        removed = self.directories.pop(index)
+        self._refresh_roots()
+        self._save_settings()
+        self._set_status(f"已移除目录：{removed}")
+
+    def _update_fuzzy_ability(self):
+        is_series = self.field_combo.currentText() == "系列"
+        self.fuzzy_check.setEnabled(is_series)
+        self.threshold_spin.setEnabled(is_series and self.fuzzy_check.isChecked())
+
+    def _mode_changed(self, _value):
+        self._update_fuzzy_ability()
+        self._save_settings()
+        if self.records:
+            self._set_status("匹配依据已改变：请重新扫描才会应用")
+
+    def _fuzzy_changed(self, _value):
+        self._update_fuzzy_ability()
+        self._save_settings()
+        if self.records and self.field_combo.currentText() == "系列":
+            self._set_status("系列相似匹配已改变：重新快速查重后生效")
+
+    def _threshold_changed(self, _value):
+        self._save_settings()
+        if self.records and self.fuzzy_check.isChecked() and self.field_combo.currentText() == "系列":
+            self._set_status("系列相似度已改变：重新快速查重后生效")
+
+
+    def _task_active(self):
+        # finished 信号排队期间仍保留任务所有权，防止新任务覆盖旧任务。
+        return self.worker is not None
+
+    def _update_buttons(self):
+        busy = self._task_active() or self.closing_requested
+        self.scan_btn.setEnabled(not busy)
+        self.mapping_btn.setEnabled(not busy)
+        self.scan_workers_spin.setEnabled(not busy)
+        self.info_btn.setEnabled(not busy and bool(self.records))
+        self.bulk_btn.setEnabled(not busy and bool(self.duplicates))
+        self.concurrent_spin.setEnabled(not busy)
+        self.refresh_check.setEnabled(not busy)
+        self.fastplay_check.setEnabled(not self.closing_requested)
+        self.add_btn.setEnabled(not busy)
+        self.remove_btn.setEnabled(not busy)
+        self.stop_btn.setEnabled(self._task_active())
+        self.field_combo.setEnabled(not busy)
+        self.fuzzy_check.setEnabled(not busy and self.field_combo.currentText() == "系列")
+        self.threshold_spin.setEnabled(
+            not busy and self.field_combo.currentText() == "系列"
+            and self.fuzzy_check.isChecked()
+        )
+        self.minimum_spin.setEnabled(not busy)
+        self.directory_list.setEnabled(not busy)
+
+    def _begin_task(self, worker, message):
+        if self._task_active():
+            return False
+        self.worker = worker
+        worker.progress.connect(self._task_progress)
+        if hasattr(worker, "error"):
+            worker.error.connect(self._task_error)
+        worker.finished.connect(self._task_finished)
+        self.progress.setRange(0, 0)
+        self._set_status(message)
+        worker.start()
+        self._update_buttons()
+        return True
+
+    def start_scan(self):
+        if self._task_active() or self.closing_requested:
+            return
+        if not self.directories:
+            QtWidgets.QMessageBox.warning(self, "缺少目录", "请至少添加一个本地刮削目录。")
+            return
+        # 避免在 GUI 主线程对 CD2 根目录做 isdir/stat 等阻塞 I/O。
+        # 在启动之前冻结设置；只有明确填写的路径前缀才映射 STRM。
+        old = self.path_mapping.get("source_prefix", "")
+        new = self.path_mapping.get("target_prefix", "")
+        self._scan_started_at = time.monotonic()
+        # 此时用户明确发起扫描，才允许配置写入、创建缓存与日志目录。
+        self._storage_active = True
+        self._save_settings()
+        self._render_token += 1
+        self._render_groups = []
+        self._loaded_groups.clear()
+        self.filter_timer.stop()
+        self.records = []
+        self.duplicates = {}
+        self.records_by_id = {}
+        self.tree_items = {}
+        self.group_items = {}
+        self.group_for_entry = {}
+        self.rows_by_target = defaultdict(list)
+        self.scan_counts = (0, 0, 0)
+        self.tree.clear()
+        worker = ScanWorker(
+            self.directories, self.field_combo.currentText(), old, new,
+            fuzzy=self.fuzzy_check.isChecked(),
+            threshold=self.threshold_spin.value() / 100.0,
+            scan_workers=self.scan_workers_spin.value(),
+        )
+        worker.result.connect(self._scan_complete)
+        self._begin_task(worker, "快速扫描中：不会读取 CD2 指向的视频")
+
+    def _scan_complete(self, result):
+        self.records = list(result["records"])
+        self.duplicates = dict(result["matches"])
+        self.records_by_id = {entry.identifier: entry for entry in self.records}
+        nfo_count, strm_count, video_count = result["counts"]
+        self.scan_counts = (nfo_count, strm_count, video_count)
+        stats = result["text_cache"]
+        cache_hits, cache_parsed = stats.get("hits", 0), stats.get("parsed", 0)
+        strm_hits, strm_read = stats.get("strm_hits", 0), stats.get("strm_read", 0)
+        restored_video_rows = result["video_cache_restored"]
+        visible_errors = list(result["errors"])
+        self.scan_errors = visible_errors
+        self.rows_by_target = defaultdict(list)
+        for entry in self.records:
+            if entry.target and entry.target_kind in ("path", "url"):
+                key = target_identity(entry.target, entry.target_kind)
+                self.rows_by_target[key].append(entry)
+        self.render_results()
+        unknown = sum(not e.code for e in self.records)
+        message = (
+            f"扫描完成（{time.monotonic() - self._scan_started_at:.2f}秒）："
+            f"NFO {nfo_count}，STRM {strm_count}，视频 {video_count}，"
+            f"重复 {len(self.duplicates)} 组，番号未识别 {unknown}"
+        )
+        message += (
+            f"；NFO 缓存命中 {cache_hits} / 本次解析 {cache_parsed}"
+            f"；STRM 缓存命中 {strm_hits} / 本次读取 {strm_read}"
+            f"；已恢复视频参数 {restored_video_rows} 条（14天内）"
+        )
+        if visible_errors:
+            message += f"；{len(visible_errors)} 条扫描提示"
+        self._set_status(message)
+        unknown_log_path = result.get("unrecognized_log_path", "")
+        if visible_errors or unknown_log_path:
+            hints = [message]
+            if unknown_log_path:
+                hints.append(f"未识别番号详情日志：{unknown_log_path}")
+            if visible_errors:
+                hints.extend(map(str, visible_errors))
+            self.status_label.setToolTip("\n\n".join(hints))
+
+    def stop_task(self):
+        if not self._task_active():
+            return
+        self.worker.stop()
+        self.stop_btn.setEnabled(False)
+        self._set_status("已请求停止，等待当前文件访问 / 网络请求结束…")
+
+    def _task_progress(self, current, total, label=""):
+        if isinstance(self.worker, ScanWorker):
+            self.progress.setRange(0, 0)
+            self._set_status(
+                f"快速查重中：已遍历 {current:,} 个目录，已读取 {total:,} 个 NFO"
+            )
+            return
+        if total <= 0:
+            self.progress.setRange(0, 0)
+            return
+        self.progress.setRange(0, total)
+        self.progress.setValue(min(current, total))
+
+    def _task_error(self, message):
+        self._set_status(f"任务失败：{message}")
+        QtWidgets.QMessageBox.warning(self, "任务失败", message)
+
+    def _task_finished(self):
+        source = self.sender()
+        if source is not self.worker:
+            return
+        stopped = source.stop_event.is_set()
+        was_probe = isinstance(source, ProbeWorker)
+        was_merge = isinstance(source, MergeDeleteWorker)
+        merge_outcome = source.outcome if was_merge else None
+        source.stop_event.clear()  # worker ended; clear Event for any later task
+        source.deleteLater()
+        self.worker = None
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0 if stopped else 1)
+        if was_probe:
+            summary = self._current_probe_stats
+            self._set_status(
+                f"{'已停止' if stopped else '探测完成'}："
+                f"{summary.get('finished', 0)}/{summary.get('total', 0)}，"
+                f"缓存 {summary.get('cached', 0)}，实测 {summary.get('measured', 0)}，"
+                f"失败/跳过 {summary.get('failed', 0)}"
+            )
+        elif stopped:
+            self._set_status("任务已停止")
+        self._update_buttons()
+        if self.closing_requested:
+            QtCore.QTimer.singleShot(0, self.close)
+        elif was_merge and merge_outcome is not None:
+            QtCore.QTimer.singleShot(
+                0, lambda response=merge_outcome: self._handle_merge_stage(response)
+            )
+
+    def render_results(self):
+        """分批创建分组并默认全部展开；版本行分批加载，避免 UI 长时间卡顿。"""
+        if not hasattr(self, "tree") or self.closing_requested:
+            return
+        selected = self.tree.currentItem()
+        saved_id = None
+        if selected is not None:
+            stored = selected.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(stored, dict):
+                saved_id = stored.get("id")
+        minimum = self.minimum_spin.value()
+        query = self.filter_input.text().strip().casefold()
+        groups = []
+        versions_total = 0
+        for code, items in self.duplicates.items():
+            count = version_count(items)
+            if count < minimum:
+                continue
+            if not group_matches_query(code, items, query):
+                continue
+            groups.append((code, items, count))
+            versions_total += count
+        if self.sort_column == self.COL["count"]:
+            groups.sort(
+                key=lambda row: (row[2], number_sort_key(row[0]), row[0].casefold()),
+                reverse=self.sort_reverse,
+            )
+        else:
+            groups.sort(
+                key=lambda row: (number_sort_key(row[0]), row[0].casefold()),
+                reverse=self.sort_reverse,
+            )
+
+        self._render_token += 1
+        token = self._render_token
+        self._render_offset = 0
+        self._render_groups = groups
+        self._loaded_groups = set()
+        self._render_saved_id = saved_id
+        self.tree.setUpdatesEnabled(False)
+        self.tree.clear()
+        self.tree_items = {}
+        self.group_items = {}
+        self.group_for_entry = {
+            row.identifier: code for code, group, _count in groups for row in group
+        }
+        self.tree.setUpdatesEnabled(True)
+        self.stat_labels[0].setText(
+            f"{self.scan_counts[0]} / {self.scan_counts[1]} / {self.scan_counts[2]}"
+        )
+        self.stat_labels[1].setText(str(len(groups)))
+        self.stat_labels[2].setText(str(versions_total))
+        QtCore.QTimer.singleShot(0, lambda: self._render_group_batch(token))
+
+    def _render_group_batch(self, token: int):
+        if token != self._render_token or self.closing_requested:
+            return
+        start = self._render_offset
+        end = min(start + 100, len(self._render_groups))
+        self.tree.setUpdatesEnabled(False)
+        try:
+            for code, _entries, count in self._render_groups[start:end]:
+                root = QtWidgets.QTreeWidgetItem(self.tree)
+                root.setText(0, code)
+                root.setText(1, str(count))
+                aliases = sorted(
+                    {entry.code for entry in _entries if entry.code},
+                    key=number_sort_key,
+                )
+                if len(aliases) > 1:
+                    root.setToolTip(
+                        0, "等价番号（原始番号均保留）：\n"
+                        + "\n".join(aliases)
+                        + "\n\n仅供查重参考；永久删除前请确认实际视频内容。"
+                    )
+                unique_dirs = unique_group_folders(self.duplicates.get(code, []))
+                root.setText(self.COL["open_folder"], "全部")
+                root.setIcon(self.COL["open_folder"], self.folder_icon)
+                root.setToolTip(
+                    self.COL["open_folder"],
+                    f"单击打开本组 {len(unique_dirs)} 个不同文件夹"
+                )
+                root.setText(self.COL["actions"], "更多")
+                root.setIcon(self.COL["actions"], self.action_icon)
+                root.setData(
+                    0, Qt.ItemDataRole.UserRole, {"kind": "group", "code": code}
+                )
+                self.group_items[code] = root
+                self._update_group_summary(code)
+                font = root.font(0)
+                font.setBold(True)
+                root.setFont(0, font)
+                for col in range(self.tree.columnCount()):
+                    root.setBackground(col, QtGui.QBrush(QtGui.QColor(COLORS["pale"])))
+                # 先保留占位项，再自动展开。itemExpanded 会触发
+                # _group_expanded()，使用现有的定时分批加载，界面不需要逐组点击。
+                placeholder = QtWidgets.QTreeWidgetItem(root)
+                placeholder.setText(0, "正在加载全部版本…")
+                placeholder.setData(0, Qt.ItemDataRole.UserRole, {"kind": "placeholder"})
+                root.setExpanded(True)
+                # 即使某些 Qt 环境没有立即发出 itemExpanded，也主动加载；
+                # _loaded_groups 会拦截重复信号，不会产生重复子项。
+                self._group_expanded(root)
+        finally:
+            self.tree.setUpdatesEnabled(True)
+        self._render_offset = end
+        if end < len(self._render_groups):
+            QtCore.QTimer.singleShot(1, lambda: self._render_group_batch(token))
+        else:
+            # 所有分组在逐批创建时已经自动展开，不限制前 8 组。
+            self._selection_changed()
+
+    def _update_group_summary(self, code: str):
+        """更新分组的扫描文件路径和已读取的视频参数摘要。"""
+        root = self.group_items.get(code)
+        if root is None:
+            return
+        entries = self.duplicates.get(code, [])
+        sources = [next((row for row in group if row.info.get("verified")), group[0])
+                   for group in version_groups(entries)]
+        total = len(sources)
+        checked = [row for row in sources if row.info.get("verified")]
+        cached = sum("缓存" in row.info_status for row in checked)
+        # 本列显示扫描目录中真实存在的文件路径，不是视频探测状态，
+        # 也不是 STRM 首行指向的远程/本地视频源地址。
+        media_paths = [
+            entry.media_path for entry in entries
+            if entry.media_type in ("视频", "STRM")
+        ]
+        if media_paths:
+            visible_paths = "；".join(media_paths[:2])
+            if len(media_paths) > 2:
+                visible_paths += f"；…（其余 {len(media_paths) - 2} 个，展开查看）"
+            root.setText(2, visible_paths)
+            root.setToolTip(
+                2,
+                "本组扫描到的重复视频/STRM 文件路径：\n"
+                + "\n".join(media_paths)
+                + f"\n\n探测进度：已读 {len(checked)}/{total}"
+                + (f"；缓存 {cached}" if cached else ""),
+            )
+        else:
+            root.setText(2, "—（仅 NFO，无视频文件）")
+            root.setToolTip(2, "此重复组只有 NFO 元数据，没有视频或 STRM 文件。")
+        resolutions = sorted({
+            str(row.info.get("resolution")) for row in checked if row.info.get("resolution")
+            and row.info.get("resolution") != "—"
+        })
+        fps_values = sorted({
+            str(row.info.get("fps")) for row in checked if row.info.get("fps")
+            and row.info.get("fps") != "—"
+        })
+        root.setText(3, " / ".join(resolutions[:3]) + ("…" if len(resolutions) > 3 else ""))
+        root.setText(4, " / ".join(fps_values[:3]) + ("…" if len(fps_values) > 3 else ""))
+        # 探测信息已放在路径列的悬停提示中，不覆盖上述扫描路径。
+        color = COLORS["green"] if checked and len(checked) == total else COLORS["muted"]
+        root.setForeground(2, QtGui.QBrush(QtGui.QColor(color)))
+
+    def _group_expanded(self, group_item: QtWidgets.QTreeWidgetItem):
+        data = group_item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict) or data.get("kind") != "group":
+            return
+        code = data.get("code", "")
+        if code in self._loaded_groups:
+            return
+        self._loaded_groups.add(code)
+        if group_item.childCount():
+            first = group_item.child(0)
+            first_data = first.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(first_data, dict) and first_data.get("kind") == "placeholder":
+                group_item.takeChild(0)
+        entries = sorted(
+            self.duplicates.get(code, []),
+            key=lambda entry: (
+                -(entry.info.get("height") or 0),
+                -(entry.info.get("size") or 0),
+                ntpath.basename(entry.media_path).casefold(),
+            ),
+        )
+        token = self._render_token
+        QtCore.QTimer.singleShot(
+            0, lambda: self._render_child_batch(token, group_item, entries, 0)
+        )
+
+    def _render_child_batch(
+        self, token: int, root: QtWidgets.QTreeWidgetItem,
+        entries: list[MediaEntry], offset: int
+    ):
+        if token != self._render_token or self.closing_requested:
+            return
+        self.tree.setUpdatesEnabled(False)
+        try:
+            end = min(offset + 140, len(entries))
+            for entry in entries[offset:end]:
+                child = QtWidgets.QTreeWidgetItem(root)
+                child.setData(
+                    0, Qt.ItemDataRole.UserRole,
+                    {"kind": "media", "id": entry.identifier}
+                )
+                child.setText(
+                    0, ntpath.basename(entry.folder) or ntpath.basename(entry.media_path)
+                )
+                if entry.disc is not None:
+                    child.setText(0, child.text(0) + f" · CD{entry.disc}")
+                self.tree_items[entry.identifier] = child
+                self._set_entry_cells(child, entry)
+                if self._render_saved_id == entry.identifier:
+                    self.tree.setCurrentItem(child)
+        finally:
+            self.tree.setUpdatesEnabled(True)
+        if end < len(entries):
+            QtCore.QTimer.singleShot(
+                1, lambda: self._render_child_batch(token, root, entries, end)
+            )
+
+    def _set_entry_cells(self, item: QtWidgets.QTreeWidgetItem, entry: MediaEntry):
+        info = entry.info
+        # media_path 是扫描结果里的文件（STRM 时为 .strm 本身）。
+        # target 是其指向/播放的视频源，此处绝不能使用 target。
+        if entry.media_type in ("视频", "STRM"):
+            item.setText(2, entry.media_path)
+            item.setToolTip(
+                2, f"扫描文件路径：{entry.media_path}\n探测状态：{entry.info_status}"
+            )
+        else:
+            item.setText(2, "—（仅 NFO，无视频文件）")
+            item.setToolTip(
+                2, f"仅有 NFO 元数据：{entry.media_path}\n状态：{entry.info_status}"
+            )
+        item.setText(self.COL["type"], entry.media_type)
+        item.setText(self.COL["quality"], str(info.get("resolution") or "—"))
+        item.setText(self.COL["fps"], str(info.get("fps") or "—"))
+        item.setText(self.COL["codec"], str(info.get("codec") or "—"))
+        item.setText(self.COL["size"], human_size(info.get("size")))
+        item.setText(self.COL["duration"], human_duration(info.get("duration")))
+        if entry.target_kind in ("path", "url"):
+            item.setText(self.COL["play"], "播放")
+            item.setIcon(self.COL["play"], self.play_icon)
+        else:
+            item.setText(self.COL["play"], "—")
+            item.setIcon(self.COL["play"], QtGui.QIcon())
+        item.setText(self.COL["open_folder"], "打开")
+        item.setIcon(self.COL["open_folder"], self.folder_icon)
+        item.setText(self.COL["actions"], "更多")
+        item.setIcon(self.COL["actions"], self.action_icon)
+        item.setText(self.COL["source"], entry.target or entry.media_path)
+        item.setToolTip(
+            self.COL["source"], f"{entry.target or entry.media_path}\n{entry.info_status}"
+        )
+        item.setToolTip(self.COL["play"], "单击播放，不会额外扫描 CD2 视频")
+        item.setToolTip(
+            self.COL["open_folder"], f"单击打开本文件所在文件夹：{entry.folder}"
+        )
+        item.setToolTip(self.COL["actions"], "单击打开本版本的其他操作")
+        if entry.target_kind in ("unmapped", "invalid"):
+            item.setForeground(
+                self.COL["source"], QtGui.QBrush(QtGui.QColor(COLORS["red"]))
+            )
+        elif entry.info.get("verified"):
+            item.setForeground(
+                self.COL["quality"], QtGui.QBrush(QtGui.QColor(COLORS["green"]))
+            )
+
+    def _selected_entry(self) -> MediaEntry | None:
+        item = self.tree.currentItem()
+        if item is None:
+            return None
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if isinstance(data, dict) and data.get("kind") == "media":
+            return self.records_by_id.get(data.get("id"))
+        return None
+
+    def _selected_entries(self) -> list[MediaEntry]:
+        """Ctrl、Shift、Ctrl+A 多选；分组与子项重复选中时只入队一次。"""
+        selection = self.tree.selectedItems()
+        if not selection and self.tree.currentItem():
+            selection = [self.tree.currentItem()]
+        entries = []
+        seen = set()
+        for item in selection:
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if not isinstance(data, dict):
+                continue
+            if data.get("kind") == "media":
+                candidates = [self.records_by_id.get(data.get("id"))]
+            elif data.get("kind") == "group":
+                candidates = self.duplicates.get(data.get("code", ""), [])
+            else:
+                candidates = []
+            for entry in candidates:
+                if entry is not None and entry.identifier not in seen:
+                    seen.add(entry.identifier)
+                    entries.append(entry)
+        return entries
+
+    def _selection_changed(self):
+        """不再跳到下方详情面板：只在表格状态栏提示最短操作说明。"""
+        if self._task_active():
+            return
+        entry = self._selected_entry()
+        if entry is not None:
+            self._set_status(
+                f"{entry.code}  ·  {entry.media_type}  ·  {entry.info_status}  |  "
+                "单击播放或文件夹图标直接操作；播放检查完即可手动清理"
+            )
+        else:
+            selected = self.tree.currentItem()
+            if selected is None:
+                return
+            data = selected.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(data, dict) and data.get("kind") == "group":
+                self._set_status(
+                    f"{data.get('code')}: 单击「文件夹」一次打开整组目录；"
+                    "点击展开箭头查看版本"
+                )
+
+    def _cell_clicked(self, item, column):
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict) or data.get("kind") == "placeholder":
+            return
+        if column == self.COL["play"] and data.get("kind") == "media":
+            self.play_selected()
+        elif column == self.COL["open_folder"]:
+            if data.get("kind") == "group":
+                self.open_group_folders(data.get("code", ""))
+            elif data.get("kind") == "media":
+                self.open_scrape_folder()
+        elif column == self.COL["actions"]:
+            cell = self.tree.visualItemRect(item)
+            position = QtCore.QPoint(
+                max(10, min(self.tree.viewport().width() - 10,
+                            self.tree.columnViewportPosition(self.COL["actions"]) + 26)),
+                cell.center().y(),
+            )
+            self._context_menu(position)
+
+    def _double_clicked(self, item, column):
+        # 操作按钮单击已执行；双击不重复打开播放器或文件夹。
+        if column in (self.COL["play"], self.COL["open_folder"], self.COL["actions"]):
+            return
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return
+        if data.get("kind") == "group":
+            item.setExpanded(not item.isExpanded())
+        elif data.get("kind") == "media":
+            self.play_selected()
+
+    def open_group_folders(self, code: str):
+        # 不依赖树节点是否展开，使用完整分组资料；一次发出所有不同目录。
+        folders = unique_group_folders(self.duplicates.get(code, []))
+        self._open_folders(folders, code)
+
+    def _open_folders(self, folders: list[str], label=""):
+        if self.closing_requested:
+            return
+        if self.folder_worker is not None:
+            if self.folder_worker.isRunning():
+                self._set_status("文件管理器正在处理上次的目录打开请求")
+                return
+            self.folder_worker.deleteLater()
+            self.folder_worker = None
+        if not folders:
+            return
+        if len(folders) > 30:
+            QtWidgets.QMessageBox.warning(
+                self, "避免打开过多文件管理器标签",
+                f"{label} 涉及 {len(folders)} 个目录，超过本工具单次打开上限 30。"
+                "为避免文件管理器瞬间打开太多标签，请按版本分批操作。"
+            )
+            return
+        if len(folders) > 5:
+            reply = QtWidgets.QMessageBox.question(
+                self, "确认打开多目录",
+                f"{label} 包含 {len(folders)} 个不同文件夹，是否全部打开？",
+                QtWidgets.QMessageBox.StandardButton.Yes |
+                QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        self.folder_worker = FolderOpenWorker(folders)
+        self.folder_worker.opened.connect(
+            lambda count, manager: self._set_status(
+                f"已通过{manager}请求打开 {count}/{len(folders)} 个独立文件夹"
+            )
+        )
+        self.folder_worker.errors.connect(
+            lambda text: QtWidgets.QMessageBox.warning(
+                self, "部分文件夹无法打开", text
+            )
+        )
+        self.folder_worker.finished.connect(self._folders_finished)
+        self.folder_worker.start()
+
+    def _folders_finished(self):
+        worker = self.sender()
+        if worker is self.folder_worker:
+            worker.stop_event.clear()
+            worker.deleteLater()
+            self.folder_worker = None
+        if self.closing_requested:
+            QtCore.QTimer.singleShot(0, self.close)
+
+    def _header_clicked(self, index):
+        if index not in (self.COL["title"], self.COL["count"]):
+            return
+        if index == self.sort_column:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_column = index
+            self.sort_reverse = index == self.COL["count"]
+        self.render_results()
+
+
+    def _jobs_from_entries(self, entries: list[MediaEntry]) -> list[tuple[str, str]]:
+        """同一个 CD2 视频无论被多少 STRM 引用，都只读取一次。"""
+        jobs = []
+        seen = set()
+        for entry in entries:
+            if entry.target_kind not in ("path", "url") or not entry.target:
+                continue
+            key = target_identity(entry.target, entry.target_kind)
+            if key not in seen:
+                seen.add(key)
+                jobs.append((entry.target, entry.target_kind))
+        return jobs
+
+    def _visible_duplicated_entries(self) -> list[MediaEntry]:
+        """直接从内存中的重复组获得全量数据，不依赖懒加载树节点。"""
+        minimum = self.minimum_spin.value()
+        keyword = self.filter_input.text().strip().casefold()
+        entries = []
+        for code, rows in self.duplicates.items():
+            if version_count(rows) < minimum:
+                continue
+            if not group_matches_query(code, rows, keyword):
+                continue
+            entries.extend(rows)
+        return entries
+
+    def _start_info_jobs(self, jobs: list[tuple[str, str]], scope: str):
+        if self._task_active() or self.closing_requested:
+            return
+        if not jobs:
+            QtWidgets.QMessageBox.information(
+                self, "没有可读取的视频",
+                "当前范围中没有已映射的 STRM / 本地视频；"
+                "若 STRM 内是 /mnt/... 请先处理本地盘符映射。"
+            )
+            return
+        count = len(jobs)
+        if count > 10:
+            confirm = QtWidgets.QMessageBox.question(
+                self, "批量探测 CD2 视频",
+                f"{scope}共有 {count} 个不同的视频源。\n\n"
+                f"并发：{self.concurrent_spin.value()}，单源超时：20秒。\n"
+                "读取容器/轨道元数据，优先复用14天缓存；"
+                "批量探测可能仍会触发115服务端限流。\n\n继续吗？",
+                QtWidgets.QMessageBox.StandardButton.Yes |
+                QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        self._current_probe_stats = {}
+        worker = ProbeWorker(
+            jobs, self.cache_file,
+            refresh=self.refresh_check.isChecked(),
+            timeout=20,
+            concurrency=self.concurrent_spin.value(),
+        )
+        worker.batch_ready.connect(self._receive_probe_batch)
+        worker.statistics.connect(self._receive_probe_statistics)
+        # _begin_task 自动连接 progress/error/finished。
+        self._begin_task(
+            worker, f"已创建 {count} 条探测任务；CD2 同时最多 {self.concurrent_spin.value()} 条"
+        )
+
+    def get_video_info(self):
+        self._start_info_jobs(
+            self._jobs_from_entries(self._selected_entries()),
+            "选中范围",
+        )
+
+    def get_all_video_info(self):
+        # “全部重复视频”按当前筛选结果，不受树节点按需加载的影响。
+        self._start_info_jobs(
+            self._jobs_from_entries(self._visible_duplicated_entries()),
+            "当前全部重复组",
+        )
+
+    def _receive_probe_batch(self, batch):
+        # 只更新已显示的行，折叠组只更新分组摘要，避免批量读取时重建整棵树。
+        affected_groups = set()
+        self.tree.setUpdatesEnabled(False)
+        try:
+            for target, info, state in batch:
+                key = target_identity(target)
+                for entry in self.rows_by_target.get(key, []):
+                    if info.get("verified"):
+                        entry.info = dict(info)
+                        entry.info_status = state
+                    elif entry.info.get("verified"):
+                        # 主动重测失败也不能清除已成功的历史实测数据。
+                        entry.info_status = "本次探测失败（保留旧参数）：" + state
+                    else:
+                        entry.info = dict(info)
+                        entry.info_status = state
+                    item = self.tree_items.get(entry.identifier)
+                    if item is not None:
+                        self._set_entry_cells(item, entry)
+                    group_name = self.group_for_entry.get(entry.identifier)
+                    if group_name is not None:
+                        affected_groups.add(group_name)
+            for group_name in affected_groups:
+                self._update_group_summary(group_name)
+        finally:
+            self.tree.setUpdatesEnabled(True)
+
+    def _receive_probe_statistics(self, result):
+        self._current_probe_stats = dict(result)
+
+    def _require_single_media(self) -> MediaEntry | None:
+        entry = self._selected_entry()
+        if entry is None:
+            QtWidgets.QMessageBox.information(
+                self, "请选中具体版本", "请选中番号分组下面的一条实际 STRM/视频记录。"
+            )
+        return entry
+
+    def play_selected(self):
+        """以独立 mpvnet 进程播放，关闭播放器窗口后更易释放文件占用。
+
+        不强制结束播放器或云盘驱动，避免误伤用户另开的播放任务。
+        加速试验仍可在工具栏关闭，不读取 CD2 目标文件做额外 stat。
+        """
+        entry = self._require_single_media()
+        if entry is None:
+            return
+        if entry.target_kind not in ("path", "url") or not entry.target:
+            QtWidgets.QMessageBox.warning(
+                self, "不能播放", "STRM 视频地址未映射或无效，请检查 STRM 内容。"
+            )
+            return
+        player = resource_path("mpvnet.exe")
+        if not os.path.isfile(player):
+            player = "mpvnet"
+        # mpv.net single 模式会复用正在运行的播放器，关闭窗口后
+        # 旧进程可能仍持有媒体；multi 让本次播放使用独立进程。
+        # 仅发送启动请求；不调用 taskkill、不关闭别的程序句柄。
+        args = [player, "--process-instance=multi"]
+        if self.fastplay_check.isChecked():
+            args.extend([
+                "--cache-pause-initial=no",
+                "--cache-pause-wait=0.5",
+            ])
+            extension = ntpath.splitext(
+                urllib.parse.urlsplit(entry.target).path if ANY_URI.match(entry.target)
+                else entry.target
+            )[1].casefold()
+            if extension in (".mkv", ".mp4", ".m4v", ".mov"):
+                # ⚠️ 请确认此用法：部分特殊 MKV/MP4 可能需要更大探测量。
+                # 如果出现音轨/字幕识别不全，关闭工具栏加速选项即可恢复默认。
+                args.extend([
+                    "--demuxer-lavf-probesize=2MiB",
+                    "--demuxer-lavf-analyzeduration=0.5",
+                ])
+        args.append(entry.target)
+        try:
+            subprocess.Popen(
+                args,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                close_fds=True,
+            )
+            self._set_status(
+                f"{entry.code} 已交给 mpvnet 独立播放进程"
+                + ("（首帧加速试验已开启）" if self.fastplay_check.isChecked() else "")
+                + "；关闭播放器窗口后再删除，若 CD2 仍占用会安全重试"
+            )
+        except FileNotFoundError:
+            try:
+                os.startfile(entry.target)
+                self._set_status(
+                    "没有找到 mpvnet.exe，已交给 Windows 默认播放器"
+                )
+            except OSError as exc:
+                QtWidgets.QMessageBox.warning(
+                    self, "播放器未找到",
+                    f"无法启动 mpvnet / 默认播放器：{exc}\n"
+                    "建议在 mpv.net 的 Setup 中将 mpvnet 加入 PATH。"
+                )
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "启动失败", f"mpvnet 启动失败：{exc}"
+            )
+
+    def open_scrape_folder(self):
+        entry = self._require_single_media()
+        if entry is not None:
+            self._open_folders([entry.folder], entry.code)
+
+    def copy_video_path(self):
+        entry = self._require_single_media()
+        if entry is None:
+            return
+        QtWidgets.QApplication.clipboard().setText(
+            entry.target or entry.raw_target or entry.media_path
+        )
+        self._set_status("视频源地址已复制到剪贴板")
+
+    def _context_menu(self, point):
+        item = self.tree.itemAt(point)
+        if item is None:
+            return
+        self.tree.setCurrentItem(item)
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        selected = (
+            self.records_by_id.get(data.get("id"))
+            if isinstance(data, dict) and data.get("kind") == "media" else None
+        )
+        menu = QtWidgets.QMenu(self)
+        if selected is None:
+            code = data.get("code", "") if isinstance(data, dict) else ""
+            menu.addAction(
+                "打开这一组的全部文件夹",
+                lambda: self.open_group_folders(code),
+            )
+            menu.addAction(
+                "读取这一组的真实视频信息",
+                self.get_video_info,
+            )
+            menu.addAction("读取当前筛选中的全部重复视频", self.get_all_video_info)
+            menu.addSeparator()
+            hint = menu.addAction("删除请先展开分组，右键具体视频 / STRM")
+            hint.setEnabled(False)
+            menu.addAction(
+                "展开 / 折叠",
+                lambda: item.setExpanded(not item.isExpanded())
+            )
+        else:
+            menu.addAction("▶ 播放视频", self.play_selected)
+            menu.addAction("获取真实视频分辨率 / 帧率", self.get_video_info)
+
+            menu.addAction("打开本 STRM / NFO 文件夹", self.open_scrape_folder)
+            menu.addAction("复制真实视频地址", self.copy_video_path)
+            menu.addSeparator()
+            if self._task_active():
+                action = menu.addAction("请先停止当前任务，再进行合并删除")
+                action.setEnabled(False)
+            elif selected.media_type in ("STRM", "视频"):
+                action = menu.addAction(
+                    "⚠ 删除重复项（先预检，自动选择单文件 / 整目录）"
+                )
+                action.triggered.connect(
+                    lambda _checked=False, entry=selected:
+                    self.start_merge_delete_precheck(entry)
+                )
+            menu.addAction(
+                "查看合并删除日志目录",
+                lambda: self._open_folders([str(self.merge_log_file.parent)], "删除日志"),
+            )
+        menu.exec(self.tree.viewport().mapToGlobal(point))
+
+    def start_merge_delete_precheck(self, entry: MediaEntry | None = None):
+        """右键动作绑定具体条目；预检前绝不修改文件。"""
+        if entry is None:
+            entry = self._require_single_media()
+        if entry is None or self._task_active() or self.closing_requested:
+            return
+        if self.records_by_id.get(entry.identifier) is not entry:
+            QtWidgets.QMessageBox.warning(
+                self, "记录已变化", "所选条目已变化，请重新扫描后再删除。"
+            )
+            return
+        if entry.media_type not in ("STRM", "视频"):
+            QtWidgets.QMessageBox.information(
+                self, "不能合并删除", "请先选择一个具体的 STRM 或普通视频。"
+            )
+            return
+        operation_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(4)
+        worker = MergeDeleteWorker(
+            "precheck", entry, self.records, self.directories,
+            self.path_mapping.get("source_prefix", ""),
+            self.path_mapping.get("target_prefix", ""),
+            operation_id,
+        )
+        self._begin_task(
+            worker,
+            (
+                f"删除预检：{entry.code}；先核查 STRM 指向的真实视频，"
+                "再决定是删除 STRM 文件还是整个专属目录"
+                if entry.media_type == "STRM" else
+                f"删除预检：检查 {entry.code} 目录，存在其他视频时仅删除目标文件"
+            ),
+        )
+
+    def _handle_merge_stage(self, result: dict):
+        """QThread 已结束；才在主线程弹出确认对话框。"""
+        if self.closing_requested:
+            return
+        phase = result.get("phase")
+        success = result.get("success", False)
+        log_file = str(self.merge_log_file)
+        if not success:
+            error = result.get("error", "未知错误")
+            title = "合并删除已阻止" if phase == "precheck" else "合并删除未完成"
+            self._set_status(f"{title}：{error}")
+            QtWidgets.QMessageBox.warning(
+                self, title,
+                f"{error}\n\n审计日志：\n{log_file}\n\n"
+                "如果是 WinError 32/33，请先完全退出播放器，"
+                "等待 CD2/云盘驱动释放文件占用，再重新尝试。\n"
+                "程序不会强行结束其他进程，也不会冒险继续清理 STRM。\n"
+                "若出现部分删除，请按日志人工核对。"
+            )
+            if phase == "execute":
+                QtCore.QTimer.singleShot(0, self.start_scan)
+            return
+        if phase == "precheck":
+            plan = result.get("plan")
+            if not isinstance(plan, dict):
+                return
+            self._confirm_merge_plan(plan)
+        elif phase == "execute":
+            completed = result.get("completed", [])
+            self._set_status(
+                f"合并删除完成：{result.get('plan', {}).get('code', '')}；"
+                f"共处理 {len(completed)} 个目标"
+            )
+            QtWidgets.QMessageBox.information(
+                self, "合并删除完成",
+                "操作步骤：\n" + "\n".join(completed)
+                + f"\n\n日志：\n{log_file}"
+            )
+            QtCore.QTimer.singleShot(0, self.start_scan)
+
+    def _confirm_merge_plan(self, plan: dict):
+        """预检通过后仅弹出一次是/否确认，不要求键入字符。"""
+        if self._task_active() or self.closing_requested:
+            return
+        kind = plan["media_type"]
+        entire_folder = plan["cleanup_mode"] == "folder"
+        if kind == "STRM":
+            second_target = (
+                plan["scrape_folder"] if entire_folder else plan["media_path"]
+            )
+            details = (
+                "执行顺序（均为永久删除）：\n"
+                f"1. STRM 指向的真实视频文件：\n{plan['source_video']}\n\n"
+                f"2. {'整个 STRM 所在目录' if entire_folder else '仅 STRM 文件'}：\n"
+                f"{second_target}\n"
+            )
+            summary = (
+                "不会遍历或清空 STRM 真实视频的父目录。\n"
+                "源视频若被其他扫描记录引用，预检会拒绝。"
+            )
+        else:
+            target = plan["video_folder"] if entire_folder else plan["media_path"]
+            details = (
+                f"执行操作（永久删除{'整个文件夹' if entire_folder else '单个视频文件'}）：\n"
+                f"{target}\n"
+            )
+            summary = ""
+        summary += "\n目录处理依据：" + plan["cleanup_reason"]
+        if entire_folder:
+            summary += "\n目录中的 NFO、图片、字幕等其它文件也会被删除。"
+        else:
+            summary += "\n所在目录和其中其它文件均保留。"
+        summary += (
+            "\n\n⚠ 115 / CD2 的源文件删除可能直接影响云端原件！"
+            "\n所有删除都是永久删除，不进入回收站，不保证可恢复。"
+            "\n执行前会再次完整预检，防止确认期间新增其它媒体文件。"
+        )
+        prompt = QtWidgets.QMessageBox.question(
+            self, f"确认永久合并删除 {plan['code']}",
+            details + "\n" + summary + "\n\n是否继续？",
+            QtWidgets.QMessageBox.StandardButton.Yes |
+            QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if prompt != QtWidgets.QMessageBox.StandardButton.Yes:
+            self.writer.submit_merge_event(
+                plan["operation_id"], "CONFIRM_CANCELLED",
+                plan=plan, reason="用户在删除确认框中选择否"
+            )
+            self._set_status("已取消合并删除；所有文件保持不变")
+            return
+        entry = self.records_by_id.get(plan["identifier"])
+        if entry is None:
+            self.writer.submit_merge_event(
+                plan["operation_id"], "EXECUTE_ABORTED",
+                plan=plan, reason="条目在预检后消失"
+            )
+            return
+        worker = MergeDeleteWorker(
+            "execute", entry, self.records, self.directories,
+            self.path_mapping.get("source_prefix", ""),
+            self.path_mapping.get("target_prefix", ""),
+            plan["operation_id"], confirmed_plan=plan,
+        )
+        self._begin_task(
+            worker,
+            f"执行合并删除：{plan['code']}；正在重新核查后永久删除，日志保存在 {self.merge_log_file}",
+        )
+
+    def closeEvent(self, event: QtGui.QCloseEvent):
+        if not self.close_save_requested:
+            self.close_save_requested = True
+            self._save_settings()
+            self.writer.stop_event.set()
+        self.closing_requested = True
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.stop()
+            self._set_status("退出中：等待后台任务安全结束，不会强制结束删除线程")
+            self._update_buttons()
+            event.ignore()
+            return
+        if self.folder_worker is not None and self.folder_worker.isRunning():
+            self.folder_worker.stop()
+            self._set_status("退出中：等待文件管理器打开任务结束")
+            event.ignore()
+            return
+        if self.writer.is_alive():
+            event.ignore()
+            self._set_status(f"退出中：正在写入 {self.settings_file}")
+            QtCore.QTimer.singleShot(150, self.close)
+            return
+        # 所有 Event 的语义均为 set 请求停止；退出时清理状态。
+        self.writer.stop_event.clear()
         event.accept()
 
 
+class MergeDeleteWorker(QtCore.QThread):
+    """两阶段安全合并删除：后台预检 -> GUI确认 -> 后台二次预检与执行。"""
+
+    progress = QtCore.Signal(int, int, str)
+    result = QtCore.Signal(object)
+
+    def __init__(
+        self, phase: str, entry: MediaEntry, records: list[MediaEntry],
+        roots: list[str], from_prefix: str, to_prefix: str,
+        operation_id: str, confirmed_plan: dict | None = None,
+    ):
+        super().__init__()
+        self.phase = phase
+        self.entry = entry
+        self.records = list(records)
+        self.roots = list(roots)
+        self.from_prefix = from_prefix
+        self.to_prefix = to_prefix
+        self.operation_id = operation_id
+        self.confirmed_plan = dict(confirmed_plan) if confirmed_plan else None
+        self.outcome = None
+        self.stop_event = threading.Event()  # set() 表示请求停止
+
+    def stop(self):
+        self.stop_event.set()
+
+    def run(self):
+        result = {
+            "phase": self.phase, "success": False, "error": "",
+            "plan": dict(self.confirmed_plan) if self.confirmed_plan else None,
+            "completed": [],
+        }
+        try:
+            if self.phase == "precheck":
+                append_merge_delete_log(
+                    self.operation_id, "PRECHECK_START",
+                    media_type=self.entry.media_type,
+                    code=self.entry.code,
+                    scrape_or_video=self.entry.media_path,
+                    source_video=self.entry.target,
+                )
+                self.progress.emit(
+                    0, 1,
+                    "仅检查刮削文件夹里有无其它视频/STRM，不遍历源视频目录"
+                    if self.entry.media_type == "STRM"
+                    else "检查普通视频所在文件夹里有无其它视频/STRM",
+                )
+                plan = build_merge_delete_plan(
+                    self.entry, self.records, self.roots,
+                    self.from_prefix, self.to_prefix,
+                    self.stop_event, operation_id=self.operation_id,
+                )
+                append_merge_delete_log(
+                    self.operation_id, "PRECHECK_PASSED", plan=plan,
+                )
+                result["success"] = True
+                result["plan"] = plan
+                self.progress.emit(1, 1, "预检通过，等待人工确认")
+            elif self.phase == "execute":
+                if self.confirmed_plan is None:
+                    raise MergeDeleteBlocked("不存在有效的合并删除预检方案")
+                self.progress.emit(0, 2, "重新检查目标文件夹，尚未删除")
+                completed = execute_merge_delete(
+                    self.confirmed_plan, self.entry, self.records,
+                    self.roots, self.from_prefix, self.to_prefix,
+                    self.stop_event,
+                )
+                result["completed"] = completed
+                result["success"] = True
+                self.progress.emit(2, 2, "合并删除完成")
+            else:
+                raise ValueError("无效的合并删除阶段")
+        except (Interrupted, MergeDeleteBlocked, OSError, ValueError) as error:
+            result["error"] = str(error) or "用户停止或取消操作"
+            stage = "PRECHECK_BLOCKED" if self.phase == "precheck" else "EXECUTE_ABORTED"
+            try:
+                append_merge_delete_log(
+                    self.operation_id, stage,
+                    reason=str(error),
+                    media_type=self.entry.media_type,
+                    media_path=self.entry.media_path,
+                    source_video=self.entry.target,
+                )
+            except OSError as log_error:
+                result["error"] += f"；审计日志无法写入：{log_error}"
+        self.outcome = result
+        self.result.emit(result)
+
+
 if __name__ == "__main__":
-    freeze_support()
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-
-    initial_directory = None
-    if len(sys.argv) > 1:
-        initial_directory = sys.argv[1]
-
-    # Enable High DPI support
-    if hasattr(QtCore.Qt, "AA_EnableHighDpiScaling"):
-        QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
-    if hasattr(QtCore.Qt, "AA_UseHighDpiPixmaps"):
-        QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
-
+    if sys.platform != "win32":
+        raise SystemExit("本程序专为 Windows 编写。")
+    if sys.version_info < (3, 10):
+        raise SystemExit("需要 Python 3.10 或更新版本。")
+    import ctypes
+    try:
+        set_app_id = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+        set_app_id.argtypes = [ctypes.c_wchar_p]
+        set_app_id.restype = ctypes.c_long
+        set_app_id("CGDedupe.Desktop")
+    except (OSError, AttributeError):
+        pass
     app = QtWidgets.QApplication(sys.argv)
-    app.setStyle("Fusion")
-    window = NfoDuplicateFinder(initial_directory=initial_directory)
-
-    # 窗口居中显示
-    screen = app.primaryScreen().geometry()
-    window_geometry = window.geometry()
-    x = (screen.width() - window_geometry.width()) // 2
-    y = (screen.height() - window_geometry.height()) // 2
-    window.move(x, y)
-
+    # Windows 使用 Qt 当前平台的原生 Style，避免强制 Fusion 的图标绘制路径。
+    start_directory = sys.argv[1] if len(sys.argv) > 1 else None
+    try:
+        window = NfoDuplicateFinder(initial_directory=start_directory)
+    except OSError as error:
+        QtWidgets.QMessageBox.critical(
+            None, "程序数据目录不可写",
+            str(error)
+        )
+        raise SystemExit(1)
+    running_file = (
+        Path(sys.executable).resolve()
+        if getattr(sys, "frozen", False)
+        else Path(__file__).resolve()
+    )
+    if sys.stdout is not None:
+        print(f"[CGDedupe v{APP_VERSION}] Running: {running_file}", flush=True)
+        print(f"[CGDedupe] Data directory: {window.data_dir}", flush=True)
     window.show()
     sys.exit(app.exec())

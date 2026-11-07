@@ -14,6 +14,7 @@ from PySide6.QtGui import QIcon
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from dataclasses import dataclass
+from nfo_version import get_app_version
 from nfo_utils import (
     normalize_catalog_number,
     parse_xml_file,
@@ -28,7 +29,7 @@ class Config:
     DEFAULT_FOLDER_FORMAT = "filename smart_actor"
     SUPPORTED_NFO_EXTENSIONS = ['.nfo']
     INVALID_FILENAME_CHARS = r'[\\/:*?"<>|]'
-    APP_VERSION = "v9.8.1"
+    APP_VERSION = get_app_version("rename", prefixed=True)
     WINDOW_MIN_SIZE = (900, 900)
     # 日志配置
     LOG_FOLDER = "log"

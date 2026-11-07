@@ -22,6 +22,7 @@ import copy
 import errno
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -33,12 +34,9 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
-import requests
-try:
-    import winshell
-except (ImportError, OSError):
-    winshell = None
-from bs4 import BeautifulSoup
+# Heavy optional features are imported when used, not during the main-window launch:
+# requests/BeautifulSoup for web searches and winshell for the recycle bin.
+# PyInstaller hidden-imports in build.yml preserve these modules in the frozen EXE.
 
 # ============================================================
 #  PySide6 imports
@@ -113,9 +111,10 @@ class NFOCache:
         return self.cache.get(path)
 
     def set(self, path, data):
-        self.cache[path] = data
-        if path not in self.file_paths:
+        # 用哈希表检查是否为新文件；避免对 file_paths 做 O(n) 线性查找。
+        if path not in self.cache:
             self.file_paths.append(path)
+        self.cache[path] = data
 
     def remove(self, path):
         if path in self.cache:
@@ -268,6 +267,41 @@ class NFODiskIndex:
         )
 
 
+    _SQL_BATCH_SIZE = 400  # 兼容 SQLite 较低的 SQL 参数上限
+
+    def get_cached_many(self, conn, root_path, paths):
+        """批量读取索引。返回 path -> (mtime_ns, size, data_json)。
+
+        使用固定长度的 IN 参数，避免每条 NFO 各执行一次 SELECT，
+        同时不把全部媒体库索引一次性载入内存。
+        """
+        cached = {}
+        for start in range(0, len(paths), self._SQL_BATCH_SIZE):
+            chunk = paths[start:start + self._SQL_BATCH_SIZE]
+            placeholders = ",".join("?" for _ in chunk)
+            cursor = conn.execute(
+                "SELECT nfo_path, mtime_ns, size, data_json "
+                "FROM nfo_index WHERE root_path = ? "
+                f"AND nfo_path IN ({placeholders})",
+                (root_path, *chunk),
+            )
+            for path, mtime_ns, size, data_json in cursor:
+                cached[path] = (mtime_ns, size, data_json)
+        return cached
+
+    def mark_seen_many(self, conn, root_path, paths, scan_id):
+        """只修改已命中缓存的扫描标记，不重写大型 JSON 元数据。"""
+        for start in range(0, len(paths), self._SQL_BATCH_SIZE):
+            chunk = paths[start:start + self._SQL_BATCH_SIZE]
+            placeholders = ",".join("?" for _ in chunk)
+            conn.execute(
+                "UPDATE nfo_index SET last_seen_scan = ? "
+                "WHERE root_path = ? "
+                f"AND nfo_path IN ({placeholders})",
+                (scan_id, root_path, *chunk),
+            )
+
+
 class LoadFilesThread(QThread):
     """异步加载 NFO 文件的线程。使用 SQLite 索引做增量解析,并批量回传 UI 数据。"""
 
@@ -281,12 +315,40 @@ class LoadFilesThread(QThread):
         self.folder_path = os.path.normpath(folder_path)
         self.batch_size = batch_size
         self.disk_index = NFODiskIndex()
-        # 工程规范: 停止用 threading.Event, 不用裸布尔标志
+        # Event.set() 表示请求停止；未设置表示允许扫描。
+        # 每轮扫描创建新线程/新 Event，不复用停止状态。
         self._stop_event = threading.Event()
 
     @property
     def is_stopped(self):
         return self._stop_event.is_set()
+
+    @staticmethod
+    def _read_cached_data(cached_row, nfo_path):
+        """校验并解码缓存；无效 JSON 按缓存未命中处理。"""
+        if cached_row is None:
+            return None
+        try:
+            data = json.loads(cached_row[2])
+        except (json.JSONDecodeError, TypeError, UnicodeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        data["path"] = nfo_path
+        return data
+
+    def _make_tree_row(self, nfo_path, data):
+        """维持既有的三级树展示格式。"""
+        relative_path = os.path.relpath(nfo_path, self.folder_path)
+        parts = relative_path.split(os.sep)
+        if len(parts) > 1:
+            first_level = os.sep.join(parts[:-2]) if len(parts) > 2 else ""
+            second_level = parts[-2]
+            nfo_name = parts[-1]
+        else:
+            first_level = second_level = ""
+            nfo_name = parts[-1]
+        return (nfo_path, first_level, second_level, nfo_name, data)
 
     def run(self):
         conn = None
@@ -294,14 +356,21 @@ class LoadFilesThread(QThread):
             scan_id = time.time_ns()
             conn = self.disk_index.connect()
 
+            # 保持原有的确定性排序及 os.walk 默认不跟随目录软链接的行为。
             nfo_files = []
             for root, dirs, files in os.walk(self.folder_path):
                 if self._stop_event.is_set():
                     return
                 dirs.sort(key=str.lower)
-                for file in sorted(files, key=str.lower):
-                    if file.lower().endswith(".nfo"):
-                        nfo_files.append(os.path.join(root, file))
+                names = sorted(
+                    (name for name in files if name.lower().endswith(".nfo")),
+                    key=str.lower,
+                )
+                for name in names:
+                    nfo_files.append(os.path.join(root, name))
+
+            if self._stop_event.is_set():
+                return
 
             total = len(nfo_files)
             if total == 0:
@@ -311,103 +380,85 @@ class LoadFilesThread(QThread):
                 return
 
             parsed_count = 0
-            batch = []
-            index_rows = []
 
-            for i, nfo_path in enumerate(nfo_files, 1):
+            # 按批执行 SELECT、stat/XML 解析、索引更新和 UI 信号回传。
+            # 既避免 N 次 SQL SELECT，也不会缓存全部 JSON 到内存中。
+            for start in range(0, total, self.batch_size):
                 if self._stop_event.is_set():
                     return
 
-                try:
-                    stat_result = os.stat(nfo_path)
-                    cache_data = self.disk_index.get_if_fresh(
-                        conn, self.folder_path, nfo_path, stat_result
-                    )
-                    if cache_data is None:
-                        cache_data = self._parse_nfo(nfo_path)
-                        parsed_count += 1
+                paths = nfo_files[start:start + self.batch_size]
+                cached_rows = self.disk_index.get_cached_many(
+                    conn, self.folder_path, paths
+                )
+                batch = []
+                changed_rows = []
+                cached_paths = []
 
-                    relative_path = os.path.relpath(nfo_path, self.folder_path)
-                    parts = relative_path.split(os.sep)
+                for offset, nfo_path in enumerate(paths, start + 1):
+                    if self._stop_event.is_set():
+                        return
 
-                    if len(parts) > 1:
-                        first_level = os.sep.join(parts[:-2]) if len(parts) > 2 else ""
-                        second_level = parts[-2]
-                        nfo_file = parts[-1]
-                    else:
-                        first_level = ""
-                        second_level = ""
-                        nfo_file = parts[-1]
-
-                    batch.append((nfo_path, first_level, second_level, nfo_file, cache_data))
-                    index_rows.append((
-                        nfo_path,
-                        stat_result.st_mtime_ns,
-                        stat_result.st_size,
-                        cache_data,
-                    ))
-
-                    if len(batch) >= self.batch_size:
-                        self.disk_index.upsert_many(conn, self.folder_path, index_rows, scan_id)
-                        conn.commit()
-                        self.batch_ready.emit(batch)
-                        batch = []
-                        index_rows = []
-
-                    if i % 200 == 0 or i == total:
-                        self.progress.emit(i, total, os.path.basename(nfo_path))
-
-                except (ET.ParseError, OSError) as e:
-                    # 原子替换或外部写入期间可能短暂无法解析。优先展示旧索引，
-                    # 避免项目从树中闪退消失；下一次精确事件会重新解析。
-                    stale_data = None
+                    cached_row = cached_rows.get(nfo_path)
                     try:
-                        stale_data = self.disk_index.get_stale(
-                            conn, self.folder_path, nfo_path
-                        )
-                        self.disk_index.mark_seen(
-                            conn, self.folder_path, nfo_path, scan_id
-                        )
-                    except sqlite3.Error:
-                        pass
-                    if stale_data is not None:
-                        relative_path = os.path.relpath(nfo_path, self.folder_path)
-                        parts = relative_path.split(os.sep)
-                        if len(parts) > 1:
-                            first_level = os.sep.join(parts[:-2]) if len(parts) > 2 else ""
-                            second_level = parts[-2]
-                            nfo_file = parts[-1]
+                        stat_result = os.stat(nfo_path)
+                        data = None
+                        if (
+                            cached_row is not None
+                            and cached_row[0] == stat_result.st_mtime_ns
+                            and cached_row[1] == stat_result.st_size
+                        ):
+                            data = self._read_cached_data(cached_row, nfo_path)
+
+                        if data is not None:
+                            cached_paths.append(nfo_path)
                         else:
-                            first_level = second_level = ""
-                            nfo_file = parts[-1]
-                        batch.append((
-                            nfo_path, first_level, second_level, nfo_file, stale_data
-                        ))
-                    if len(batch) >= self.batch_size:
-                        if index_rows:
-                            self.disk_index.upsert_many(
-                                conn, self.folder_path, index_rows, scan_id
-                            )
-                        conn.commit()
-                        self.batch_ready.emit(batch)
-                        batch = []
-                        index_rows = []
-                    if i % 200 == 0 or i == total:
-                        self.progress.emit(i, total, os.path.basename(nfo_path))
-                    print(f"解析文件失败，已尝试使用旧索引 {nfo_path}: {e}")
-                    continue
+                            data = self._parse_nfo(nfo_path)
+                            parsed_count += 1
+                            changed_rows.append((
+                                nfo_path,
+                                stat_result.st_mtime_ns,
+                                stat_result.st_size,
+                                data,
+                            ))
+                        batch.append(self._make_tree_row(nfo_path, data))
 
-            if batch:
-                self.disk_index.upsert_many(conn, self.folder_path, index_rows, scan_id)
+                    except (ET.ParseError, OSError, UnicodeError) as exc:
+                        # 文件在扫描过程中被外部改写时，继续沿用旧索引。
+                        stale_data = self._read_cached_data(cached_row, nfo_path)
+                        if stale_data is not None:
+                            stale_data["stale"] = True
+                            batch.append(self._make_tree_row(nfo_path, stale_data))
+                        if cached_row is not None:
+                            cached_paths.append(nfo_path)
+                        print(f"解析文件失败，已尝试使用旧索引 {nfo_path}: {exc}")
+
+                    if offset % 200 == 0 or offset == total:
+                        self.progress.emit(offset, total, os.path.basename(nfo_path))
+
+                if self._stop_event.is_set():
+                    return
+
+                if changed_rows:
+                    self.disk_index.upsert_many(
+                        conn, self.folder_path, changed_rows, scan_id
+                    )
+                if cached_paths:
+                    self.disk_index.mark_seen_many(
+                        conn, self.folder_path, cached_paths, scan_id
+                    )
                 conn.commit()
-                self.batch_ready.emit(batch)
 
+                if batch:
+                    self.batch_ready.emit(batch)
+
+            # 只有完整扫描完成才清除不再存在的条目；用户中途取消不删索引。
             self.disk_index.delete_not_seen(conn, self.folder_path, scan_id)
             conn.commit()
             self.finished_signal.emit(total, parsed_count)
 
-        except (OSError, sqlite3.Error) as e:
-            self.error.emit(f"加载过程出错: {str(e)}")
+        except (OSError, sqlite3.Error) as exc:
+            self.error.emit(f"加载过程出错: {exc}")
         finally:
             if conn is not None:
                 conn.close()
@@ -1526,6 +1577,10 @@ class SearchEngine:
         }
 
     def search_javdb(self, num_text):
+        # 此方法从搜索工作线程调用；按需导入，避免增加主界面冷启动时间。
+        import requests
+        from bs4 import BeautifulSoup
+
         try:
             search_url = f"https://javdb.com/search?q={num_text}&f=all"
             response = requests.get(search_url, headers=self.headers, timeout=10)
@@ -1613,6 +1668,9 @@ class NFOEditorQt6(NFOEditorQt):
         self.nfo_cache = NFOCache()
         self.load_thread = None
         self._show_progress = True
+        self._pending_load_request = None
+        self._load_auto_select = True
+        self._load_selection_path = None
 
         # QApplication 已由入口创建；此处再延迟导入 Fluent 控件，避免过早构造 QPixmap。
         from qfluentwidgets import ProgressBar as FluentProgressBar
@@ -1693,8 +1751,8 @@ class NFOEditorQt6(NFOEditorQt):
         self.file_watcher.fileChanged.connect(self.on_file_changed)
         self.file_watcher.directoryChanged.connect(self.on_directory_changed)
 
-        # 排序
-        self.sorting_group.buttonClicked.connect(self.sort_files)
+        # 排序下拉框切换时，立即重排当前可见列表。
+        self.sort_combo.currentIndexChanged.connect(self.sort_files)
 
         # 图片裁剪
         # bug 修复: poster 关键字传 "poster",thumb 传 "fanart"(原文件查 fanart.jpg)
@@ -1872,6 +1930,7 @@ class NFOEditorQt6(NFOEditorQt):
         for name in (
             "btn_open_folder", "btn_select_target", "btn_refresh",
             "btn_move", "btn_filter", "btn_photo_wall", "btn_unify_actor",
+            "sort_combo", "field_combo", "condition_combo",
         ):
             btn = getattr(self, name, None)
             if btn is not None:
@@ -1891,6 +1950,11 @@ class NFOEditorQt6(NFOEditorQt):
             "btn_batch_fill",
             "btn_batch_add",
             "btn_unify_actor",
+            "btn_filter",
+            "sort_combo",
+            "field_combo",
+            "condition_combo",
+            "filter_entry",
         ):
             btn = getattr(self, name, None)
             if btn is not None:
@@ -1911,25 +1975,26 @@ class NFOEditorQt6(NFOEditorQt):
             )
             return
 
-        # 防重复启动: 若已有加载线程在跑, 先停掉再重开(下方已 stop+wait),
-        # 此处仅做按钮态的兜底, 避免 UI 与线程状态不一致。
+        # 扫描线程使用 Event 停止，新请求由 finished 槽在主线程中排队启动。
         current_selection_path = None
         if not auto_select:
             selected = self.file_tree.selectedItems()
             if selected and self.current_file_path:
                 current_selection_path = self.current_file_path
 
-        # 停止旧线程并断开所有信号
-        if self.load_thread is not None and self.load_thread.isRunning():
-            self.load_thread.stop()
-            try:
-                self.load_thread.batch_ready.disconnect()
-                self.load_thread.progress.disconnect()
-                self.load_thread.finished_signal.disconnect()
-                self.load_thread.error.disconnect()
-            except RuntimeError:
-                pass
-            self.load_thread.wait()
+        # Stop asynchronously. Never wait for disk I/O on the GUI thread.
+        # A pending reload runs after QThread.finished, when disposal is safe.
+        if self.load_thread is not None:
+            old_thread = self.load_thread
+            if old_thread.isRunning():
+                old_thread.stop()
+                # 最新请求覆盖旧请求；主线程 Slot 收到真正的 finished 后再重启。
+                self._pending_load_request = (auto_select, show_progress)
+                self.status_bar.showMessage("正在停止上一次加载，随后重新加载...")
+                return
+            # The worker has exited but its queued finished slot may not yet run.
+            self.load_thread = None
+            old_thread.deleteLater()
 
         self._clear_current_editor_state()
         self.file_tree.clear()
@@ -1945,19 +2010,24 @@ class NFOEditorQt6(NFOEditorQt):
             self.progress_bar.show()
             self.status_bar.showMessage("正在加载文件...")
 
-        self.load_thread = LoadFilesThread(self.folder_path, batch_size=300)
+        self._pending_load_request = None
+        self._load_auto_select = auto_select
+        self._load_selection_path = current_selection_path
+        self.load_thread = LoadFilesThread(self.folder_path, batch_size=400)
         self.load_thread.progress.connect(self._on_load_progress)
         self.load_thread.batch_ready.connect(self._on_batch_ready)
-        self.load_thread.finished_signal.connect(
-            lambda count, parsed: self._on_load_finished(
-                count, auto_select, current_selection_path, parsed
-            )
-        )
+        self.load_thread.finished_signal.connect(self._on_load_result)
         self.load_thread.error.connect(self._on_load_error)
+        self.load_thread.finished.connect(self._on_load_thread_finished)
         self._set_loading_busy(True)
+        self._scan_started_at = time.perf_counter()
         self.load_thread.start()
 
+    @pyqtSlot(int, int, str)
     def _on_load_progress(self, current, total, filename):
+        sender = self.sender()
+        if (sender is not None and sender is not self.load_thread) or self._pending_load_request:
+            return
         if not self._show_progress:
             return
         self.progress_bar.setMaximum(total)
@@ -1965,7 +2035,11 @@ class NFOEditorQt6(NFOEditorQt):
         if current % 100 == 0 or current == total:
             self.status_bar.showMessage(f"正在加载: {current}/{total} - {filename}")
 
+    @pyqtSlot(list)
     def _on_batch_ready(self, batch):
+        sender = self.sender()
+        if (sender is not None and sender is not self.load_thread) or self._pending_load_request:
+            return
         items = []
         paths = []
         for nfo_path, first, second, nfo_name, cache_data in batch:
@@ -1979,6 +2053,15 @@ class NFOEditorQt6(NFOEditorQt):
             self.file_tree.addTopLevelItems(items)
             for nfo_path, item in zip(paths, items):
                 self._tree_item_index[self._event_path_key(nfo_path)] = item
+
+    @pyqtSlot(int, int)
+    def _on_load_result(self, count, parsed_count):
+        sender = self.sender()
+        if (sender is not None and sender is not self.load_thread) or self._pending_load_request:
+            return
+        self._on_load_finished(
+            count, self._load_auto_select, self._load_selection_path, parsed_count
+        )
 
     def _on_load_finished(self, count, auto_select, selection_path, parsed_count=0):
         if self._show_progress:
@@ -1995,11 +2078,19 @@ class NFOEditorQt6(NFOEditorQt):
         )
         failure_text = f"，失败 {failed_count} 个" if failed_count else ""
         stale_text = f"，临时使用旧索引 {stale_count} 个" if stale_count else ""
+        elapsed = max(0.0, time.perf_counter() - getattr(
+            self, "_scan_started_at", time.perf_counter()
+        ))
         self.status_bar.showMessage(
             f"加载完成: 成功 {loaded_count}/{count} 个NFO ({total_folders} 个文件夹)，"
-            f"本次解析 {parsed_count} 个，缓存命中 {cache_hits} 个{stale_text}{failure_text} - "
+            f"本次解析 {parsed_count} 个，缓存命中 {cache_hits} 个"
+            f"{stale_text}{failure_text}，耗时 {elapsed:.2f} 秒 - "
             f"目录: {self.folder_path}"
         )
+
+        # 业务数据批次已全部发送；允许按选中的排序重新排列，再自动选首项。
+        if self.sort_combo.currentIndex() != 0:
+            self.sort_files(show_status=False, allow_loading=True)
 
         if auto_select and self.file_tree.topLevelItemCount() > 0:
             first_item = self.file_tree.topLevelItem(0)
@@ -2012,13 +2103,29 @@ class NFOEditorQt6(NFOEditorQt):
             self._pending_select_folder = None
             self.select_folder_in_tree(pending)
 
-        if self.load_thread:
-            self.load_thread.deleteLater()
-            self.load_thread = None
+        # 这里只处理业务结果；按钮恢复和事件追踪必须等真正的 QThread.finished。
+        # Dispose the QThread only in _on_load_thread_finished().
 
-        self._set_loading_busy(False)
-        if self._pending_library_events or self._full_reconcile_required:
-            QTimer.singleShot(0, self._process_pending_library_events)
+    @pyqtSlot()
+    def _on_load_thread_finished(self):
+        """Release the worker only after the underlying QThread has exited."""
+        thread = self.sender()
+        if thread is None:
+            return
+        if self.load_thread is thread:
+            self.load_thread = None
+            pending = self._pending_load_request
+            self._pending_load_request = None
+            if pending is not None:
+                # QTimer 在主线程事件循环中启动下一轮，绝不阻塞 GUI 等待磁盘。
+                QTimer.singleShot(
+                    0, lambda options=pending: self.load_files_in_folder(*options)
+                )
+            else:
+                self._set_loading_busy(False)
+                if self._refresh_pending or self._pending_library_events or self._full_reconcile_required:
+                    QTimer.singleShot(0, self._process_pending_library_events)
+        thread.deleteLater()
 
     def _restore_selection(self, target_path):
         for i in range(self.file_tree.topLevelItemCount()):
@@ -2036,11 +2143,15 @@ class NFOEditorQt6(NFOEditorQt):
                     return
         self.file_tree.clearSelection()
 
+    @pyqtSlot(str)
     def _on_load_error(self, error_msg):
+        sender = self.sender()
+        if (sender is not None and sender is not self.load_thread) or self._pending_load_request:
+            return
         if self._show_progress:
             self.progress_bar.hide()
         self.status_bar.showMessage(f"加载失败: {error_msg}")
-        self._set_loading_busy(False)
+        # 真正的线程退出时才恢复控件，避免用户在异常收尾阶段重入。
         QMessageBox.critical(self, "错误", error_msg)
 
     # ================================================================
@@ -2255,7 +2366,12 @@ class NFOEditorQt6(NFOEditorQt):
         key = self._event_path_key(nfo_path)
         item = self._tree_item_index.get(key)
         if item is not None:
-            return item
+            try:
+                if item.treeWidget() is self.file_tree:
+                    return item
+            except RuntimeError:
+                pass  # The C++ QTreeWidgetItem was already destroyed.
+            self._tree_item_index.pop(key, None)
         for index in range(self.file_tree.topLevelItemCount()):
             item = self.file_tree.topLevelItem(index)
             item_path = self._nfo_path_from_item(item)
@@ -3404,8 +3520,10 @@ class NFOEditorQt6(NFOEditorQt):
         self.target_load_thread.batch_ready.connect(self._on_target_batch_ready)
         self.target_load_thread.finished_signal.connect(self._on_target_load_finished)
         self.target_load_thread.error.connect(self._on_target_load_error)
+        self.target_load_thread.finished.connect(self._on_target_thread_finished)
         self.target_load_thread.start()
 
+    @pyqtSlot(str, list)
     def _on_target_batch_ready(self, target_path, folder_names):
         sender_thread = self.sender()
         if (
@@ -3429,6 +3547,7 @@ class NFOEditorQt6(NFOEditorQt):
             self.sorted_tree.addTopLevelItems(items)
             self.sorted_tree.setUpdatesEnabled(True)
 
+    @pyqtSlot(str, int)
     def _on_target_load_finished(self, target_path, folder_count):
         sender_thread = self.sender()
         if (
@@ -3440,11 +3559,9 @@ class NFOEditorQt6(NFOEditorQt):
             return
         self.sorted_tree.setEnabled(self._target_tree_should_be_enabled())
         self.status_bar.showMessage(f"目标目录: {target_path} (共{folder_count}个文件夹)")
-        thread = self.target_load_thread
-        self.target_load_thread = None
-        if thread is not None:
-            thread.deleteLater()
+        # Dispose only after QThread.finished, not result notification.
 
+    @pyqtSlot(str, str)
     def _on_target_load_error(self, target_path, error_msg):
         sender_thread = self.sender()
         if (
@@ -3455,11 +3572,20 @@ class NFOEditorQt6(NFOEditorQt):
         if not same_path(target_path, self.current_target_path):
             return
         self.sorted_tree.setEnabled(self._target_tree_should_be_enabled())
-        thread = self.target_load_thread
-        self.target_load_thread = None
-        if thread is not None:
-            thread.deleteLater()
+        # Dispose only after QThread.finished, not error notification.
         QMessageBox.critical(self, "错误", error_msg)
+
+    @pyqtSlot()
+    def _on_target_thread_finished(self):
+        """Clean only the target-directory worker that actually finished."""
+        thread = self.sender()
+        if thread is None:
+            return
+        if self.target_load_thread is thread:
+            self.target_load_thread = None
+            self.sorted_tree.setEnabled(self._target_tree_should_be_enabled())
+        self._retired_target_load_threads.discard(thread)
+        thread.deleteLater()
 
     # ================================================================
     #  未保存检测
@@ -3566,132 +3692,254 @@ class NFOEditorQt6(NFOEditorQt):
         return [first, second, nfo_name]
 
     def rebuild_tree_from_paths(self, paths):
-        self._last_selected_item = None
-        self.file_tree.clear()
-        self._tree_item_index.clear()
-        pairs = []
-        for nfo_path in paths:
-            if os.path.exists(nfo_path):
-                pairs.append((nfo_path, QTreeWidgetItem(self._path_to_tree_values(nfo_path))))
-        if pairs:
-            self.file_tree.addTopLevelItems([item for _, item in pairs])
-            for nfo_path, item in pairs:
-                self._tree_item_index[self._event_path_key(nfo_path)] = item
+        """完整重建显示行和索引，并尽量保留可见条目的多选状态。
+
+        QTreeWidget.clear() 会销毁底层 C++ 节点，禁止保留旧节点引用。
+        禁止在重建中间阶段发出选中变化信号。
+        """
+        selected_keys = set()
+        for old_item in self.file_tree.selectedItems():
+            old_path = self._nfo_path_from_item(old_item)
+            if old_path:
+                selected_keys.add(self._event_path_key(old_path))
+
+        old_current = self.file_tree.currentItem()
+        current_path = self._nfo_path_from_item(old_current) if old_current else None
+
+        blocker = QSignalBlocker(self.file_tree)
+        previous_updates = self.file_tree.updatesEnabled()
+        self.file_tree.setUpdatesEnabled(False)
+        try:
+            self._last_selected_item = None
+            self._tree_item_index.clear()
+            self.file_tree.clear()
+
+            pairs = []
+            for nfo_path in paths:
+                if os.path.isfile(nfo_path):
+                    pairs.append(
+                        (nfo_path, QTreeWidgetItem(self._path_to_tree_values(nfo_path)))
+                    )
+
+            if pairs:
+                self.file_tree.addTopLevelItems([item for _, item in pairs])
+                for nfo_path, item in pairs:
+                    self._tree_item_index[self._event_path_key(nfo_path)] = item
+
+                if current_path:
+                    restored = self._tree_item_index.get(
+                        self._event_path_key(current_path)
+                    )
+                    if restored is not None:
+                        self.file_tree.setCurrentItem(restored)
+                        self._last_selected_item = restored
+
+                for key in selected_keys:
+                    selected_item = self._tree_item_index.get(key)
+                    if selected_item is not None:
+                        selected_item.setSelected(True)
+                        if self._last_selected_item is None:
+                            self._last_selected_item = selected_item
+        finally:
+            self.file_tree.setUpdatesEnabled(previous_updates)
+            del blocker
 
     # ================================================================
     #  排序 & 筛选
     # ================================================================
 
-    def sort_files(self):
-        if not self.sorting_group.checkedButton():
-            return
-        if self.nfo_cache.size() == 0:
-            return
-
-        sort_by = self.sorting_group.checkedButton().text()
-        items_with_data = []
-        for i in range(self.file_tree.topLevelItemCount()):
-            item = self.file_tree.topLevelItem(i)
-            values = [item.text(j) for j in range(3)]
-            if values[2]:
-                nfo_path = (
-                    os.path.join(self.folder_path, values[0], values[1], values[2])
-                    if values[1]
-                    else os.path.join(self.folder_path, values[0], values[2])
-                )
-                cache_data = self.nfo_cache.get(nfo_path)
-                if cache_data:
-                    items_with_data.append((values, item, cache_data))
-
-        series_counts = {}
-        if "系列" in sort_by:
-            for _, _, cd in items_with_data:
-                s = cd.get('series', '') or ''
-                series_counts[s] = series_counts.get(s, 0) + 1
-
-        def get_sort_key(t):
-            values, _, cd = t
-            if "演员" in sort_by:
-                return (", ".join(sorted(cd.get('actors', []) or [])),)
-            elif "系列" in sort_by:
-                series = cd.get('series', '') or ''
-                return (1 if not series else 0, -series_counts.get(series, 0), series)
-            elif "评分" in sort_by:
-                try:
-                    r = cd.get('rating', 0.0)
-                    return (-float(r) if r else 0.0,)
-                except (ValueError, TypeError):
-                    return (0.0,)
+    @staticmethod
+    def _natural_catalog_key(value):
+        """按番号自然排序：ABC-2 在 ABC-10 前，超长数字也不需转 int。"""
+        text = str(value or "").casefold().strip()
+        tokens = []
+        for part in re.split(r"([0-9]+)", text):
+            if not part:
+                continue
+            if part.isascii() and part.isdigit():
+                significant = part.lstrip("0") or "0"
+                tokens.append((0, len(significant), significant, len(part)))
             else:
-                return (cd.get('release', '') or '0000-00-00',)
+                tokens.append((1, part))
+        return tuple(tokens)
+
+    def sort_files(self, _index=None, *, show_status=True, allow_loading=False):
+        """重排当前可见文件，不改变原始缓存或筛选结果。"""
+        if not self.folder_path or self._active_operations:
+            return
+        if (
+            not allow_loading
+            and self.load_thread is not None
+            and self.load_thread.isRunning()
+        ):
+            return
+        if self.file_tree.topLevelItemCount() == 0:
+            return
+
+        sort_by = self.sort_combo.currentText()
+        items_with_data = []
+        for index in range(self.file_tree.topLevelItemCount()):
+            item = self.file_tree.topLevelItem(index)
+            nfo_path = self._nfo_path_from_item(item)
+            if nfo_path:
+                items_with_data.append(
+                    (nfo_path, self.nfo_cache.get(nfo_path) or {})
+                )
+
+        if not items_with_data:
+            return
 
         try:
-            reverse = "日期" in sort_by
-            items_with_data.sort(key=get_sort_key, reverse=reverse)
-        except (TypeError, ValueError) as e:
-            print(f"排序出错: {str(e)}")
-            QMessageBox.warning(self, "警告", f"排序失败: {str(e)}")
+            if sort_by.startswith("默认"):
+                # 默认顺序来自原扫描结果，不会在切换排序时丢弃筛选。
+                visible = {
+                    self._event_path_key(path): path for path, _ in items_with_data
+                }
+                ordered_paths = []
+                for path in self.nfo_files:
+                    known = visible.pop(self._event_path_key(path), None)
+                    if known is not None:
+                        ordered_paths.append(known)
+                ordered_paths.extend(visible.values())
+            else:
+                series_counts = {}
+                if sort_by.startswith("系列"):
+                    for _, data in items_with_data:
+                        series = str(data.get("series") or "").casefold()
+                        series_counts[series] = series_counts.get(series, 0) + 1
+
+                def get_sort_key(entry):
+                    path, data = entry
+                    if sort_by.startswith("演员"):
+                        actors = data.get("actors") or []
+                        return (", ".join(sorted(
+                            str(actor).casefold() for actor in actors
+                        )),)
+                    if sort_by.startswith("系列"):
+                        series = str(data.get("series") or "").casefold()
+                        return (
+                            1 if not series else 0,
+                            -series_counts.get(series, 0),
+                            series,
+                        )
+                    if sort_by.startswith("评分"):
+                        try:
+                            rating = float(data.get("rating") or 0)
+                            if rating != rating:  # 非数字 NaN 按零分处理。
+                                rating = 0.0
+                        except (TypeError, ValueError, OverflowError):
+                            rating = 0.0
+                        return (-rating,)
+                    if sort_by.startswith("番号"):
+                        number = str(data.get("num") or "").strip()
+                        if not number:
+                            number = os.path.splitext(os.path.basename(path))[0]
+                        return (self._natural_catalog_key(number),)
+                    # 日期仍采用原逻辑：ISO 格式按从新到旧排序。
+                    return (str(data.get("release") or "0000-00-00"),)
+
+                newest_first = sort_by.startswith("日期")
+                items_with_data.sort(key=get_sort_key, reverse=newest_first)
+                ordered_paths = [path for path, _ in items_with_data]
+
+        except (TypeError, ValueError, OSError) as exc:
+            QMessageBox.warning(self, "排序错误", f"排序失败：{exc}")
             return
 
-        self._last_selected_item = None
-        self.file_tree.clear()
-        for values, _, _ in items_with_data:
-            self.file_tree.addTopLevelItem(QTreeWidgetItem(values))
-        self.status_bar.showMessage(f"已按 {sort_by} 排序", 3000)
+        self.rebuild_tree_from_paths(ordered_paths)
+        if show_status:
+            self.status_bar.showMessage(
+                f"已按 {sort_by} 排序（{len(ordered_paths)} 个 NFO）", 3000
+            )
 
     def apply_filter(self):
-        if not self.folder_path:
+        if not self.folder_path or self._active_operations:
             return
+        if self.load_thread is not None and self.load_thread.isRunning():
+            return
+
         field = self.field_combo.currentText()
         condition = self.condition_combo.currentText()
-        filter_text = self.filter_entry.text().strip()
+        raw_text = self.filter_entry.text()
+        filter_text = raw_text if condition.startswith("正则") else raw_text.strip()
 
         if not filter_text:
             self.rebuild_tree_from_paths(self.nfo_files)
-            self.status_bar.showMessage(f"已清除筛选: 共 {len(self.nfo_files)} 个NFO")
+            self.sort_files(show_status=False)
+            self.status_bar.showMessage(
+                f"已清除筛选: 共 {len(self.nfo_files)} 个 NFO"
+            )
             return
+
+        pattern = None
+        if condition in {"正则匹配", "正则不匹配"}:
+            try:
+                pattern = re.compile(filter_text, re.IGNORECASE)
+            except re.error as exc:
+                QMessageBox.warning(
+                    self, "正则表达式错误",
+                    f"表达式无效：{exc}\n请检查括号、转义字符或量词。"
+                )
+                self.filter_entry.setFocus()
+                return
+        elif field == "评分":
+            try:
+                threshold = float(filter_text)
+            except ValueError:
+                QMessageBox.warning(self, "筛选错误", "评分筛选请输入有效数字")
+                return
 
         matched = []
         for nfo_path in self.nfo_files:
-            cd = self.nfo_cache.get(nfo_path)
-            if not cd:
+            data = self.nfo_cache.get(nfo_path)
+            if not data:
                 continue
-            try:
-                value = ""
-                if field == "标题":
-                    value = cd.get('title', '')
-                elif field == "标签":
-                    value = ", ".join(cd.get('tags', []))
-                elif field == "演员":
-                    value = ", ".join(cd.get('actors', []))
-                elif field == "系列":
-                    value = cd.get('series', '')
-                elif field == "评分":
-                    r = cd.get('rating', 0.0)
-                    try:
-                        value = str(float(r) if r else 0.0)
-                    except (ValueError, TypeError):
-                        value = "0.0"
 
-                match = False
-                if field == "评分":
+            try:
+                if field == "标题":
+                    value = str(data.get("title") or "")
+                elif field == "番号":
+                    value = str(data.get("num") or "").strip()
+                    if not value:
+                        value = os.path.splitext(os.path.basename(nfo_path))[0]
+                elif field == "标签":
+                    value = ", ".join(str(v) for v in (data.get("tags") or []))
+                elif field == "演员":
+                    value = ", ".join(str(v) for v in (data.get("actors") or []))
+                elif field == "系列":
+                    value = str(data.get("series") or "")
+                elif field == "评分":
                     try:
-                        cv = float(value); fv = float(filter_text)
-                        match = (cv > fv) if condition == "大于" else (cv < fv)
-                    except ValueError:
-                        continue
+                        value = str(float(data.get("rating") or 0.0))
+                    except (TypeError, ValueError):
+                        value = "0.0"
                 else:
-                    if condition == "包含":
-                        match = filter_text.lower() in value.lower()
-                    elif condition == "不包含":
-                        match = filter_text.lower() not in value.lower()
+                    continue
+
+                if pattern is not None:
+                    found = pattern.search(value) is not None
+                    match = found if condition == "正则匹配" else not found
+                elif field == "评分":
+                    score = float(value)
+                    match = (
+                        score > threshold if condition == "大于"
+                        else score < threshold
+                    )
+                elif condition == "包含":
+                    match = filter_text.casefold() in value.casefold()
+                elif condition == "不包含":
+                    match = filter_text.casefold() not in value.casefold()
+                else:
+                    match = False
+
                 if match:
                     matched.append(nfo_path)
-            except (ValueError, TypeError) as e:
-                print(f"筛选文件 {nfo_path} 时出错: {str(e)}")
-                continue
+            except (ValueError, TypeError) as exc:
+                print(f"筛选文件 {nfo_path} 时出错: {exc}")
 
         self.rebuild_tree_from_paths(matched)
+        # 筛选后仍按排序下拉框当前值显示。
+        self.sort_files(show_status=False)
         self.status_bar.showMessage(
             f"筛选结果: 匹配 {len(matched)} / 总计 {len(self.nfo_files)}"
         )
@@ -4035,6 +4283,8 @@ class NFOEditorQt6(NFOEditorQt):
 
     def _fetch_online_trailer(self, num_text):
         def worker():
+            import requests
+
             api_url = f"https://javp.cc.cd/trailers/{num_text}"
             headers = {
                 "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -4156,6 +4406,8 @@ class NFOEditorQt6(NFOEditorQt):
 
     def _start_javdb_search(self, num_text, initial_count):
         def search():
+            import requests
+
             engine = SearchEngine()
             opened = initial_count
             try:
@@ -4216,6 +4468,8 @@ class NFOEditorQt6(NFOEditorQt):
 
             if predefined.get('javdb', False):
                 def batch_search():
+                    import requests
+
                     engine = SearchEngine()
                     for num in numbers:
                         try:
@@ -4401,10 +4655,12 @@ class NFOEditorQt6(NFOEditorQt):
         try:
             for folder in folders:
                 try:
-                    if winshell is None:
+                    try:
+                        import winshell
+                    except (ImportError, OSError) as exc:
                         raise OSError(
                             "当前系统缺少 Windows 回收站支持（winshell/pywin32）"
-                        )
+                        ) from exc
                     winshell.delete_file(folder)
                     deleted += 1
                     self._queue_library_event("folder_deleted", folder)
@@ -4721,15 +4977,43 @@ def _qt_message_handler(mode, context, message):
         for keyword in _PAINTER_NOISE_KEYWORDS:
             if keyword in message:
                 return
-    # 其余消息按 Qt 默认输出
-    print(message, file=sys.stderr)
+    # PyInstaller console=False / pythonw.exe 可能没有 sys.stderr。
+    # 在 Qt 消息回调中向 None 写入可能引起难以诊断的异常。
+    stream = getattr(sys, "stderr", None)
+    if stream is not None:
+        print(message, file=stream)
 
 
 # ================================================================
 #  入口
 # ================================================================
 
+def _set_windows_taskbar_identity():
+    """分配稳定的任务栏应用标识；必须在 QApplication / 窗口构造前完成。"""
+    if os.name != "nt":
+        return
+
+    try:
+        import ctypes
+
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        set_app_id = shell32.SetCurrentProcessExplicitAppUserModelID
+        set_app_id.argtypes = (ctypes.c_wchar_p,)
+        set_app_id.restype = ctypes.c_long  # Windows HRESULT 为 32 位有符号整数。
+        result = set_app_id("NFOEditor.Desktop")
+        if result != 0:
+            raise OSError(
+                f"设置 Windows 任务栏应用标识失败，HRESULT=0x{result & 0xFFFFFFFF:08X}"
+            )
+    except (OSError, AttributeError) as exc:
+        stream = getattr(sys, "stderr", None)
+        if stream is not None:
+            print(f"NFOEditor taskbar identity: {exc}", file=stream)
+
+
 def main():
+    _set_windows_taskbar_identity()
+
     # 安装消息过滤器(必须在 QApplication 之前)
     qInstallMessageHandler(_qt_message_handler)
 
@@ -4750,7 +5034,9 @@ def main():
         window._set_event_file_for_folder(window.folder_path)
         if args.select_folder:
             window._pending_select_folder = args.select_folder
-        window.load_files_in_folder()
+        # 命令行指定媒体库时也先显示窗口，再从 GUI 事件循环启动后台扫描。
+        # 避免目录预处理拖慢首次可见窗口的时间。
+        QTimer.singleShot(0, window.load_files_in_folder)
 
     window.show()
     sys.exit(app.exec())

@@ -35,6 +35,7 @@ from PySide6.QtGui import (
 )
 import concurrent.futures
 from enum import Enum
+from nfo_version import get_app_version
 from nfo_utils import (
     is_path_within,
     preferred_image_from_names,
@@ -377,7 +378,7 @@ class PhotoWallDialog(QDialog):
 
     def init_ui(self):
         """初始化UI"""
-        self.setWindowTitle("大锤 照片墙 v9.8.1")
+        self.setWindowTitle(f"大锤 照片墙 {get_app_version("photo_wall", prefixed=True)}")
         self.setStyleSheet(
             """
             QDialog {

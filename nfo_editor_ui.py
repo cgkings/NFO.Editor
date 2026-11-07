@@ -32,7 +32,7 @@ NFO Editor UI 层 - PySide6 + qfluentwidgets 实现
 
 输入控件:
     show_images_checkbox / field_combo / condition_combo
-    filter_entry / sorting_group
+    filter_entry / sort_combo
 
 数据控件:
     fields_entries (dict[str, QWidget])
@@ -58,10 +58,10 @@ import os
 import sys
 
 from PySide6.QtCore import Qt, QSettings, QSize
+from nfo_version import get_app_version
 from PySide6.QtGui import QCursor, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
-    QButtonGroup,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -406,7 +406,7 @@ class NFOEditorQt(QMainWindow):
         self.current_target_path = None
         self.fields_entries = {}
 
-        self.setWindowTitle("大锤 NFO Editor v9.8.3")
+        self.setWindowTitle(f"大锤 NFO Editor {get_app_version('editor', prefixed=True)}")
         self.resize(1400, 900)
         self.setMinimumSize(1000, 650)
 
@@ -598,7 +598,6 @@ class NFOEditorQt(QMainWindow):
         ComboBox = self._fw["ComboBox"]
         LineEdit = self._fw["LineEdit"]
         PushButton = self._fw["PushButton"]
-        RadioButton = self._fw["RadioButton"]
         FluentIcon = self._fw["FluentIcon"]
 
         bar = QFrame()
@@ -608,23 +607,28 @@ class NFOEditorQt(QMainWindow):
 
         layout.addWidget(BodyLabel("排序:"))
 
-        self.sorting_group = QButtonGroup(self)
-        for text in [
-            "日期 (Release Date)",
-            "演员 (Actors)",
-            "系列 (Series)",
-            "评分 (Rating)",
-        ]:
-            rb = RadioButton(text)
-            self.sorting_group.addButton(rb)
-            layout.addWidget(rb)
+        self.sort_combo = ComboBox()
+        self.sort_combo.setFixedWidth(175)
+        self.sort_combo.addItems([
+            "默认（文件顺序）",
+            "日期（最新在前）",
+            "演员（名称）",
+            "系列（数量优先）",
+            "评分（高到低）",
+            "番号（自然排序）",
+        ])
+        self.sort_combo.setToolTip(
+            "日期按新到旧，评分按高到低；"
+            "番号采用自然排序，如 ABC-2 在 ABC-10 前面。"
+        )
+        layout.addWidget(self.sort_combo)
 
-        layout.addSpacing(20)
+        layout.addSpacing(14)
         layout.addWidget(BodyLabel("筛选:"))
 
         self.field_combo = ComboBox()
         self.field_combo.setFixedWidth(90)
-        self.field_combo.addItems(["标题", "标签", "演员", "系列", "评分"])
+        self.field_combo.addItems(["标题", "番号", "标签", "演员", "系列", "评分"])
         layout.addWidget(self.field_combo)
 
         self.condition_combo = ComboBox()
@@ -640,12 +644,28 @@ class NFOEditorQt(QMainWindow):
             self.condition_combo.clear()
             self.filter_entry.clear()
             if self.field_combo.currentText() == "评分":
-                self.condition_combo.addItems(["大于", "小于"])
+                self.condition_combo.addItems(
+                    ["大于", "小于", "正则匹配", "正则不匹配"]
+                )
             else:
-                self.condition_combo.addItems(["包含", "不包含"])
+                self.condition_combo.addItems(
+                    ["包含", "不包含", "正则匹配", "正则不匹配"]
+                )
+
+        def on_condition_changed(_index: int):
+            if "正则" in self.condition_combo.currentText():
+                self.filter_entry.setPlaceholderText(r"例如 ^ABC-\d{3}$")
+                self.filter_entry.setToolTip(
+                    r"使用 Python 正则表达式，忽略大小写；支持 ^、$、|、\d 等。"
+                )
+            else:
+                self.filter_entry.setPlaceholderText("输入筛选条件")
+                self.filter_entry.setToolTip("输入文字或数值后点击筛选")
 
         self.field_combo.currentIndexChanged.connect(on_field_changed)
+        self.condition_combo.currentIndexChanged.connect(on_condition_changed)
         on_field_changed(0)
+        on_condition_changed(0)
 
         self.btn_filter = PushButton("筛选")
         self.btn_filter.setIcon(FluentIcon.FILTER)

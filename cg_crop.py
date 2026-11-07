@@ -11,12 +11,13 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QSize, Qt, QRect, QPoint, Signal as pyqtSignal
 from PySide6.QtGui import QIcon, QImage, QImageReader, QPixmap, QPainter, QPen, QTransform, QColor
+from nfo_version import get_app_version
 
 
 # ================================ 配置管理 ================================
 class CropConfig:
     """裁剪工具配置中心"""
-    APP_VERSION = "v9.8.1"
+    APP_VERSION = get_app_version("crop", prefixed=True)
     APP_TITLE = "大锤 EMBY海报裁剪工具"
     WINDOW_SIZE = (1200, 680)
     IMAGE_DISPLAY_SIZE = (800, 538)
