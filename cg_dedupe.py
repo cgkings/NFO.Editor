@@ -128,6 +128,17 @@ WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:[/\\]")
 ANY_URI = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 
 
+def is_trailer_filename(path: str) -> bool:
+    """文件名包含 trailer（大小写不敏感）即视为预告片；不检查父目录名。"""
+    name = str(path)
+    if ANY_URI.match(name):
+        try:
+            name = urllib.parse.unquote(urllib.parse.urlsplit(name).path)
+        except ValueError:
+            return False
+    return "trailer" in ntpath.basename(name).casefold()
+
+
 def application_dir() -> Path:
     """返回程序真实所在目录，不使用 PyInstaller onefile 的临时解压目录。
 
@@ -830,6 +841,11 @@ def iter_scan_folders(roots, stop_event, errors):
 
 def read_scan_folder(job, snapshot, mode, source_prefix, mount_prefix, stop_event):
     folder, nfo_items, media_items = job
+    # 先记住原目录是否存在媒体，避免“只有预告片 + 普通 NFO”
+    # 被错误视为纯 NFO 目录，重新生成一条假版本。
+    had_media_files = bool(media_items)
+    nfo_items = [item for item in nfo_items if not is_trailer_filename(item.name)]
+    media_items = [item for item in media_items if not is_trailer_filename(item.name)]
     nfo_items.sort(key=lambda item: item.name.casefold())
     media_items.sort(key=lambda item: item.name.casefold())
     changed, errors, records = [], [], []
@@ -900,6 +916,9 @@ def read_scan_folder(job, snapshot, mode, source_prefix, mount_prefix, stop_even
         raw = load(item, "strm") if is_strm else media_path
         target, kind = (normalize_strm_target(media_path, raw, source_prefix, mount_prefix)
                         if is_strm else (media_path, "path"))
+        # STRM 自身可能没有 trailer，但指向的实际视频是预告片。
+        if is_strm and is_trailer_filename(target):
+            continue
         disc = get_disc_number(ntpath.splitext(item.name)[0])
         if disc is None:
             disc = get_disc_number(ntpath.basename(folder))
@@ -913,7 +932,7 @@ def read_scan_folder(job, snapshot, mode, source_prefix, mount_prefix, stop_even
         ))
     # 有媒体的目录内，未配对 NFO 只是元数据，不能凭空多算一个媒体版本。
     # 纯 NFO 目录继续支持旧版查重。
-    if not media_items:
+    if not had_media_files:
         for path in nfos:
             if stop_event.is_set():
                 break
@@ -953,9 +972,12 @@ def scan_library(
     last_notify = time.monotonic()
 
     def consume(result):
-        nonlocal processed, cache, last_notify
+        nonlocal processed, cache, last_notify, strm_total, video_total
         records, changed, hits, reads, notices = result
         entries.extend(records)
+        # 统计实际保留下来的媒体，不把预告片计入扫描结果。
+        strm_total += sum(entry.media_type == "STRM" for entry in records)
+        video_total += sum(entry.media_type == "视频" for entry in records)
         processed += hits["nfo"] + reads["nfo"]
         stats["hits"] += hits["nfo"]
         stats["parsed"] += reads["nfo"]
@@ -986,9 +1008,9 @@ def scan_library(
                     if stop_event.is_set():
                         break
                     visited += 1
-                    nfo_total += len(job[1])
-                    strm_total += sum(item.name.casefold().endswith(".strm") for item in job[2])
-                    video_total += sum(not item.name.casefold().endswith(".strm") for item in job[2])
+                    nfo_total += sum(
+                        not is_trailer_filename(item.name) for item in job[1]
+                    )
                     if pool is None:
                         consume(read_scan_folder(job, snapshot, mode, source_prefix, mount_prefix, stop_event))
                         continue
@@ -1498,8 +1520,10 @@ def check_folder_has_only_selected_media(
 ) -> dict:
     """完整递归检查目录内的媒体，禁止在不知情时整目录删除。
 
-    预检使用 allow_other_media=True：发现其它视频/STRM 时返回其数量，
-    自动改为只删除指定文件。实际执行整目录删除时必须使用严格模式。
+    预检使用 allow_other_media=True：发现其它正片/STRM 时返回其数量，
+    自动改为只删除指定文件。文件名含 trailer 的视频/STRM 不算其它媒体，
+    但整目录删除仍会一并删除它们；必须在确认框告知用户。
+    实际执行整目录删除时使用严格模式。
     所有扫描均在后台线程运行，拒绝目录链接及异常大的目录。
     """
     check_merge_stop(stop_event)
@@ -1510,6 +1534,8 @@ def check_folder_has_only_selected_media(
     folder_total = 0
     other_media_count = 0
     other_media_example = ""
+    trailer_count = 0
+    trailer_example = ""
 
     def fail_walk(error):
         raise MergeDeleteBlocked(f"不能完整读取待删目录，拒绝删除：{error}")
@@ -1543,14 +1569,23 @@ def check_folder_has_only_selected_media(
             extension = os.path.splitext(name)[1].casefold()
             if extension in MEDIA_EXTS:
                 key = nt_key(target)
-                if key not in allowed:
+                if key in allowed:
+                    discovered.add(key)
+                elif (is_trailer_filename(name)
+                      or (extension == ".strm"
+                          and is_trailer_filename(read_strm(target)))):
+                    # 预告片文件或指向预告片的 STRM 不算“其他视频”。
+                    # 仅读取本地小 STRM 文本，绝不访问其指向的云端源文件。
+                    # 仍纳入文件数量、链接检查及确认框的永久删除提醒。
+                    trailer_count += 1
+                    if not trailer_example:
+                        trailer_example = target
+                else:
                     if not allow_other_media:
                         raise MergeDeleteBlocked(f"目录里还有其他 STRM/视频文件：{target}")
                     other_media_count += 1
                     if not other_media_example:
                         other_media_example = target
-                else:
-                    discovered.add(key)
 
     missing = allowed - discovered
     if missing:
@@ -1561,6 +1596,8 @@ def check_folder_has_only_selected_media(
         "files": file_total, "directories": folder_total,
         "other_media_count": other_media_count,
         "other_media_example": other_media_example,
+        "trailer_count": trailer_count,
+        "trailer_example": trailer_example,
     }
 
 
@@ -1590,6 +1627,12 @@ def choose_cleanup_mode(
             "file", stats,
             f"所在目录还有 {count} 个其他视频/STRM，"
             f"例如：{stats['other_media_example']}",
+        )
+    if stats["trailer_count"]:
+        return (
+            "folder", stats,
+            f"目录内没有其他正片/STRM；{stats['trailer_count']} 个 trailer 预告片"
+            "不阻止整目录删除，并会随目录一起永久删除",
         )
     return "folder", stats, "目录内没有其他视频/STRM，可删除整个目录"
 
@@ -1662,6 +1705,10 @@ def build_merge_delete_plan(
     kind = entry.media_type
     if kind not in ("STRM", "视频"):
         raise MergeDeleteBlocked("只允许合并删除 STRM 或普通视频条目")
+    if is_trailer_filename(entry.media_path) or (
+        kind == "STRM" and is_trailer_filename(entry.target)
+    ):
+        raise MergeDeleteBlocked("预告片不作为查重版本，不能单独执行合并删除；请重新扫描")
     if kind == "STRM" and (
         entry.target_kind != "path"
         or os.path.splitext(entry.target)[1].casefold() not in VIDEO_EXTS
@@ -1799,6 +1846,18 @@ def execute_merge_delete(
         raise MergeDeleteBlocked(
             "确认期间目录内视频情况已变化，删除方式改变；已取消，请重新确认"
         )
+    if fresh["cleanup_mode"] == "folder":
+        # 预告片不是查重视频，但新增预告片仍属于新增的永久删除目标，
+        # 因此不能在未经再次确认时悄悄一并删除。
+        stats_key = ("scrape_folder_contents" if entry.media_type == "STRM"
+                     else "video_folder_contents")
+        old_stats = plan.get(stats_key) or {}
+        new_stats = fresh.get(stats_key) or {}
+        if (old_stats.get("trailer_count") != new_stats.get("trailer_count")
+                or old_stats.get("trailer_example") != new_stats.get("trailer_example")):
+            raise MergeDeleteBlocked(
+                "确认期间预告片文件发生增减，删除范围已变化；请重新预检确认"
+            )
     if fresh["video_fingerprint"] != plan["video_fingerprint"] or (
         fresh["media_fingerprint"] != plan["media_fingerprint"]
     ):
@@ -3758,6 +3817,14 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         summary += "\n目录处理依据：" + plan["cleanup_reason"]
         if entire_folder:
             summary += "\n目录中的 NFO、图片、字幕等其它文件也会被删除。"
+            folder_stats = (plan.get("scrape_folder_contents") if kind == "STRM"
+                            else plan.get("video_folder_contents")) or {}
+            if folder_stats.get("trailer_count", 0):
+                summary += (
+                    f"\n⚠ 本目录还有 {folder_stats['trailer_count']} 个 trailer 预告片，"
+                    "它们不算重复视频，但也会随整个目录永久删除。"
+                    f"\n例如：{folder_stats.get('trailer_example', '')}"
+                )
         else:
             summary += "\n所在目录和其中其它文件均保留。"
         summary += (
