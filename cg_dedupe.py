@@ -34,10 +34,6 @@ from typing import Callable
 
 DATA_DIR_NAME = "CGDedupe_Data"
 
-# 仅清理此目录中的重复 STRM 作品目录，不扩大到父目录或其他扫描根目录。
-BULK_CLEANUP_ROOT = r"D:\cg_sync\strmfile\7.ADV\JAV"
-# 必须有这份保留的作品副本，才允许删除以上目录中的对应作品。
-BULK_KEEP_ROOT = r"D:\z.刮削\JAV_scrape\JAV_output"
 # 每次 115 / CloudDrive2 真实视频删除完成后，至少间隔三秒才处理下一条。
 BULK_DELETE_DELAY_SECONDS = 3.0
 
@@ -2085,6 +2081,28 @@ def _bulk_guard_source(entry: MediaEntry, root: str, retain_root: str):
         raise MergeDeleteBlocked("视频源位于待删 STRM 根目录或保留目录内，拒绝操作")
 
 
+
+def validate_bulk_roots(
+    source_root: str, keep_root: str, scan_roots: list[str],
+) -> tuple[str, str]:
+    """校验用户从本次扫描目录中选择的待删端和保留端；只做字符串检查。"""
+    if not source_root or not keep_root:
+        raise MergeDeleteBlocked("必须分别选择待删扫描目录和保留扫描目录")
+    source_root = ntpath.normpath(str(source_root))
+    keep_root = ntpath.normpath(str(keep_root))
+    for label, root in (("待删", source_root), ("保留", keep_root)):
+        if not ntpath.isabs(root):
+            raise MergeDeleteBlocked(f"{label}目录不是 Windows 绝对路径：{root}")
+        if nt_key(root) not in {nt_key(item) for item in scan_roots}:
+            raise MergeDeleteBlocked(f"{label}目录不在本次扫描目录列表中：{root}")
+        if ntpath.dirname(root) == root:
+            raise MergeDeleteBlocked(f"不能把磁盘根目录或网络共享根目录作为批量清理目标：{root}")
+    if (is_nested_path(source_root, keep_root, allow_equal=True)
+            or is_nested_path(keep_root, source_root, allow_equal=True)):
+        raise MergeDeleteBlocked("待删目录和保留目录不能相同，也不能互相包含")
+    return source_root, keep_root
+
+
 def format_bulk_preview(batch: dict) -> str:
     lines = [
         "大锤 NFO / STRM 批量清理 · 删除前预览（并非执行结果）",
@@ -2137,20 +2155,10 @@ def precheck_bulk_cleanup(
     duplicates: dict[str, list[MediaEntry]], records: list[MediaEntry],
     scan_roots: list[str], from_prefix: str, to_prefix: str,
     stop_event: threading.Event, notify: Callable[[int, int, str], None],
-    *, operation_id: str, source_root: str = BULK_CLEANUP_ROOT,
-    keep_root: str = BULK_KEEP_ROOT,
+    *, operation_id: str, source_root: str, keep_root: str,
 ) -> dict:
     """后台全量预检；不删任何数据，逐项安全拒绝并生成完整清单。"""
-    source_root = ntpath.normpath(source_root)
-    keep_root = ntpath.normpath(keep_root)
-    if not any(is_nested_path(source_root, root, allow_equal=True) for root in scan_roots):
-        raise MergeDeleteBlocked(f"本次没有完整扫描待删根目录：{source_root}")
-    if not any(is_nested_path(keep_root, root, allow_equal=True) for root in scan_roots):
-        raise MergeDeleteBlocked(f"本次没有完整扫描必须保留的根目录：{keep_root}")
-    if is_nested_path(source_root, keep_root, allow_equal=True) or is_nested_path(
-        keep_root, source_root, allow_equal=True
-    ):
-        raise MergeDeleteBlocked("待删目录与保留目录存在包含关系，禁止批量删除")
+    source_root, keep_root = validate_bulk_roots(source_root, keep_root, scan_roots)
     append_merge_delete_log(
         operation_id, "BULK_PRECHECK_START", source_root=source_root,
         keep_root=keep_root, all_groups=len(duplicates),
@@ -2252,12 +2260,22 @@ def execute_bulk_cleanup(
     video_keys = [nt_key(plan["source_video"]) for plan in plans]
     if len(folder_keys) != len(set(folder_keys)) or len(video_keys) != len(set(video_keys)):
         raise MergeDeleteBlocked("批量清单有重复的视频源或目标文件夹，已整批拦截")
-    if nt_key(batch["source_root"]) != nt_key(BULK_CLEANUP_ROOT) or (
-        nt_key(batch["keep_root"]) != nt_key(BULK_KEEP_ROOT)
-    ):
-        raise MergeDeleteBlocked("待删根目录或保留根目录与固定安全配置不一致")
+    source_root, keep_root = validate_bulk_roots(
+        batch["source_root"], batch["keep_root"], scan_roots,
+    )
+    # 预览时选定的范围在执行阶段保持不变；逐条核对已确认的计划。
+    for plan in plans:
+        if (nt_key(plan.get("bulk_source_root", "")) != nt_key(source_root)
+                or nt_key(plan.get("bulk_keep_root", "")) != nt_key(keep_root)
+                or not is_nested_path(plan.get("scrape_folder", ""), source_root)
+                or not is_nested_path(plan.get("media_path", ""), source_root)
+                or not plan.get("bulk_keepers")
+                or not all(is_nested_path(snapshot.get("media_path", ""), keep_root)
+                           for snapshot in plan["bulk_keepers"])):
+            raise MergeDeleteBlocked("预览清单的目录范围与所选扫描目录不一致，已整批拦截")
     append_merge_delete_log(
         operation_id, "BULK_EXECUTE_START", planned=len(plans),
+        source_root=source_root, keep_root=keep_root,
         delay_seconds=delete_interval_seconds, preview_path=batch["preview_path"],
     )
     last_attempt_finished = None
@@ -2268,13 +2286,13 @@ def execute_bulk_cleanup(
         entry = by_id.get(plan["identifier"])
         if (entry is None or entry.media_type != "STRM"
                 or nt_key(entry.media_path) != nt_key(plan["media_path"])
-                or not is_nested_path(plan["scrape_folder"], BULK_CLEANUP_ROOT)):
+                or not is_nested_path(plan["scrape_folder"], source_root)):
             outcome["skipped_runtime"].append({
                 "code": plan["code"], "reason": "记录/目标路径在预检后发生变化"
             })
             continue
         try:
-            _bulk_guard_source(entry, BULK_CLEANUP_ROOT, BULK_KEEP_ROOT)
+            _bulk_guard_source(entry, source_root, keep_root)
             _bulk_ensure_keeper(plan, by_id, from_prefix, to_prefix, stop_event)
             # 与确认预览对比整个文件夹的快照，而非只比较 STRM 文件。
             current = check_folder_has_only_selected_media(
@@ -2738,6 +2756,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.scan_counts = (0, 0, 0)
         self.scan_errors = []
         self._last_scan_mode = ""
+        self._completed_scan_roots: tuple[str, ...] = ()
         self._scan_started_at = time.monotonic()
         self.sort_column = self.COL["title"]  # 默认按番号，而非版本数
         self.sort_reverse = False                # A-Z / 数字升序
@@ -2995,12 +3014,12 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             "读取当前筛选出的所有重复组的视频参数（不依赖分组是否展开）。"
             "从本地缓存恢复无需访问 CD2；结果显示在番号组的「已读 X/Y」、分辨率和帧率列。"
         )
-        self.bulk_delete_btn = QtWidgets.QPushButton("⚠ 批量清理 D 盘重复项")
+        self.bulk_delete_btn = QtWidgets.QPushButton("⚠ 批量清理重复项")
         self.bulk_delete_btn.setToolTip(
-            f"作用于全部重复番号组，不受筛选影响。仅整删 {BULK_CLEANUP_ROOT} 下安全的 STRM 作品目录；"
-            f"必须保留 {BULK_KEEP_ROOT} 中另一份作品。"
-            f"同时删除指向的真实 115/CD2 视频，每条间隔至少 {BULK_DELETE_DELAY_SECONDS:g} 秒。"
-            "执行前完整预检、预览、输入确认词；风险项自动跳过。"
+            "从已扫描的目录中分别选择「待删目录」和「保留目录」。"
+            "仅处理待删根下重复 STRM 所在的安全作品目录；"
+            "同时删除指向的真实 115/CD2 视频，删除间隔至少 3 秒。"
+            "执行前完整预检、预览、输入确认词；不安全的项目跳过。"
         )
         self.concurrent_spin = QtWidgets.QSpinBox()
         self.concurrent_spin.setRange(1, 2)
@@ -3263,16 +3282,20 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "目录数量限制", "最多允许九个扫描目录。")
             return
         self.directories.append(directory)
+        self._completed_scan_roots = ()  # 目录改变后必须重新扫描，才能批量删除
         self._refresh_roots()
         self._save_settings()
+        self._update_buttons()
 
     def remove_directory(self):
         index = self.directory_list.currentIndex()
         if index < 0 or index >= len(self.directories):
             return
         removed = self.directories.pop(index)
+        self._completed_scan_roots = ()  # 目录改变后必须重新扫描，才能批量删除
         self._refresh_roots()
         self._save_settings()
+        self._update_buttons()
         self._set_status(f"已移除目录：{removed}")
 
     def _update_fuzzy_ability(self):
@@ -3311,6 +3334,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.bulk_btn.setEnabled(not busy and bool(self.duplicates))
         self.bulk_delete_btn.setEnabled(
             not busy and bool(self.duplicates) and self._last_scan_mode == "番号"
+            and bool(self._completed_scan_roots)
         )
         self.concurrent_spin.setEnabled(not busy)
         self.refresh_check.setEnabled(not busy)
@@ -3353,6 +3377,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         new = self.path_mapping.get("target_prefix", "")
         self._scan_started_at = time.monotonic()
         self._last_scan_mode = ""
+        self._completed_scan_roots = ()
         # 此时用户明确发起扫描，才允许配置写入、创建缓存与日志目录。
         self._storage_active = True
         self._save_settings()
@@ -3382,6 +3407,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.records = list(result["records"])
         self.duplicates = dict(result["matches"])
         self._last_scan_mode = self.field_combo.currentText()
+        self._completed_scan_roots = tuple(self.directories)
         self.records_by_id = {entry.identifier: entry for entry in self.records}
         nfo_count, strm_count, video_count = result["counts"]
         self.scan_counts = (nfo_count, strm_count, video_count)
@@ -4306,41 +4332,103 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
 
 
     def start_bulk_cleanup_precheck(self):
-        """全量番号重复组，不依赖 UI 筛选或是否已展开。"""
+        """从本次扫描的根目录中选择两侧，再对全部番号重复组预检。"""
         if self._task_active() or self.closing_requested:
             return
         if self._last_scan_mode != "番号" or self.field_combo.currentText() != "番号":
             QtWidgets.QMessageBox.warning(
-                self, "请按番号重新扫描", "批量永久删除仅允许按番号查重，"
-                "以免系列近似匹配误删不同作品。请切换到「番号」并重新扫描。"
+                self, "请按番号重新扫描",
+                "批量永久删除仅支持按番号查重，避免系列近似匹配误删不同作品。"
             )
             return
         if not self.duplicates:
             QtWidgets.QMessageBox.information(self, "没有重复组", "请先完成快速查重。")
             return
-        if not any(is_nested_path(BULK_CLEANUP_ROOT, root, allow_equal=True)
-                   for root in self.directories) or not any(
-            is_nested_path(BULK_KEEP_ROOT, root, allow_equal=True)
-            for root in self.directories
-        ):
+        if (not self._completed_scan_roots or
+                tuple(map(nt_key, self.directories)) !=
+                tuple(map(nt_key, self._completed_scan_roots))):
             QtWidgets.QMessageBox.warning(
-                self, "扫描范围不足",
-                "为确保另一份作品确实存在，请同时扫描完整的待删根和保留根：\n\n"
-                f"待删：{BULK_CLEANUP_ROOT}\n保留：{BULK_KEEP_ROOT}"
+                self, "扫描目录已变化",
+                "扫描目录在上次查重后有调整，请重新执行快速查重再批量清理。"
             )
             return
+        scan_roots = list(self._completed_scan_roots)
+        if len(scan_roots) < 2:
+            QtWidgets.QMessageBox.warning(
+                self, "需要两个扫描目录",
+                "请至少添加两个相互独立的扫描目录，"
+                "一个用于删除重复项，另一个用于保留对应副本，然后重新扫描。"
+            )
+            return
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("批量清理 - 从扫描目录中选择")
+        dialog.setMinimumWidth(750)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        message = QtWidgets.QLabel(
+            f"当前扫描得到 {len(self.duplicates)} 个重复番号组（不受筛选影响）。\n"
+            "请选择「要删除的一侧」及「必须保留的一侧」；两边不能相同或嵌套。\n"
+            "下一步只进行预检；最终确认后将删除待删侧 STRM 作品目录，"
+            "以及 STRM 指向的 115/CD2 真实视频（两次源视频删除间隔至少 3 秒）。"
+        )
+        message.setWordWrap(True)
+        layout.addWidget(message)
+        form = QtWidgets.QFormLayout()
+        delete_combo = QtWidgets.QComboBox(dialog)
+        keep_combo = QtWidgets.QComboBox(dialog)
+        delete_combo.addItem("— 请选择待清理的扫描目录 —", "")
+        keep_combo.addItem("— 请选择要保留的扫描目录 —", "")
+        for root in scan_roots:
+            delete_combo.addItem(root, root)
+            keep_combo.addItem(root, root)
+        delete_combo.setMinimumWidth(530)
+        keep_combo.setMinimumWidth(530)
+        form.addRow("删除重复项所在目录：", delete_combo)
+        form.addRow("保留另一份所在目录：", keep_combo)
+        layout.addLayout(form)
+        caution = QtWidgets.QLabel(
+            "⚠ 115/CD2 挂载文件删除可能直接影响网盘原件；"
+            "预检会跳过共享源视频、目录混有其他媒体以及保留副本无效的项目。"
+        )
+        caution.setWordWrap(True)
+        layout.addWidget(caution)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_button = buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        ok_button.setText("开始安全预检")
+        def check_user_choice():
+            try:
+                validate_bulk_roots(
+                    delete_combo.currentData() or "",
+                    keep_combo.currentData() or "",
+                    scan_roots,
+                )
+            except MergeDeleteBlocked as error:
+                QtWidgets.QMessageBox.warning(dialog, "目录选择无效", str(error))
+                return
+            dialog.accept()
+        buttons.accepted.connect(check_user_choice)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        source_root = str(delete_combo.currentData())
+        keep_root = str(keep_combo.currentData())
         operation_id = (
             datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
             + "-" + secrets.token_hex(4)
         )
         worker = BulkDeleteWorker(
-            "precheck", self.duplicates, self.records, self.directories,
+            "precheck", self.duplicates, self.records, scan_roots,
             self.path_mapping.get("source_prefix", ""),
             self.path_mapping.get("target_prefix", ""), operation_id,
+            source_root=source_root, keep_root=keep_root,
         )
         self._begin_task(
             worker,
-            f"正在检查全部 {len(self.duplicates)} 个重复组的安全删除条件，暂不删除任何文件",
+            f"预检全部 {len(self.duplicates)} 个重复组：删除侧 {source_root}；保留侧 {keep_root}",
         )
 
     def _handle_bulk_stage(self, result: dict):
@@ -4393,11 +4481,12 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         dialog.resize(1050, 700)
         layout = QtWidgets.QVBoxLayout(dialog)
         explanation = QtWidgets.QLabel(
-            f"全部重复组 {batch['all_groups']}，其中命中待删目录 {batch['matched_groups']} 组；"
+            f"全部重复组 {batch['all_groups']}；命中待删侧 {batch['matched_groups']} 组；"
             f"可整删 {ready} 项，跳过 {len(batch['skipped'])} 项。\n"
-            "必须逐行核对。仅删除 D 盘指定 STRM 作品目录 + 对应 115/CD2 源视频；"
-            "保留 Z 盘副本。\n"
-            f"视频删除间隔至少 {BULK_DELETE_DELAY_SECONDS:g} 秒。"
+            f"待删扫描目录：{batch['source_root']}\n"
+            f"必须保留目录：{batch['keep_root']}\n"
+            "将删除待删侧作品目录及对应 115/CD2 真实视频；保留另一侧副本。"
+            f"源视频删除间隔至少 {BULK_DELETE_DELAY_SECONDS:g} 秒。"
         )
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
@@ -4429,6 +4518,8 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         word, accepted = QtWidgets.QInputDialog.getText(
             self, "最终确认：删除 115 网盘真实视频",
             f"将永久删除 {ready} 个 STRM 作品目录及其真实源视频。\n"
+            f"待删目录：{batch['source_root']}\n"
+            f"保留目录：{batch['keep_root']}\n"
             f"每次源视频删除之间间隔至少 {BULK_DELETE_DELAY_SECONDS:g} 秒。\n"
             "115/CD2 删除可能直接影响云端原件，不进入 Windows 回收站。\n\n"
             "如已核对所有真实视频路径，请输入：删除115源视频",
@@ -4445,7 +4536,9 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             "execute", self.duplicates, self.records, self.directories,
             self.path_mapping.get("source_prefix", ""),
             self.path_mapping.get("target_prefix", ""),
-            batch["operation_id"], confirmed_batch=batch,
+            batch["operation_id"],
+            source_root=batch["source_root"], keep_root=batch["keep_root"],
+            confirmed_batch=batch,
         )
         self._begin_task(
             worker, f"批量执行：计划删除 {ready} 项；115/CD2 每条间隔至少 3 秒，按停止可中断",
@@ -4576,7 +4669,8 @@ class BulkDeleteWorker(QtCore.QThread):
     def __init__(
         self, phase: str, duplicates: dict[str, list[MediaEntry]],
         records: list[MediaEntry], roots: list[str], from_prefix: str,
-        to_prefix: str, operation_id: str, confirmed_batch: dict | None = None,
+        to_prefix: str, operation_id: str, *,
+        source_root: str, keep_root: str, confirmed_batch: dict | None = None,
     ):
         super().__init__()
         self.phase = phase
@@ -4586,6 +4680,8 @@ class BulkDeleteWorker(QtCore.QThread):
         self.from_prefix = from_prefix
         self.to_prefix = to_prefix
         self.operation_id = operation_id
+        self.source_root = source_root
+        self.keep_root = keep_root
         self.confirmed_batch = confirmed_batch
         self.stop_event = threading.Event()  # set() = 请求停止，退出后主线程清理
         self.outcome = None
@@ -4601,10 +4697,14 @@ class BulkDeleteWorker(QtCore.QThread):
                     self.duplicates, self.records, self.roots,
                     self.from_prefix, self.to_prefix, self.stop_event,
                     self.progress.emit, operation_id=self.operation_id,
+                    source_root=self.source_root, keep_root=self.keep_root,
                 )
             elif self.phase == "execute":
                 if not self.confirmed_batch:
                     raise MergeDeleteBlocked("缺少最终确认的批量删除计划")
+                if (nt_key(self.confirmed_batch["source_root"]) != nt_key(self.source_root)
+                        or nt_key(self.confirmed_batch["keep_root"]) != nt_key(self.keep_root)):
+                    raise MergeDeleteBlocked("执行目录与用户预检时选择的目录不一致")
                 result["outcome"] = execute_bulk_cleanup(
                     self.confirmed_batch, self.records, self.roots,
                     self.from_prefix, self.to_prefix, self.stop_event,
