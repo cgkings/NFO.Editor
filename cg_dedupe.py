@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import datetime
+import hashlib
 import secrets
 import stat
 import queue
@@ -33,11 +34,25 @@ from typing import Callable
 
 DATA_DIR_NAME = "CGDedupe_Data"
 
+# 仅清理此目录中的重复 STRM 作品目录，不扩大到父目录或其他扫描根目录。
+BULK_CLEANUP_ROOT = r"D:\cg_sync\strmfile\7.ADV\JAV"
+# 必须有这份保留的作品副本，才允许删除以上目录中的对应作品。
+BULK_KEEP_ROOT = r"D:\z.刮削\JAV_scrape\JAV_output"
+# 每次 115 / CloudDrive2 真实视频删除完成后，至少间隔三秒才处理下一条。
+BULK_DELETE_DELAY_SECONDS = 3.0
+
 
 APP_TITLE = "大锤 NFO / STRM 多版本查重"
 
 
-from nfo_version import get_app_version
+try:
+    from nfo_version import get_app_version
+except ModuleNotFoundError as error:
+    if error.name != "nfo_version":
+        raise
+    # 单文件交付时也能启动；原项目存在 nfo_version.py 时继续统一读取版本。
+    def get_app_version(_module: str) -> str:
+        return "9.8.5"
 
 APP_VERSION = get_app_version("dedupe")
 
@@ -151,20 +166,17 @@ def application_dir() -> Path:
 
 
 def program_data_dir() -> Path:
-    """计算用户数据目录，但不创建，首次扫描前不会产生任何文件。
+    """用户可写配置/缓存/审计日志始终位于 APPDATA 程序专属目录。
 
-    .py 模式：脚本所在目录 / CGDedupe_Data
-    EXE 模式：exe 所在目录 / CGDedupe_Data
-    不能用 sys._MEIPASS（onefile 解压临时目录）存放可写数据。
+    无论源码运行还是 PyInstaller EXE，均不写入安装位置或 _MEIPASS。
     """
-    return application_dir() / DATA_DIR_NAME
+    appdata = os.environ.get("APPDATA")
+    base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+    return base / DATA_DIR_NAME
 
 
 def ensure_program_data_dir() -> Path:
-    """仅从后台工作线程调用，首次开始扫描时生成便携数据目录。
-
-    若 EXE / .py 所在目录没有写入权限，明确报错而不悄悄改写 APPDATA。
-    """
+    """仅在后台线程创建 APPDATA 下的可写数据目录。"""
     directory = program_data_dir()
     try:
         directory.mkdir(parents=True, exist_ok=True)
@@ -174,8 +186,8 @@ def ensure_program_data_dir() -> Path:
         probe.unlink()
     except OSError as error:
         raise OSError(
-            f"程序旁的数据目录不可写：{directory}\n"
-            "请将程序放到具有写入权限的位置，不要放在 Program Files 等受保护目录。"
+            f"APPDATA 中的数据目录不可写：{directory}\n"
+            "请检查当前 Windows 账户的 APPDATA 访问权限。"
         ) from error
     return directory
 
@@ -1329,7 +1341,7 @@ def json_load(path: Path) -> dict:
 
 
 def json_save(path: Path, value: dict):
-    """原子替换配置文件；调用方应确保程序旁数据目录已创建。"""
+    """原子替换配置文件；调用方应确保 APPDATA 数据目录已创建。"""
     temp = path.with_name(path.name + f".{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1433,8 +1445,16 @@ class MergeDeleteBlocked(Exception):
     """完整预检不通过，禁止任何删除。"""
 
 
+class MergeDeletePartial(MergeDeleteBlocked):
+    """删除了部分目标；批量任务必须立即停止，不可自动继续下一项。"""
+
+    def __init__(self, message: str, completed_steps: list[str]):
+        super().__init__(message)
+        self.completed_steps = list(completed_steps)
+
+
 def merge_delete_log_path() -> Path:
-    """合并删除审计日志：程序目录/CGDedupe_Data/logs/merge_delete.jsonl。"""
+    """合并删除审计日志：APPDATA/CGDedupe_Data/logs/merge_delete.jsonl。"""
     return program_data_dir() / "logs" / "merge_delete.jsonl"
 
 
@@ -1532,6 +1552,7 @@ def check_folder_has_only_selected_media(
     discovered = set()
     file_total = 0
     folder_total = 0
+    tree_digest = hashlib.sha256()
     other_media_count = 0
     other_media_example = ""
     trailer_count = 0
@@ -1545,6 +1566,10 @@ def check_folder_has_only_selected_media(
     ):
         check_merge_stop(stop_event)
         guard_merge_path(current, directory=True)
+        # 遍历顺序稳定，快照包含目录和各文件的元数据，不读取媒体内容。
+        directories.sort(key=str.casefold)
+        names.sort(key=str.casefold)
+        tree_digest.update(("D|" + nt_key(os.path.relpath(current, folder)) + "\n").encode("utf-8"))
         folder_total += 1
         if folder_total > 2000:
             raise MergeDeleteBlocked("待删文件夹下有超过2000个子目录，请人工检查")
@@ -1561,9 +1586,14 @@ def check_folder_has_only_selected_media(
             if os.path.islink(target):
                 raise MergeDeleteBlocked(f"文件夹含符号链接，拒绝递归删除：{target}")
             try:
-                attributes = getattr(os.lstat(target), "st_file_attributes", 0)
+                file_st = os.lstat(target)
+                attributes = getattr(file_st, "st_file_attributes", 0)
             except OSError as error:
                 raise MergeDeleteBlocked(f"无法核查目录中文件：{target}，{error}") from error
+            tree_digest.update((
+                f"F|{nt_key(os.path.relpath(target, folder))}|"
+                f"{file_st.st_size}|{file_st.st_mtime_ns}|{file_st.st_ino}\n"
+            ).encode("utf-8"))
             if attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
                 raise MergeDeleteBlocked(f"目录中有重解析点文件，拒绝整目录删除：{target}")
             extension = os.path.splitext(name)[1].casefold()
@@ -1594,6 +1624,7 @@ def check_folder_has_only_selected_media(
         )
     return {
         "files": file_total, "directories": folder_total,
+        "tree_fingerprint": tree_digest.hexdigest(),
         "other_media_count": other_media_count,
         "other_media_example": other_media_example,
         "trailer_count": trailer_count,
@@ -1862,7 +1893,18 @@ def execute_merge_delete(
         fresh["media_fingerprint"] != plan["media_fingerprint"]
     ):
         raise MergeDeleteBlocked("预检之后目标文件已变化，操作已取消")
+    if plan.get("bulk_source_root"):
+        original = plan.get("scrape_folder_contents") or {}
+        updated = fresh.get("scrape_folder_contents") or {}
+        if original.get("tree_fingerprint") != updated.get("tree_fingerprint"):
+            raise MergeDeleteBlocked("STRM 作品目录在批量预览后发生变化，拒绝删除")
     check_merge_stop(stop_event)
+    if plan.get("bulk_source_root"):
+        # 最终实际删除前再确认保留方，避免预检或限速等待后副本丢失。
+        _bulk_ensure_keeper(
+            plan, {record.identifier: record for record in records},
+            old_prefix, mapped_prefix, stop_event,
+        )
     append_merge_delete_log(
         operation_id, "EXECUTE_START", plan=fresh,
         note="开始不可逆操作；在此之前不做任何删除"
@@ -1882,10 +1924,19 @@ def execute_merge_delete(
             )
             check_merge_stop(stop_event)
             if fresh["cleanup_mode"] == "folder":
-                # 再次确保无其他视频；确认期间出现新视频则停止。
-                check_folder_has_only_selected_media(
+                # 真实视频删完后也要保护本地目录：若出现任何新增文件，
+                # 不得把它连同原目录一起误删；此时记录为部分完成并停止整批。
+                latest_folder = check_folder_has_only_selected_media(
                     fresh["scrape_folder"], [fresh["media_path"]], stop_event,
                 )
+                if plan.get("bulk_source_root") and (
+                    latest_folder.get("tree_fingerprint") !=
+                    (plan.get("scrape_folder_contents") or {}).get("tree_fingerprint")
+                ):
+                    raise MergeDeleteBlocked(
+                        "源视频已经删除，但 STRM 目录在操作中发生变化；"
+                        "已保留目录，请人工检查审计日志"
+                    )
             check_snapshot_matches(fresh["media_path"], plan["media_fingerprint"])
             check_merge_stop(stop_event)
             if fresh["cleanup_mode"] == "folder":
@@ -1947,10 +1998,368 @@ def execute_merge_delete(
             operation_id, stage, completed=finished_steps,
             error=str(error),
         )
-        raise MergeDeleteBlocked(
-            f"删除未完成：{error}；已完成步骤："
-            + ("；".join(finished_steps) if finished_steps else "无")
-        ) from error
+        message = (f"删除未完成：{error}；已完成步骤："
+                   + ("；".join(finished_steps) if finished_steps else "无"))
+        raise MergeDeletePartial(message, finished_steps) from error
+
+
+def _bulk_candidates(group: list[MediaEntry], root: str) -> list[MediaEntry]:
+    """仅选择指定根下的 STRM；整个目录必须严格位于根目录之下。"""
+    return [
+        entry for entry in group
+        if entry.media_type == "STRM"
+        and ntpath.splitext(entry.media_path)[1].casefold() == ".strm"
+        and is_nested_path(entry.folder, root)
+        and is_nested_path(entry.media_path, root)
+        and nt_key(ntpath.dirname(entry.media_path)) == nt_key(entry.folder)
+    ]
+
+
+def _bulk_keepers(group: list[MediaEntry], root: str) -> list[MediaEntry]:
+    """另一份必须在指定保留根内，且有独立的本地 STRM/视频文件。"""
+    return [
+        entry for entry in group
+        if entry.media_type in ("STRM", "视频")
+        and entry.target_kind in ("path", "url")
+        and bool(entry.target)
+        and is_nested_path(entry.media_path, root)
+        and is_nested_path(entry.folder, root)
+    ]
+
+
+def _verify_bulk_keeper(
+    entry: MediaEntry, source_video: str, from_prefix: str,
+    to_prefix: str, stop_event: threading.Event,
+) -> dict:
+    """只触碰保留方的本地 STRM/媒体文件，不打开其指向的云盘视频。"""
+    check_merge_stop(stop_event)
+    st = guard_merge_path(entry.media_path, directory=False)
+    if entry.media_type == "STRM":
+        raw = read_strm(entry.media_path, strict=True)
+        actual, kind = normalize_strm_target(entry.media_path, raw, from_prefix, to_prefix)
+        if (kind != entry.target_kind
+                or target_identity(actual, kind) != target_identity(entry.target, entry.target_kind)):
+            raise MergeDeleteBlocked(f"保留方 STRM 内容已变化：{entry.media_path}")
+    if (entry.target_kind == "path"
+            and nt_key(entry.target) == nt_key(source_video)):
+        raise MergeDeleteBlocked("保留方和待删 STRM 指向同一源视频，禁止删除源文件")
+    return {
+        "identifier": entry.identifier,
+        "media_path": entry.media_path,
+        "fingerprint": file_fingerprint(st),
+    }
+
+
+def _bulk_ensure_keeper(
+    plan: dict, record_by_id: dict[int, MediaEntry],
+    from_prefix: str, to_prefix: str, stop_event: threading.Event,
+):
+    """执行时至少仍有一份与预览完全相同的保留方文件。"""
+    for snapshot in plan["bulk_keepers"]:
+        check_merge_stop(stop_event)
+        keeper = record_by_id.get(snapshot["identifier"])
+        if keeper is None or nt_key(keeper.media_path) != nt_key(snapshot["media_path"]):
+            continue
+        try:
+            current = _verify_bulk_keeper(
+                keeper, plan["source_video"], from_prefix, to_prefix, stop_event,
+            )
+        except (MergeDeleteBlocked, OSError, ValueError):
+            continue
+        if current["fingerprint"] == snapshot["fingerprint"]:
+            return
+    raise MergeDeleteBlocked("全部保留方副本已缺失或发生变化，禁止删除源视频")
+
+
+def _bulk_guard_source(entry: MediaEntry, root: str, retain_root: str):
+    if entry.target_kind != "path" or not entry.target:
+        raise MergeDeleteBlocked("STRM 不是已映射的本地视频路径，不能批量删源")
+    if ntpath.splitext(entry.target)[1].casefold() not in VIDEO_EXTS:
+        raise MergeDeleteBlocked("STRM 指向内容不是已识别的视频扩展名")
+    if os.name == "nt" and not (
+        WINDOWS_DRIVE.match(entry.target) or entry.target.startswith("\\\\")
+    ):
+        raise MergeDeleteBlocked("视频源不是 Windows 盘符或 UNC 绝对路径")
+    if (is_nested_path(entry.target, root, allow_equal=True)
+            or is_nested_path(entry.target, retain_root, allow_equal=True)):
+        raise MergeDeleteBlocked("视频源位于待删 STRM 根目录或保留目录内，拒绝操作")
+
+
+def format_bulk_preview(batch: dict) -> str:
+    lines = [
+        "大锤 NFO / STRM 批量清理 · 删除前预览（并非执行结果）",
+        "=" * 74,
+        f"生成时间：{datetime.datetime.now().astimezone().isoformat()}",
+        f"扫描重复组总数：{batch['all_groups']}",
+        f"涉及指定根目录的重复组：{batch['matched_groups']}",
+        f"准备删除作品目录：{len(batch['plans'])}",
+        f"被跳过的条目：{len(batch['skipped'])}",
+        f"只允许删除 STRM 所在目录：{batch['source_root']}",
+        f"必须保留匹配的副本：{batch['keep_root']}",
+        f"源视频删除间隔：{BULK_DELETE_DELAY_SECONDS:.0f} 秒（两次删除之间）",
+        "注意：CD2 挂载删除可能直接删除 115 网盘原文件，不进 Windows 回收站。",
+        "注意：只检查当前已扫描的 STRM 引用；扫描范围外的引用无法自动排除。",
+        "",
+        "一、将执行的操作（每条：先删除真实视频文件，再删除整个 STRM 作品目录）",
+        "-" * 74,
+    ]
+    for index, plan in enumerate(batch["plans"], 1):
+        lines.extend([
+            f"[{index}] 番号：{plan['code']}",
+            f"    要删除的作品目录：{plan['scrape_folder']}",
+            f"    要删除的 115/CD2 视频：{plan['source_video']}",
+            f"    保留的 STRM/视频：{plan['bulk_keepers'][0]['media_path']}",
+            f"    目录内文件数（含图片/NFO等）：{plan['scrape_folder_contents']['files']}",
+            "",
+        ])
+    lines.extend(["", "二、跳过（不会删除）", "-" * 74])
+    for index, item in enumerate(batch["skipped"], 1):
+        lines.append(
+            f"[{index}] {item['code']} | {item['media_path']}\n"
+            f"    原因：{item['reason']}"
+        )
+    if not batch["plans"]:
+        lines.append("没有任何符合安全条件的删除项。")
+    return "\n".join(lines) + "\n"
+
+
+def _save_bulk_preview(operation_id: str, content: str) -> str:
+    path = program_data_dir() / "logs" / f"bulk_preview_{operation_id}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "x", encoding="utf-8", newline="\n") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return str(path)
+
+
+def precheck_bulk_cleanup(
+    duplicates: dict[str, list[MediaEntry]], records: list[MediaEntry],
+    scan_roots: list[str], from_prefix: str, to_prefix: str,
+    stop_event: threading.Event, notify: Callable[[int, int, str], None],
+    *, operation_id: str, source_root: str = BULK_CLEANUP_ROOT,
+    keep_root: str = BULK_KEEP_ROOT,
+) -> dict:
+    """后台全量预检；不删任何数据，逐项安全拒绝并生成完整清单。"""
+    source_root = ntpath.normpath(source_root)
+    keep_root = ntpath.normpath(keep_root)
+    if not any(is_nested_path(source_root, root, allow_equal=True) for root in scan_roots):
+        raise MergeDeleteBlocked(f"本次没有完整扫描待删根目录：{source_root}")
+    if not any(is_nested_path(keep_root, root, allow_equal=True) for root in scan_roots):
+        raise MergeDeleteBlocked(f"本次没有完整扫描必须保留的根目录：{keep_root}")
+    if is_nested_path(source_root, keep_root, allow_equal=True) or is_nested_path(
+        keep_root, source_root, allow_equal=True
+    ):
+        raise MergeDeleteBlocked("待删目录与保留目录存在包含关系，禁止批量删除")
+    append_merge_delete_log(
+        operation_id, "BULK_PRECHECK_START", source_root=source_root,
+        keep_root=keep_root, all_groups=len(duplicates),
+    )
+    folder_occurrences: dict[str, int] = defaultdict(int)
+    candidates: list[tuple[str, MediaEntry, list[MediaEntry]]] = []
+    matched_groups = 0
+    for code, group in sorted(duplicates.items(), key=lambda x: number_sort_key(x[0])):
+        if stop_event.is_set():
+            raise Interrupted()
+        targets = _bulk_candidates(group, source_root)
+        if targets:
+            matched_groups += 1
+        for entry in targets:
+            folder_occurrences[nt_key(entry.folder)] += 1
+            candidates.append((code, entry, group))
+
+    plans = []
+    skipped = []
+    for index, (code, entry, group) in enumerate(candidates, 1):
+        check_merge_stop(stop_event)
+        try:
+            if folder_occurrences[nt_key(entry.folder)] != 1:
+                raise MergeDeleteBlocked("同一作品目录匹配了多个 STRM，批量模式跳过整目录")
+            keepers = _bulk_keepers(group, keep_root)
+            if not keepers:
+                raise MergeDeleteBlocked("未找到指定保留目录内的另一份 STRM/视频，不能确认有副本")
+            _bulk_guard_source(entry, source_root, keep_root)
+            safe_keepers = []
+            for keeper in keepers:
+                check_merge_stop(stop_event)
+                try:
+                    safe_keepers.append(_verify_bulk_keeper(
+                        keeper, entry.target, from_prefix, to_prefix, stop_event,
+                    ))
+                except (OSError, ValueError, MergeDeleteBlocked):
+                    continue
+            if not safe_keepers:
+                raise MergeDeleteBlocked("保留方文件缺失、改变或与待删项共用同一视频源")
+            plan = build_merge_delete_plan(
+                entry, records, scan_roots, from_prefix, to_prefix,
+                stop_event, operation_id=operation_id,
+            )
+            if plan["cleanup_mode"] != "folder":
+                raise MergeDeleteBlocked(
+                    "目录不适合整删（有其他媒体/共享目录/权限问题）："
+                    + plan["cleanup_reason"]
+                )
+            if nt_key(plan["cleanup_folder"]) != nt_key(entry.folder):
+                raise MergeDeleteBlocked("预检得到的整删目录与扫描目录不一致")
+            plan["bulk_keepers"] = safe_keepers
+            plan["bulk_source_root"] = source_root
+            plan["bulk_keep_root"] = keep_root
+            plans.append(plan)
+        except (MergeDeleteBlocked, OSError, ValueError) as error:
+            skipped.append({
+                "code": code, "media_path": entry.media_path,
+                "reason": str(error),
+            })
+        if index % 5 == 0 or index == len(candidates):
+            notify(index, max(len(candidates), 1),
+                   f"批量预检 {index}/{len(candidates)}，可删 {len(plans)}，跳过 {len(skipped)}")
+    batch = {
+        "operation_id": operation_id,
+        "source_root": source_root, "keep_root": keep_root,
+        "all_groups": len(duplicates), "matched_groups": matched_groups,
+        "plans": plans, "skipped": skipped,
+    }
+    check_merge_stop(stop_event)
+    preview = format_bulk_preview(batch)
+    batch["preview_path"] = _save_bulk_preview(operation_id, preview)
+    check_merge_stop(stop_event)
+    append_merge_delete_log(
+        operation_id, "BULK_PRECHECK_DONE",
+        ready=[{"code": p["code"], "folder": p["scrape_folder"],
+                "source": p["source_video"]} for p in plans],
+        skipped=skipped, preview_path=batch["preview_path"],
+    )
+    return batch
+
+
+def execute_bulk_cleanup(
+    batch: dict, records: list[MediaEntry], scan_roots: list[str],
+    from_prefix: str, to_prefix: str,
+    stop_event: threading.Event, notify: Callable[[int, int, str], None],
+    *, delete_interval_seconds: float = BULK_DELETE_DELAY_SECONDS,
+) -> dict:
+    """逐一删除 CD2 源视频与 STRM 文件夹；三秒间隔，Event 可中断。"""
+    operation_id = batch["operation_id"]
+    plans = list(batch["plans"])
+    by_id = {entry.identifier: entry for entry in records}
+    outcome = {
+        "deleted": [], "skipped_runtime": [], "error": "", "stopped": False,
+        "total_plans": len(plans), "preview_path": batch["preview_path"],
+        "log_path": str(merge_delete_log_path()),
+    }
+    # 冻结整批删除目标：不允许同一目录或同一真实视频重复入队。
+    folder_keys = [nt_key(plan["scrape_folder"]) for plan in plans]
+    video_keys = [nt_key(plan["source_video"]) for plan in plans]
+    if len(folder_keys) != len(set(folder_keys)) or len(video_keys) != len(set(video_keys)):
+        raise MergeDeleteBlocked("批量清单有重复的视频源或目标文件夹，已整批拦截")
+    if nt_key(batch["source_root"]) != nt_key(BULK_CLEANUP_ROOT) or (
+        nt_key(batch["keep_root"]) != nt_key(BULK_KEEP_ROOT)
+    ):
+        raise MergeDeleteBlocked("待删根目录或保留根目录与固定安全配置不一致")
+    append_merge_delete_log(
+        operation_id, "BULK_EXECUTE_START", planned=len(plans),
+        delay_seconds=delete_interval_seconds, preview_path=batch["preview_path"],
+    )
+    last_attempt_finished = None
+    for index, plan in enumerate(plans, 1):
+        if stop_event.is_set():
+            outcome["stopped"] = True
+            break
+        entry = by_id.get(plan["identifier"])
+        if (entry is None or entry.media_type != "STRM"
+                or nt_key(entry.media_path) != nt_key(plan["media_path"])
+                or not is_nested_path(plan["scrape_folder"], BULK_CLEANUP_ROOT)):
+            outcome["skipped_runtime"].append({
+                "code": plan["code"], "reason": "记录/目标路径在预检后发生变化"
+            })
+            continue
+        try:
+            _bulk_guard_source(entry, BULK_CLEANUP_ROOT, BULK_KEEP_ROOT)
+            _bulk_ensure_keeper(plan, by_id, from_prefix, to_prefix, stop_event)
+            # 与确认预览对比整个文件夹的快照，而非只比较 STRM 文件。
+            current = check_folder_has_only_selected_media(
+                plan["scrape_folder"], [plan["media_path"]], stop_event,
+            )
+            prior = plan.get("scrape_folder_contents") or {}
+            if current.get("tree_fingerprint") != prior.get("tree_fingerprint"):
+                raise MergeDeleteBlocked("作品目录内文件在预览后发生变化，请重新扫描")
+        except Interrupted:
+            outcome["stopped"] = True
+            break
+        except (MergeDeleteBlocked, OSError, ValueError) as error:
+            skipped = {"code": plan["code"], "reason": str(error)}
+            outcome["skipped_runtime"].append(skipped)
+            append_merge_delete_log(operation_id, "BULK_ITEM_SKIPPED", **skipped)
+            notify(index, len(plans), f"跳过 {plan['code']}：{error}")
+            continue
+        if last_attempt_finished is not None:
+            remaining = delete_interval_seconds - (time.monotonic() - last_attempt_finished)
+            if remaining > 0:
+                notify(index - 1, len(plans),
+                       f"115/CD2 限速等待 {remaining:.1f} 秒，下一条 {plan['code']}")
+                if stop_event.wait(remaining):
+                    outcome["stopped"] = True
+                    break
+        if stop_event.is_set():
+            outcome["stopped"] = True
+            break
+        # 限速等待时可能出现新增文件或保留方变化，再做最后一次本地核查。
+        try:
+            _bulk_ensure_keeper(plan, by_id, from_prefix, to_prefix, stop_event)
+            latest = check_folder_has_only_selected_media(
+                plan["scrape_folder"], [plan["media_path"]], stop_event,
+            )
+            if latest.get("tree_fingerprint") != (
+                (plan.get("scrape_folder_contents") or {}).get("tree_fingerprint")
+            ):
+                raise MergeDeleteBlocked("限速等待期间作品目录发生变化，已跳过")
+        except Interrupted:
+            outcome["stopped"] = True
+            break
+        except (MergeDeleteBlocked, OSError, ValueError) as error:
+            skipped = {"code": plan["code"], "reason": str(error)}
+            outcome["skipped_runtime"].append(skipped)
+            append_merge_delete_log(operation_id, "BULK_ITEM_SKIPPED", **skipped)
+            notify(index, len(plans), f"跳过 {plan['code']}：{error}")
+            continue
+        notify(index - 1, len(plans), f"正在删除 {index}/{len(plans)}：{plan['code']}")
+        try:
+            # 此函数再做一次完整预检，包括引用、STRM 内容和文件指纹，
+            # 删除顺序为真实视频单文件 -> 本地专属 STRM 目录。
+            completed = execute_merge_delete(
+                plan, entry, records, scan_roots, from_prefix, to_prefix, stop_event,
+            )
+            last_attempt_finished = time.monotonic()
+            done = {"code": plan["code"], "source_video": plan["source_video"],
+                    "scrape_folder": plan["scrape_folder"], "steps": completed}
+            outcome["deleted"].append(done)
+            append_merge_delete_log(
+                operation_id, "BULK_ITEM_DONE", code=plan["code"],
+                source_video=plan["source_video"], scrape_folder=plan["scrape_folder"],
+            )
+        except (MergeDeleteBlocked, OSError, ValueError) as error:
+            last_attempt_finished = time.monotonic()
+            # 出现任何真实视频删除失败或部分完成，都立即停下整批，
+            # 避免继续请求 115 并掩盖已发生的不可逆变化。
+            outcome["error"] = f"{plan['code']}：{error}"
+            append_merge_delete_log(
+                operation_id, "BULK_ABORTED", code=plan["code"],
+                error=outcome["error"],
+                partial_steps=(error.completed_steps
+                               if isinstance(error, MergeDeletePartial) else []),
+            )
+            break
+        notify(index, len(plans), f"已清理 {len(outcome['deleted'])}/{len(plans)}：{plan['code']}")
+    if stop_event.is_set():
+        outcome["stopped"] = True
+    append_merge_delete_log(
+        operation_id,
+        "BULK_STOPPED" if outcome["stopped"] else
+        ("BULK_INCOMPLETE" if outcome["error"] else "BULK_FINISHED"),
+        deleted=outcome["deleted"], skipped_runtime=outcome["skipped_runtime"],
+        error=outcome["error"], planned=len(plans),
+    )
+    return outcome
 
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -2295,7 +2704,11 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.settings_file = self.data_dir / "settings.json"
         self.cache_file = self.data_dir / "video_index.sqlite3"
         self.merge_log_file = self.data_dir / "logs" / "merge_delete.jsonl"
-        self.settings = json_load(self.settings_file)
+        # 兼容旧版放在程序旁的配置；下次扫描会写到 APPDATA，旧文件不修改。
+        legacy_settings = application_dir() / DATA_DIR_NAME / "settings.json"
+        self.settings = json_load(
+            self.settings_file if self.settings_file.is_file() else legacy_settings
+        )
         # 从旧版本继承已有的纯路径映射，不发起任何网络属性请求。
         legacy_mapping = self.settings.pop("webdav", {})
         legacy_mapping = legacy_mapping if isinstance(legacy_mapping, dict) else {}
@@ -2324,6 +2737,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.group_for_entry: dict[int, str] = {}
         self.scan_counts = (0, 0, 0)
         self.scan_errors = []
+        self._last_scan_mode = ""
         self._scan_started_at = time.monotonic()
         self.sort_column = self.COL["title"]  # 默认按番号，而非版本数
         self.sort_reverse = False                # A-Z / 数字升序
@@ -2581,6 +2995,13 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             "读取当前筛选出的所有重复组的视频参数（不依赖分组是否展开）。"
             "从本地缓存恢复无需访问 CD2；结果显示在番号组的「已读 X/Y」、分辨率和帧率列。"
         )
+        self.bulk_delete_btn = QtWidgets.QPushButton("⚠ 批量清理 D 盘重复项")
+        self.bulk_delete_btn.setToolTip(
+            f"作用于全部重复番号组，不受筛选影响。仅整删 {BULK_CLEANUP_ROOT} 下安全的 STRM 作品目录；"
+            f"必须保留 {BULK_KEEP_ROOT} 中另一份作品。"
+            f"同时删除指向的真实 115/CD2 视频，每条间隔至少 {BULK_DELETE_DELAY_SECONDS:g} 秒。"
+            "执行前完整预检、预览、输入确认词；风险项自动跳过。"
+        )
         self.concurrent_spin = QtWidgets.QSpinBox()
         self.concurrent_spin.setRange(1, 2)
         self.concurrent_spin.setValue(1)
@@ -2609,6 +3030,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.filter_input.setMinimumWidth(165)
         toolbar.addWidget(self.info_btn)
         toolbar.addWidget(self.bulk_btn)
+        toolbar.addWidget(self.bulk_delete_btn)
         toolbar.addWidget(QtWidgets.QLabel("探测并发"))
         toolbar.addWidget(self.concurrent_spin)
         toolbar.addWidget(self.refresh_check)
@@ -2695,6 +3117,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.filter_input.textChanged.connect(lambda _text: self.filter_timer.start())
         self.info_btn.clicked.connect(self.get_video_info)
         self.bulk_btn.clicked.connect(self.get_all_video_info)
+        self.bulk_delete_btn.clicked.connect(self.start_bulk_cleanup_precheck)
         self.concurrent_spin.valueChanged.connect(self._save_settings)
         self.refresh_check.toggled.connect(self._refresh_toggle_changed)
         self.fastplay_check.toggled.connect(self._fastplay_toggle_changed)
@@ -2821,7 +3244,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         )
 
     def choose_directory(self):
-        # 首次扫描之前选择仅保存在内存；扫描时写入程序同级数据目录。
+        # 首次扫描之前选择仅保存在内存；扫描时写入 APPDATA 数据目录。
         # 让原生对话框处理路径有效性；不要先在 GUI 线程 stat 可能离线的挂载盘。
         initial = self.last_directory or str(Path.home())
         selected = QtWidgets.QFileDialog.getExistingDirectory(
@@ -2886,6 +3309,9 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.scan_workers_spin.setEnabled(not busy)
         self.info_btn.setEnabled(not busy and bool(self.records))
         self.bulk_btn.setEnabled(not busy and bool(self.duplicates))
+        self.bulk_delete_btn.setEnabled(
+            not busy and bool(self.duplicates) and self._last_scan_mode == "番号"
+        )
         self.concurrent_spin.setEnabled(not busy)
         self.refresh_check.setEnabled(not busy)
         self.fastplay_check.setEnabled(not self.closing_requested)
@@ -2926,6 +3352,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         old = self.path_mapping.get("source_prefix", "")
         new = self.path_mapping.get("target_prefix", "")
         self._scan_started_at = time.monotonic()
+        self._last_scan_mode = ""
         # 此时用户明确发起扫描，才允许配置写入、创建缓存与日志目录。
         self._storage_active = True
         self._save_settings()
@@ -2954,6 +3381,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
     def _scan_complete(self, result):
         self.records = list(result["records"])
         self.duplicates = dict(result["matches"])
+        self._last_scan_mode = self.field_combo.currentText()
         self.records_by_id = {entry.identifier: entry for entry in self.records}
         nfo_count, strm_count, video_count = result["counts"]
         self.scan_counts = (nfo_count, strm_count, video_count)
@@ -3006,6 +3434,12 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
                 f"快速查重中：已遍历 {current:,} 个目录，已读取 {total:,} 个 NFO"
             )
             return
+        if isinstance(self.worker, BulkDeleteWorker):
+            self.progress.setRange(0, max(1, total))
+            self.progress.setValue(min(current, max(1, total)))
+            if label:
+                self._set_status(label)
+            return
         if total <= 0:
             self.progress.setRange(0, 0)
             return
@@ -3023,7 +3457,9 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         stopped = source.stop_event.is_set()
         was_probe = isinstance(source, ProbeWorker)
         was_merge = isinstance(source, MergeDeleteWorker)
+        was_bulk_delete = isinstance(source, BulkDeleteWorker)
         merge_outcome = source.outcome if was_merge else None
+        bulk_outcome = source.outcome if was_bulk_delete else None
         source.stop_event.clear()  # worker ended; clear Event for any later task
         source.deleteLater()
         self.worker = None
@@ -3045,6 +3481,10 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         elif was_merge and merge_outcome is not None:
             QtCore.QTimer.singleShot(
                 0, lambda response=merge_outcome: self._handle_merge_stage(response)
+            )
+        elif was_bulk_delete and bulk_outcome is not None:
+            QtCore.QTimer.singleShot(
+                0, lambda response=bulk_outcome: self._handle_bulk_stage(response)
             )
 
     def render_results(self):
@@ -3864,6 +4304,153 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             f"执行合并删除：{plan['code']}；正在重新核查后永久删除，日志保存在 {self.merge_log_file}",
         )
 
+
+    def start_bulk_cleanup_precheck(self):
+        """全量番号重复组，不依赖 UI 筛选或是否已展开。"""
+        if self._task_active() or self.closing_requested:
+            return
+        if self._last_scan_mode != "番号" or self.field_combo.currentText() != "番号":
+            QtWidgets.QMessageBox.warning(
+                self, "请按番号重新扫描", "批量永久删除仅允许按番号查重，"
+                "以免系列近似匹配误删不同作品。请切换到「番号」并重新扫描。"
+            )
+            return
+        if not self.duplicates:
+            QtWidgets.QMessageBox.information(self, "没有重复组", "请先完成快速查重。")
+            return
+        if not any(is_nested_path(BULK_CLEANUP_ROOT, root, allow_equal=True)
+                   for root in self.directories) or not any(
+            is_nested_path(BULK_KEEP_ROOT, root, allow_equal=True)
+            for root in self.directories
+        ):
+            QtWidgets.QMessageBox.warning(
+                self, "扫描范围不足",
+                "为确保另一份作品确实存在，请同时扫描完整的待删根和保留根：\n\n"
+                f"待删：{BULK_CLEANUP_ROOT}\n保留：{BULK_KEEP_ROOT}"
+            )
+            return
+        operation_id = (
+            datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            + "-" + secrets.token_hex(4)
+        )
+        worker = BulkDeleteWorker(
+            "precheck", self.duplicates, self.records, self.directories,
+            self.path_mapping.get("source_prefix", ""),
+            self.path_mapping.get("target_prefix", ""), operation_id,
+        )
+        self._begin_task(
+            worker,
+            f"正在检查全部 {len(self.duplicates)} 个重复组的安全删除条件，暂不删除任何文件",
+        )
+
+    def _handle_bulk_stage(self, result: dict):
+        if self.closing_requested:
+            return
+        phase = result.get("phase")
+        if phase == "precheck":
+            if not result.get("success"):
+                QtWidgets.QMessageBox.warning(
+                    self, "批量预检未完成",
+                    str(result.get("error", "预检被中断"))
+                    + f"\n\n审计日志：{self.merge_log_file}",
+                )
+                return
+            batch = result.get("batch")
+            if batch:
+                self._confirm_bulk_cleanup(batch)
+            return
+        if phase == "execute":
+            outcome = result.get("outcome") or {}
+            error = result.get("error") or outcome.get("error", "")
+            deleted = outcome.get("deleted", [])
+            skipped = outcome.get("skipped_runtime", [])
+            stopped = result.get("stopped", False) or outcome.get("stopped", False)
+            message = (
+                f"计划 {outcome.get('total_plans', 0)} 项，成功删除 {len(deleted)} 项，"
+                f"执行中跳过 {len(skipped)} 项。"
+                + ("\n用户已请求停止。" if stopped else "")
+                + (f"\n异常：{error}" if error else "")
+                + f"\n\n预览：{outcome.get('preview_path', '')}"
+                + f"\n审计日志：{self.merge_log_file}"
+                + "\n\n请核对日志；删除 115/CD2 挂载视频不保证可恢复。"
+            )
+            self._set_status(message.replace("\n", "  "))
+            if error or stopped:
+                QtWidgets.QMessageBox.warning(self, "批量清理中止 / 部分完成", message)
+            else:
+                QtWidgets.QMessageBox.information(self, "批量清理完成", message)
+            # 删完重新扫描；不依赖旧列表复用已被删除的条目。
+            if deleted and not self.closing_requested:
+                QtCore.QTimer.singleShot(0, self.start_scan)
+
+    def _confirm_bulk_cleanup(self, batch: dict):
+        """两级确认：全量文本清单 -> 手工输入确认词。"""
+        if self._task_active() or self.closing_requested:
+            return
+        ready = len(batch["plans"])
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("批量清理预览 - 真实 115/CD2 视频将被永久删除")
+        dialog.resize(1050, 700)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        explanation = QtWidgets.QLabel(
+            f"全部重复组 {batch['all_groups']}，其中命中待删目录 {batch['matched_groups']} 组；"
+            f"可整删 {ready} 项，跳过 {len(batch['skipped'])} 项。\n"
+            "必须逐行核对。仅删除 D 盘指定 STRM 作品目录 + 对应 115/CD2 源视频；"
+            "保留 Z 盘副本。\n"
+            f"视频删除间隔至少 {BULK_DELETE_DELAY_SECONDS:g} 秒。"
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        preview = QtWidgets.QPlainTextEdit(dialog)
+        preview.setReadOnly(True)
+        preview.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        preview.setPlainText(format_bulk_preview(batch))
+        layout.addWidget(preview, 1)
+        path_label = QtWidgets.QLabel(f"完整预检清单已保存到：{batch['preview_path']}")
+        path_label.setWordWrap(True)
+        layout.addWidget(path_label)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        buttons.rejected.connect(dialog.reject)
+        if ready:
+            proceed = buttons.addButton(
+                "已核对清单，进入最终确认",
+                QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole,
+            )
+            proceed.setObjectName("primary")
+            buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted or not ready:
+            self.writer.submit_merge_event(
+                batch["operation_id"], "BULK_CONFIRM_CANCELLED",
+                preview_path=batch["preview_path"], planned=ready,
+            )
+            self._set_status("批量清理已取消：预检未执行任何删除")
+            return
+        word, accepted = QtWidgets.QInputDialog.getText(
+            self, "最终确认：删除 115 网盘真实视频",
+            f"将永久删除 {ready} 个 STRM 作品目录及其真实源视频。\n"
+            f"每次源视频删除之间间隔至少 {BULK_DELETE_DELAY_SECONDS:g} 秒。\n"
+            "115/CD2 删除可能直接影响云端原件，不进入 Windows 回收站。\n\n"
+            "如已核对所有真实视频路径，请输入：删除115源视频",
+            QtWidgets.QLineEdit.EchoMode.Normal,
+        )
+        if not accepted or word.strip() != "删除115源视频":
+            self.writer.submit_merge_event(
+                batch["operation_id"], "BULK_CONFIRM_CANCELLED",
+                reason="最终确认词未匹配或用户取消", planned=ready,
+            )
+            self._set_status("批量删除取消：最终确认词未匹配")
+            return
+        worker = BulkDeleteWorker(
+            "execute", self.duplicates, self.records, self.directories,
+            self.path_mapping.get("source_prefix", ""),
+            self.path_mapping.get("target_prefix", ""),
+            batch["operation_id"], confirmed_batch=batch,
+        )
+        self._begin_task(
+            worker, f"批量执行：计划删除 {ready} 项；115/CD2 每条间隔至少 3 秒，按停止可中断",
+        )
+
     def closeEvent(self, event: QtGui.QCloseEvent):
         if not self.close_save_requested:
             self.close_save_requested = True
@@ -3976,6 +4563,69 @@ class MergeDeleteWorker(QtCore.QThread):
                 )
             except OSError as log_error:
                 result["error"] += f"；审计日志无法写入：{log_error}"
+        self.outcome = result
+        self.result.emit(result)
+
+
+class BulkDeleteWorker(QtCore.QThread):
+    """后台批量预检或逐条删除；set(stop_event)=请求停止。"""
+
+    progress = QtCore.Signal(int, int, str)
+    result = QtCore.Signal(object)
+
+    def __init__(
+        self, phase: str, duplicates: dict[str, list[MediaEntry]],
+        records: list[MediaEntry], roots: list[str], from_prefix: str,
+        to_prefix: str, operation_id: str, confirmed_batch: dict | None = None,
+    ):
+        super().__init__()
+        self.phase = phase
+        self.duplicates = dict(duplicates)
+        self.records = list(records)
+        self.roots = list(roots)
+        self.from_prefix = from_prefix
+        self.to_prefix = to_prefix
+        self.operation_id = operation_id
+        self.confirmed_batch = confirmed_batch
+        self.stop_event = threading.Event()  # set() = 请求停止，退出后主线程清理
+        self.outcome = None
+
+    def stop(self):
+        self.stop_event.set()
+
+    def run(self):
+        result = {"phase": self.phase, "success": False, "error": "", "stopped": False}
+        try:
+            if self.phase == "precheck":
+                result["batch"] = precheck_bulk_cleanup(
+                    self.duplicates, self.records, self.roots,
+                    self.from_prefix, self.to_prefix, self.stop_event,
+                    self.progress.emit, operation_id=self.operation_id,
+                )
+            elif self.phase == "execute":
+                if not self.confirmed_batch:
+                    raise MergeDeleteBlocked("缺少最终确认的批量删除计划")
+                result["outcome"] = execute_bulk_cleanup(
+                    self.confirmed_batch, self.records, self.roots,
+                    self.from_prefix, self.to_prefix, self.stop_event,
+                    self.progress.emit,
+                )
+            else:
+                raise ValueError(f"不支持的批量任务阶段：{self.phase}")
+            result["success"] = True
+        except Interrupted:
+            result["stopped"] = True
+            result["error"] = "用户停止操作；未开始下一条删除"
+        except (MergeDeleteBlocked, OSError, ValueError) as error:
+            result["error"] = str(error)
+            try:
+                append_merge_delete_log(
+                    self.operation_id, "BULK_WORKER_FAILED", phase=self.phase,
+                    error=str(error),
+                )
+            except OSError as log_error:
+                result["error"] += f"；日志写入失败：{log_error}"
+        result["stopped"] = bool(result["stopped"] or self.stop_event.is_set())
         self.outcome = result
         self.result.emit(result)
 
