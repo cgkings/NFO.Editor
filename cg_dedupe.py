@@ -2731,14 +2731,12 @@ def _move_replace_folder(plan: dict, stop_event: threading.Event,
     cross_volume = (source_stat.st_dev != destination_stat.st_dev
                     or (source_drive and dest_drive and
                         source_drive.casefold() != dest_drive.casefold()))
-    staged = False
     old_renamed = False
     promoted = False
     source_removed = False
     try:
         if cross_volume:
             _copy_move_tree(source, stage, stop_event)
-            staged = True
         # 复制可能需要较长时间，真正替换前再次确认两边文件树没有变化。
         _verify_move_folder_plan(plan, plan["source_root"],
                                  plan["destination_root"], stop_event)
