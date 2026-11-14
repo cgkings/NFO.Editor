@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import datetime
+import faulthandler
 import hashlib
 import secrets
 import stat
@@ -23,7 +24,7 @@ import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -41,14 +42,22 @@ BULK_DELETE_DELAY_SECONDS = 3.0
 APP_TITLE = "大锤 NFO / STRM 多版本查重"
 
 
+# 外部版本函数和本地回退统一走一个签名，避免 Pylance 函数赋值类型冲突。
+_external_get_app_version: Callable[[str], str] | None = None
 try:
-    from nfo_version import get_app_version
+    from nfo_version import get_app_version as _imported_get_app_version
 except ModuleNotFoundError as error:
     if error.name != "nfo_version":
         raise
-    # 单文件交付时也能启动；原项目存在 nfo_version.py 时继续统一读取版本。
-    def get_app_version(_module: str) -> str:
+else:
+    _external_get_app_version = _imported_get_app_version
+
+
+def get_app_version(app_name: str) -> str:
+    if _external_get_app_version is None:
         return "9.8.5"
+    return _external_get_app_version(app_name)
+
 
 APP_VERSION = get_app_version("dedupe")
 
@@ -162,17 +171,23 @@ def application_dir() -> Path:
 
 
 def program_data_dir() -> Path:
-    """用户可写配置/缓存/审计日志始终位于 APPDATA 程序专属目录。
+    """便携模式：日志、SQLite 缓存和配置随 .py/.exe 同目录存放。
 
-    无论源码运行还是 PyInstaller EXE，均不写入安装位置或 _MEIPASS。
+    使用 application_dir 而非 sys._MEIPASS：onefile 的解压目录是临时目录。
+    如安装于 Program Files 等受保护目录，须将程序移到可写位置。
     """
+    return application_dir()
+
+
+def legacy_program_data_dir() -> Path:
+    """仅读取旧版 APPDATA 配置；新的可写文件不再存放在此。"""
     appdata = os.environ.get("APPDATA")
     base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
     return base / DATA_DIR_NAME
 
 
 def ensure_program_data_dir() -> Path:
-    """仅在后台线程创建 APPDATA 下的可写数据目录。"""
+    """在后台线程验证可执行文件或源码同级目录是否可写。"""
     directory = program_data_dir()
     try:
         directory.mkdir(parents=True, exist_ok=True)
@@ -182,8 +197,8 @@ def ensure_program_data_dir() -> Path:
         probe.unlink()
     except OSError as error:
         raise OSError(
-            f"APPDATA 中的数据目录不可写：{directory}\n"
-            "请检查当前 Windows 账户的 APPDATA 访问权限。"
+            f"程序所在目录不可写：{directory}\n"
+            "请将 .py/.exe 放在有写入权限的目录；缓存和日志需要保存在这里。"
         ) from error
     return directory
 
@@ -272,6 +287,17 @@ def extract_number(value: str | None) -> str:
     if match:
         return f"{match.group(1)}-{match.group(2)}"
 
+    # 部分系列使用单字母 N + 4 位序号，例如 N0780、N0946。
+    # 对此类明确形式单独识别，不放宽其他厂牌的字母要求。
+    match = re.search(r"(?<![A-Za-z0-9])N[-_. ]?(\d{4})(?![A-Za-z0-9])", value, re.I)
+    if match:
+        return f"N-{match.group(1)}"
+
+    # 加勒比等纯数字厂牌的四位前缀：4159-001。
+    match = re.search(r"(?<![A-Za-z0-9])(\d{4})[-_](\d{3})(?![A-Za-z0-9])", value)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+
     match = NUMERIC_PAIR_PATTERN.search(value)
     if match:
         return f"{match.group(1)}_{match.group(2)}"
@@ -316,7 +342,7 @@ def number_equivalence_key(code: str) -> str:
     if match:
         return f"FC2-PPV-{match.group(1)}"
 
-    match = re.fullmatch(r"(\d{5,9})[-_](\d{2,5})", code)
+    match = re.fullmatch(r"(\d{4,9})[-_](\d{2,5})", code)
     if match:
         # 保留两段数字的分界，避免不同分段的纯数字编号误碰撞。
         return f"NUM:{match.group(1)}_{match.group(2)}"
@@ -350,16 +376,18 @@ def number_equivalence_key(code: str) -> str:
 
 
 def filename_release_base_key(code: str) -> str:
-    """只供 NFO 配对：若文件名后缀为 U/C，可回退到无后缀的 NFO。
-
-    不能用于重复分组；ABC-123-A/B 始终被当作不同的番号。
-    """
+    """U/C 发行标记可回退到主番号；A/B 等真实区分后缀不合并。"""
     if not code:
         return ""
     base, delim, suffix = code.rpartition("-")
     if delim and suffix.upper() in RELEASE_SUFFIXES_FOR_NFO:
         return number_equivalence_key(base)
     return ""
+
+
+def duplicate_number_key(code: str) -> str:
+    """仅合并发行版 U/C 和无后缀番号；保留其他字母后缀的差异。"""
+    return filename_release_base_key(code) or number_equivalence_key(code)
 
 
 def preferred_number_label(entries: list[MediaEntry]) -> str:
@@ -553,11 +581,7 @@ def paired_nfo(
         known = extract_number(info.get("num")) or extract_number(ntpath.basename(path))
         if not movie_code or not known:
             return True
-        known_key = number_equivalence_key(known)
-        return (
-            number_equivalence_key(movie_code) == known_key
-            or filename_release_base_key(movie_code) == known_key
-        )
+        return duplicate_number_key(movie_code) == duplicate_number_key(known)
 
     if stem_index is None:
         exact_candidates = [
@@ -573,23 +597,18 @@ def paired_nfo(
         if number_index is None:
             number_candidates = [
                 path for path in nfo_paths
-                if number_equivalence_key(
+                if duplicate_number_key(
                     extract_number(parsed.get(path, {}).get("num"))
                     or extract_number(ntpath.basename(path))
-                ) in {
-                    number_equivalence_key(movie_code),
-                    filename_release_base_key(movie_code),
-                }
+                ) == duplicate_number_key(movie_code)
             ]
         else:
             # 兼容由旧代码构建的原始番号索引及新版等价键索引。
-            number_candidates = number_index.get(movie_code, [])
+            number_candidates = number_index.get(duplicate_number_key(movie_code), [])
+            if not number_candidates:
+                number_candidates = number_index.get(movie_code, [])
             if not number_candidates:
                 number_candidates = number_index.get(number_equivalence_key(movie_code), [])
-            if not number_candidates:
-                release_key = filename_release_base_key(movie_code)
-                if release_key:
-                    number_candidates = number_index.get(release_key, [])
         if len(number_candidates) > 1:
             # 如果一个目录同时有 NTK-670 和 300NTK-670 的 NFO，
             # 优先选择与文件名原始番号完全一致的 NFO，避免配错元数据。
@@ -645,7 +664,7 @@ def target_identity(target: str, kind: str | None = None) -> str:
 
 
 def version_groups(entries: list[MediaEntry]) -> list[list[MediaEntry]]:
-    """同源引用和同套多碟均合并；两种关系同时生效，避免假重复。"""
+    """按实际本地文件计数；CD1/CD2 同套归并，不因共享视频源漏掉重复 STRM。"""
     parent = list(range(len(entries)))
     seen = {}
 
@@ -656,7 +675,9 @@ def version_groups(entries: list[MediaEntry]) -> list[list[MediaEntry]]:
         return i
 
     for i, entry in enumerate(entries):
-        keys = [entry.distinct_version_key()]
+        # 两个不同路径的 STRM 即使指向同一视频，也需要列为重复文件。
+        # 但同套 CD1/CD2 仍只计一个版本。
+        keys = ["file:" + nt_key(entry.media_path)]
         if entry.edition_group:
             keys.append(entry.edition_group)
         for key in keys:
@@ -713,7 +734,7 @@ def group_duplicates(
     buckets: dict[str, list[MediaEntry]] = defaultdict(list)
     for entry in entries:
         if entry.code:
-            key = (number_equivalence_key(entry.code)
+            key = (duplicate_number_key(entry.code)
                    if mode != "系列" else entry.code)
             buckets[key].append(entry)
 
@@ -901,14 +922,14 @@ def read_scan_folder(job, snapshot, mode, source_prefix, mount_prefix, stop_even
         stem_index[ntpath.splitext(ntpath.basename(path))[0].casefold()].append(path)
         number = extract_number(parsed.get(path, {}).get("num")) or extract_number(ntpath.basename(path))
         if number:
-            number_index[number_equivalence_key(number)].append(path)
+            number_index[duplicate_number_key(number)].append(path)
     # 番号提取一次即可复用：避免大目录上反复执行多轮正则表达式。
     codes = set()
     all_media_coded = True
     for item in media_items:
         raw_code = extract_number(item.name)
         if raw_code:
-            codes.add(number_equivalence_key(raw_code))
+            codes.add(duplicate_number_key(raw_code))
         else:
             all_media_coded = False
     allow_fallback = len(media_items) == 1 or (
@@ -1291,13 +1312,13 @@ def append_unrecognized_scan_log(
 
     只追加真正未识别的记录。每条包含当前扫描时间、文件/NFO 路径、
     已缓存的 NFO 原始 num，以及当前识别规则未命中的原因。
-    完整扫描且有未识别记录时才创建日志；不向发布包写入任何用户数据。
+    完整扫描且有未识别记录时才创建日志。
     """
     unknown = [entry for entry in records if not entry.code]
     if not unknown:
         return ""
 
-    log_file = program_data_dir() / "logs" / "scan_unrecognized.jsonl"
+    log_file = program_data_dir() / "scan_unrecognized.jsonl"
     log_file.parent.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.datetime.now(
         datetime.timezone.utc
@@ -1337,7 +1358,7 @@ def json_load(path: Path) -> dict:
 
 
 def json_save(path: Path, value: dict):
-    """原子替换配置文件；调用方应确保 APPDATA 数据目录已创建。"""
+    """原子替换配置文件；调用方应确保程序数据目录可写。"""
     temp = path.with_name(path.name + f".{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1373,7 +1394,7 @@ class ConfigWriter(threading.Thread):
                 continue
             try:
                 if kind == "json" and path is not None:
-                    # 第一次点击扫描后才会有写入任务；目录创建在后台。
+                    # 目录创建/写入在后台，不阻塞 Qt 界面线程。
                     ensure_program_data_dir()
                     json_save(path, payload)
                 elif kind == "merge_event":
@@ -1450,8 +1471,8 @@ class MergeDeletePartial(MergeDeleteBlocked):
 
 
 def merge_delete_log_path() -> Path:
-    """合并删除审计日志：APPDATA/CGDedupe_Data/logs/merge_delete.jsonl。"""
-    return program_data_dir() / "logs" / "merge_delete.jsonl"
+    """合并删除审计日志：脚本或 EXE 同级 merge_delete.jsonl。"""
+    return program_data_dir() / "merge_delete.jsonl"
 
 
 def append_merge_delete_log(operation_id: str, stage: str, **data):
@@ -1553,6 +1574,7 @@ def check_folder_has_only_selected_media(
     other_media_example = ""
     trailer_count = 0
     trailer_example = ""
+    nfo_count = 0
 
     def fail_walk(error):
         raise MergeDeleteBlocked(f"不能完整读取待删目录，拒绝删除：{error}")
@@ -1593,6 +1615,8 @@ def check_folder_has_only_selected_media(
             if attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
                 raise MergeDeleteBlocked(f"目录中有重解析点文件，拒绝整目录删除：{target}")
             extension = os.path.splitext(name)[1].casefold()
+            if extension == ".nfo" and not is_trailer_filename(name):
+                nfo_count += 1
             if extension in MEDIA_EXTS:
                 key = nt_key(target)
                 if key in allowed:
@@ -1625,6 +1649,7 @@ def check_folder_has_only_selected_media(
         "other_media_example": other_media_example,
         "trailer_count": trailer_count,
         "trailer_example": trailer_example,
+        "nfo_count": nfo_count,
     }
 
 
@@ -2142,7 +2167,7 @@ def format_bulk_preview(batch: dict) -> str:
 
 
 def _save_bulk_preview(operation_id: str, content: str) -> str:
-    path = program_data_dir() / "logs" / f"bulk_preview_{operation_id}.txt"
+    path = program_data_dir() / f"bulk_preview_{operation_id}.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "x", encoding="utf-8", newline="\n") as handle:
         handle.write(content)
@@ -2349,7 +2374,10 @@ def execute_bulk_cleanup(
             )
             last_attempt_finished = time.monotonic()
             done = {"code": plan["code"], "source_video": plan["source_video"],
-                    "scrape_folder": plan["scrape_folder"], "steps": completed}
+                    "scrape_folder": plan["scrape_folder"], "steps": completed,
+                    "nfo_deleted": ((plan.get("scrape_folder_contents") or {}).get("nfo_count", 0)
+                                    if any(step.startswith("STRM 刮削目录：") for step in completed)
+                                    else 0)}
             outcome["deleted"].append(done)
             append_merge_delete_log(
                 operation_id, "BULK_ITEM_DONE", code=plan["code"],
@@ -2360,6 +2388,14 @@ def execute_bulk_cleanup(
             # 出现任何真实视频删除失败或部分完成，都立即停下整批，
             # 避免继续请求 115 并掩盖已发生的不可逆变化。
             outcome["error"] = f"{plan['code']}：{error}"
+            outcome["partial_steps"] = (
+                error.completed_steps if isinstance(error, MergeDeletePartial) else []
+            )
+            outcome["partial_nfo_deleted"] = (
+                (plan.get("scrape_folder_contents") or {}).get("nfo_count", 0)
+                if any(step.startswith("STRM 刮削目录：")
+                       for step in outcome["partial_steps"]) else 0
+            )
             append_merge_delete_log(
                 operation_id, "BULK_ABORTED", code=plan["code"],
                 error=outcome["error"],
@@ -2379,6 +2415,545 @@ def execute_bulk_cleanup(
     )
     return outcome
 
+
+# 批量移动覆盖：源/目标均由用户选择的扫描根目录限定。
+# 以重复番号匹配整套作品文件夹；整个目标作品目录由源目录替换。
+# STRM 只是文本指针，绝不删除或访问其指向的 115/CD2 真实视频。
+def validate_move_roots(source_root: str, destination_root: str,
+                        scanned_roots: list[str]) -> tuple[str, str]:
+    """源、目标只能选择上次扫描的两个独立根目录，不允许互相包含。"""
+    known = {nt_key(root) for root in scanned_roots}
+    choices = []
+    for label, value in (("源", source_root), ("目标", destination_root)):
+        root = os.path.normpath(str(value).strip())
+        if not root or not (ntpath.isabs(root) or (os.name != "nt" and os.path.isabs(root))):
+            raise MergeDeleteBlocked(f"请选择有效的{label}扫描目录")
+        if nt_key(root) not in known:
+            raise MergeDeleteBlocked(f"{label}目录不在最近一次扫描的根目录列表中：{root}")
+        if nt_key(root) == nt_key(ntpath.dirname(root)):
+            raise MergeDeleteBlocked(f"不能将盘符或共享根目录用作{label}目录：{root}")
+        choices.append(root)
+    source, destination = choices
+    if (is_nested_path(source, destination, allow_equal=True)
+            or is_nested_path(destination, source, allow_equal=True)):
+        raise MergeDeleteBlocked("源扫描目录和目标扫描目录不能相同或互相包含")
+    return source, destination
+
+
+def _move_folder_snapshot(folder: str) -> dict:
+    """记录完整文件树的路径及元数据；拒绝链接/junction，不打开视频内容。"""
+    guard_merge_path(folder, directory=True)
+    digest = hashlib.sha256()
+    counts = {"files": 0, "directories": 0, "nfo_count": 0,
+              "strm_count": 0, "video_count": 0, "bytes": 0}
+
+    def fail_walk(error):
+        raise MergeDeleteBlocked(f"无法完整访问作品目录：{error}")
+
+    for current, directories, names in os.walk(
+        folder, topdown=True, followlinks=False, onerror=fail_walk,
+    ):
+        guard_merge_path(current, directory=True)
+        directories.sort(key=str.casefold)
+        names.sort(key=str.casefold)
+        relative = os.path.relpath(current, folder)
+        digest.update(("D|" + nt_key(relative) + "\n").encode("utf-8"))
+        counts["directories"] += 1
+        if counts["directories"] > 2000:
+            raise MergeDeleteBlocked("作品文件夹超过 2000 个子目录，拒绝批量覆盖")
+        for name in directories:
+            guard_merge_path(os.path.join(current, name), directory=True)
+        for name in names:
+            path = os.path.join(current, name)
+            st = guard_merge_path(path, directory=False)
+            counts["files"] += 1
+            if counts["files"] > 100000:
+                raise MergeDeleteBlocked("作品文件夹超过 10 万个文件，拒绝批量覆盖")
+            counts["bytes"] += st.st_size
+            relative = os.path.relpath(path, folder)
+            digest.update((
+                f"F|{nt_key(relative)}|{st.st_size}|{st.st_mtime_ns}|"
+                f"{st.st_dev}|{st.st_ino}\n"
+            ).encode("utf-8"))
+            ext = os.path.splitext(name)[1].casefold()
+            if ext == ".nfo" and not is_trailer_filename(name):
+                counts["nfo_count"] += 1
+            if ext == ".strm" and not is_trailer_filename(name):
+                counts["strm_count"] += 1
+            if ext in VIDEO_EXTS and not is_trailer_filename(name):
+                counts["video_count"] += 1
+    counts["fingerprint"] = digest.hexdigest()
+    return counts
+
+
+def _folder_code_index(records: list[MediaEntry], roots: tuple[str, str]):
+    """线性建立每个作品目录含有哪些番号；防止误移动含其他作品的目录。"""
+    index = defaultdict(set)
+    folder_rows = defaultdict(list)
+    for entry in records:
+        if not entry.media_path:
+            continue
+        relevant_root = next((root for root in roots
+                              if is_nested_path(entry.folder, root)), None)
+        if relevant_root is None:
+            continue
+        key = duplicate_number_key(entry.code) if entry.code else "(未识别)"
+        parent = entry.folder
+        while is_nested_path(parent, relevant_root):
+            folder_key = nt_key(parent)
+            index[folder_key].add(key)
+            folder_rows[folder_key].append(entry)
+            ancestor = ntpath.dirname(parent)
+            if nt_key(ancestor) == nt_key(parent):
+                break
+            parent = ancestor
+    return index, folder_rows
+
+
+def _move_source_relative_strm_safe(records: list[MediaEntry], folder: str) -> None:
+    """相对 STRM 若指向目录外，移动后可能失效，宁可跳过。"""
+    for entry in records:
+        if (entry.media_type != "STRM"
+                or not is_nested_path(entry.media_path, folder)):
+            continue
+        raw = entry.raw_target.strip().strip('"').strip("'")
+        if not raw:
+            continue
+        is_absolute = (ANY_URI.match(raw) or WINDOWS_DRIVE.match(raw)
+                       or raw.startswith(("/", "\\")))
+        if not is_absolute and not is_nested_path(entry.target, folder):
+            raise MergeDeleteBlocked(
+                f"存在指向文件夹外的相对 STRM，移动后可能失效：{entry.media_path}"
+            )
+
+
+def precheck_bulk_move(
+    duplicates: dict[str, list[MediaEntry]], records: list[MediaEntry],
+    roots: list[str], from_prefix: str, to_prefix: str,
+    stop_event: threading.Event, notify: Callable[[int, int, str], None],
+    *, operation_id: str, source_root: str, destination_root: str,
+) -> dict:
+    """后台预检：指定两侧根目录，按重复番号唯一匹配作品文件夹。"""
+    source_root, destination_root = validate_move_roots(
+        source_root, destination_root, roots,
+    )
+    append_merge_delete_log(
+        operation_id, "MOVE_FOLDER_PRECHECK_START", source_root=source_root,
+        destination_root=destination_root, groups=len(duplicates),
+    )
+    code_index, folder_rows = _folder_code_index(records, (source_root, destination_root))
+    groups = sorted(duplicates.items(), key=lambda pair: number_sort_key(pair[0]))
+    plans, skipped = [], []
+    matched = 0
+    for index, (code, group) in enumerate(groups, 1):
+        check_merge_stop(stop_event)
+        source_rows = [e for e in group if e.media_type in ("STRM", "视频")
+                       and is_nested_path(e.folder, source_root)]
+        dest_rows = [e for e in group if e.media_type in ("STRM", "视频")
+                     and is_nested_path(e.folder, destination_root)]
+        if not source_rows or not dest_rows:
+            if index % 50 == 0 or index == len(groups):
+                notify(index, max(1, len(groups)),
+                       f"作品文件夹预检 {index}/{len(groups)}；可选 {len(plans)}，跳过 {len(skipped)}")
+            continue
+        matched += 1
+        try:
+            source_folders = {nt_key(e.folder): e.folder for e in source_rows}
+            dest_folders = {nt_key(e.folder): e.folder for e in dest_rows}
+            if len(source_folders) != 1:
+                raise MergeDeleteBlocked("源侧该番号存在多个作品文件夹，无法唯一确定来源")
+            if len(dest_folders) != 1:
+                raise MergeDeleteBlocked("目标侧该番号存在多个作品文件夹，无法唯一确定覆盖位置")
+            source_folder = next(iter(source_folders.values()))
+            dest_folder = next(iter(dest_folders.values()))
+            code_key = duplicate_number_key(code)
+            if code_index[nt_key(source_folder)] != {code_key}:
+                raise MergeDeleteBlocked("源作品目录包含其他或无法识别的番号，不能整目录移动")
+            if code_index[nt_key(dest_folder)] != {code_key}:
+                raise MergeDeleteBlocked("目标作品目录包含其他或无法识别的番号，不能整目录覆盖")
+            if is_nested_path(source_folder, dest_folder, allow_equal=True) or (
+                is_nested_path(dest_folder, source_folder, allow_equal=True)
+            ):
+                raise MergeDeleteBlocked("源和目标作品目录有包含关系")
+            guard_merge_ancestor_links(source_folder, stop_event)
+            guard_merge_ancestor_links(dest_folder, stop_event)
+            _move_source_relative_strm_safe(
+                folder_rows[nt_key(source_folder)], source_folder,
+            )
+            source_snapshot = _move_folder_snapshot(source_folder)
+            dest_snapshot = _move_folder_snapshot(dest_folder)
+            if not source_snapshot["files"] or not dest_snapshot["files"]:
+                raise MergeDeleteBlocked("源或目标作品文件夹为空，拒绝自动覆盖")
+            plans.append({
+                "code": code, "source_folder": source_folder,
+                "destination_folder": dest_folder,
+                "source_snapshot": source_snapshot,
+                "destination_snapshot": dest_snapshot,
+            })
+        except (OSError, ValueError, MergeDeleteBlocked) as error:
+            skipped.append({"code": code, "reason": str(error)})
+        if index % 50 == 0 or index == len(groups):
+            notify(index, max(1, len(groups)),
+                   f"作品文件夹预检 {index}/{len(groups)}；可选 {len(plans)}，跳过 {len(skipped)}")
+    # 一个作品目录在整批中只能作为一次源或目标；冲突组全部跳过。
+    usage = defaultdict(int)
+    for plan in plans:
+        usage[nt_key(plan["source_folder"])] += 1
+        usage[nt_key(plan["destination_folder"])] += 1
+    valid = []
+    for plan in plans:
+        if any(usage[nt_key(plan[field])] != 1
+               for field in ("source_folder", "destination_folder")):
+            skipped.append({"code": plan["code"],
+                            "reason": "作品文件夹被多个重复组引用，无法一对一覆盖"})
+        else:
+            valid.append(plan)
+    batch = {"operation_id": operation_id, "source_root": source_root,
+             "destination_root": destination_root, "group_count": len(groups),
+             "matched_groups": matched, "plans": valid, "skipped": skipped}
+    preview = format_bulk_move_preview(batch)
+    path = program_data_dir() / f"move_preview_{operation_id}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "x", encoding="utf-8", newline="\n") as stream:
+        stream.write(preview)
+        stream.flush()
+        os.fsync(stream.fileno())
+    batch["preview_path"] = str(path)
+    append_merge_delete_log(
+        operation_id, "MOVE_FOLDER_PRECHECK_DONE",
+        source_root=source_root, destination_root=destination_root,
+        matched_groups=matched, ready=len(valid), skipped=len(skipped),
+        preview_path=str(path),
+    )
+    return batch
+
+
+def format_bulk_move_preview(batch: dict) -> str:
+    lines = [
+        "批量移动覆盖 · 作品文件夹预览（未执行）", "=" * 74,
+        f"源扫描目录：{batch['source_root']}",
+        f"目标扫描目录：{batch['destination_root']}",
+        f"重复组 {batch['group_count']}，两侧匹配 {batch['matched_groups']}，",
+        f"可选作品文件夹 {len(batch['plans'])}，跳过 {len(batch['skipped'])}。",
+        "操作：将源作品文件夹移动到目标作品文件夹原来的完整路径。",
+        "覆盖含义：整个目标文件夹原有内容都会被源文件夹内容替换，",
+        "包括目标原有 NFO、封面、字幕及 STRM；不是合并文件，也不是只覆盖 STRM。",
+        "源文件夹中的所有文件和子目录随文件夹一起移动。",
+        "只操作扫描根目录内的本地作品文件夹；不碰 STRM 指向的 115/CD2 云端原视频。",
+        "执行时旧目标目录暂存为备份，异常则尽量回滚；成功后清理备份。", "",
+        "一、可执行的匹配作品文件夹", "-" * 74,
+    ]
+    for number, plan in enumerate(batch["plans"], 1):
+        src = plan["source_snapshot"]
+        dst = plan["destination_snapshot"]
+        lines.extend([
+            f"[{number}] {plan['code']}",
+            f"  源目录：{plan['source_folder']}",
+            f"  替换目标：{plan['destination_folder']}",
+            f"  源文件：{src['files']} 个，源 NFO：{src['nfo_count']} 个",
+            f"  目标旧文件：{dst['files']} 个，目标旧 NFO：{dst['nfo_count']} 个",
+            "  目标旧目录中的全部内容都将被替换（并非按同名文件合并）。", "",
+        ])
+    lines.extend(["二、跳过项目", "-" * 74])
+    for item in batch["skipped"]:
+        lines.append(f"{item['code']} | {item['reason']}")
+    return "\n".join(lines) + "\n"
+
+
+def _verify_move_folder_plan(plan: dict, source_root: str, destination_root: str,
+                             stop_event: threading.Event):
+    source = plan["source_folder"]
+    destination = plan["destination_folder"]
+    check_merge_stop(stop_event)
+    if not is_nested_path(source, source_root) or not is_nested_path(destination, destination_root):
+        raise MergeDeleteBlocked("作品文件夹不在已选定的源/目标扫描根目录下")
+    if is_nested_path(source, destination, allow_equal=True) or (
+        is_nested_path(destination, source, allow_equal=True)
+    ):
+        raise MergeDeleteBlocked("源/目标作品文件夹有包含关系，拒绝覆盖")
+    guard_merge_ancestor_links(source, stop_event)
+    guard_merge_ancestor_links(destination, stop_event)
+    for label, folder, snapshot_key in (
+        ("源", source, "source_snapshot"),
+        ("目标", destination, "destination_snapshot"),
+    ):
+        current = _move_folder_snapshot(folder)
+        if current["fingerprint"] != plan[snapshot_key]["fingerprint"]:
+            raise MergeDeleteBlocked(f"{label}作品文件夹在预览后发生变化，跳过并重新预检：{folder}")
+
+
+class MoveReplacePartial(MergeDeleteBlocked):
+    """目录交换发生变更但未彻底完成；必须停止整批并同步受影响目录。"""
+
+    def __init__(self, message: str, *, changed: bool = False):
+        super().__init__(message)
+        self.changed = changed
+
+
+def _copy_move_tree(source: str, stage: str, stop_event: threading.Event):
+    """跨卷复制到目标所在卷临时目录，检查每一个子目录和文件的链接状态。"""
+    os.mkdir(stage)
+    def fail_walk(error):
+        raise MergeDeleteBlocked(f"复制时无法完整读取来源：{error}")
+    for current, directories, names in os.walk(
+        source, topdown=True, followlinks=False, onerror=fail_walk,
+    ):
+        check_merge_stop(stop_event)
+        guard_merge_path(current, directory=True)
+        relative = os.path.relpath(current, source)
+        new_parent = stage if relative == "." else os.path.join(stage, relative)
+        os.makedirs(new_parent, exist_ok=True)
+        for name in directories:
+            check_merge_stop(stop_event)
+            guard_merge_path(os.path.join(current, name), directory=True)
+        for name in names:
+            check_merge_stop(stop_event)
+            current_file = os.path.join(current, name)
+            guard_merge_path(current_file, directory=False)
+            shutil.copy2(current_file, os.path.join(new_parent, name))
+
+
+def _move_replace_folder(plan: dict, stop_event: threading.Event,
+                         operation_id: str) -> dict:
+    """目标先更名为同级备份；同卷更名，跨卷先复制后切换；失败尽可能恢复。"""
+    source = plan["source_folder"]
+    destination = plan["destination_folder"]
+    parent = os.path.dirname(destination)
+    token = secrets.token_hex(7)
+    backup = os.path.join(parent, f".cg_backup_{token}")
+    stage = os.path.join(parent, f".cg_stage_{token}")
+    if os.path.lexists(backup) or os.path.lexists(stage):
+        raise MergeDeleteBlocked("临时备份/暂存目录发生冲突，已取消")
+    check_merge_stop(stop_event)
+    source_stat = guard_merge_path(source, directory=True)
+    destination_stat = guard_merge_path(destination, directory=True)
+    source_drive, dest_drive = ntpath.splitdrive(source)[0], ntpath.splitdrive(destination)[0]
+    cross_volume = (source_stat.st_dev != destination_stat.st_dev
+                    or (source_drive and dest_drive and
+                        source_drive.casefold() != dest_drive.casefold()))
+    staged = False
+    old_renamed = False
+    promoted = False
+    source_removed = False
+    try:
+        if cross_volume:
+            _copy_move_tree(source, stage, stop_event)
+            staged = True
+        # 复制可能需要较长时间，真正替换前再次确认两边文件树没有变化。
+        _verify_move_folder_plan(plan, plan["source_root"],
+                                 plan["destination_root"], stop_event)
+        check_merge_stop(stop_event)
+        append_merge_delete_log(operation_id, "MOVE_FOLDER_SWAP_START",
+                                source=source, destination=destination,
+                                backup=backup, staging=stage if cross_volume else "",
+                                cross_volume=cross_volume)
+        os.rename(destination, backup)
+        old_renamed = True
+        try:
+            os.rename(stage if cross_volume else source, destination)
+            promoted = True
+            source_removed = not cross_volume
+        except OSError as swap_error:
+            try:
+                os.rename(backup, destination)
+                old_renamed = False
+            except OSError as restore_error:
+                raise MoveReplacePartial(
+                    f"新目录未能移动，旧目标目录回滚也失败；"
+                    f"旧目标暂存在 {backup}，请人工处理：{restore_error}", changed=True,
+                ) from swap_error
+            raise MergeDeleteBlocked(f"移动文件夹失败，已恢复目标旧目录：{swap_error}") from swap_error
+        # 交换完成后，不再受停止事件中断；确保删除/日志收尾有机会完成。
+        try:
+            append_merge_delete_log(operation_id, "MOVE_FOLDER_PROMOTED",
+                                    source=source, destination=destination,
+                                    backup=backup, cross_volume=cross_volume)
+        except OSError as error:
+            raise MoveReplacePartial(
+                f"目标目录已被替换，但写入操作日志失败；旧目标暂存在 {backup}：{error}",
+                changed=True,
+            ) from error
+        warnings = []
+        if cross_volume:
+            try:
+                shutil.rmtree(source)
+                source_removed = True
+            except OSError as error:
+                raise MoveReplacePartial(
+                    f"目标已经替换为源文件夹副本，但跨卷删除源目录未完成：{source}；{error}。"
+                    f"目标旧内容暂存在 {backup}。已停止后续项目。", changed=True,
+                ) from error
+        try:
+            # 不再使用旧目标目录，确保只能删除此次明确预检过的目标备份。
+            shutil.rmtree(backup)
+            old_renamed = False
+        except OSError as error:
+            warnings.append(f"目标覆盖已完成，但旧目录备份清理失败：{backup}；{error}")
+        return {"source_removed": source_removed, "warnings": warnings,
+                "backup": backup if warnings else ""}
+    finally:
+        if os.path.lexists(stage):
+            try:
+                shutil.rmtree(stage)
+            except OSError as error:
+                # 最少写下残留位置，避免下一次扫描误把临时目录当作作品。
+                try:
+                    append_merge_delete_log(operation_id, "MOVE_STAGE_CLEANUP_FAILED",
+                                            staging=stage, error=str(error))
+                except OSError as audit_error:
+                    if sys.stderr is not None:
+                        print(f"暂存目录清理失败：{stage}；{error}；日志：{audit_error}",
+                              file=sys.stderr)
+        # 未交换成功的情况下，旧目标应仍位于其原来的路径；兜底回滚。
+        if old_renamed and not promoted and not os.path.lexists(destination):
+            try:
+                os.rename(backup, destination)
+            except OSError:
+                pass
+
+
+def _refresh_move_scopes(plans: list[dict], from_prefix: str, to_prefix: str,
+                         notify: Callable[[int, int, str], None]) -> dict:
+    """只重新读取本次操作实际触及的作品文件夹，不重扫两万个目录。"""
+    all_records = []
+    errors = []
+    old_nfo_count = sum(
+        plan["source_snapshot"]["nfo_count"] + plan["destination_snapshot"]["nfo_count"]
+        for plan in plans
+    )
+    paths = list(dict.fromkeys(
+        path for plan in plans
+        for path in (plan["source_folder"], plan["destination_folder"])
+    ))
+    unchanged_event = threading.Event()  # 此阶段只是校正结果，不受已请求的 stop 干扰
+    cache_rows = []
+    new_nfo_count = 0
+    for index, path in enumerate(paths, 1):
+        if os.path.isdir(path):
+            # 每个作品目录单独遍历，避免 unique_scan_roots 对大量路径进行 O(N²) 去重。
+            for job in iter_scan_folders([path], unchanged_event, errors):
+                new_nfo_count += sum(not is_trailer_filename(item.name) for item in job[1])
+                fresh, changed, _hits, _reads, notices = read_scan_folder(
+                    job, {}, "番号", from_prefix, to_prefix, unchanged_event,
+                )
+                all_records.extend(fresh)
+                cache_rows.extend(changed)
+                errors.extend(notices)
+        elif os.path.lexists(path):
+            errors.append(f"作品目录仍存在，但不是可扫描文件夹：{path}")
+        if index % 5 == 0 or index == len(paths):
+            notify(index, max(1, len(paths)),
+                   f"正在更新已移动作品的列表 {index}/{len(paths)}（不重扫其他目录）")
+    if cache_rows:
+        try:
+            cache = LocalTextCache(program_data_dir() / "nfo_cache.sqlite3")
+            try:
+                cache.store_many(cache_rows)
+            finally:
+                cache.close()
+        except (OSError, sqlite3.Error) as error:
+            errors.append(f"已移动文件的缓存写入失败：{error}")
+    return {"scopes": paths, "records": all_records,
+            "old_nfo_count": old_nfo_count, "new_nfo_count": new_nfo_count,
+            "errors": errors[:25]}
+
+
+def execute_bulk_move(
+    batch: dict, records: list[MediaEntry], roots: list[str],
+    from_prefix: str, to_prefix: str, stop_event: threading.Event,
+    notify: Callable[[int, int, str], None],
+) -> dict:
+    """逐个交换完整作品文件夹；每项完成后才开始下一项。"""
+    operation_id = batch["operation_id"]
+    source_root, destination_root = validate_move_roots(
+        batch["source_root"], batch["destination_root"], roots,
+    )
+    plans = list(batch["selected_plans"])
+    all_folders = [nt_key(plan[key]) for plan in plans
+                   for key in ("source_folder", "destination_folder")]
+    if len(all_folders) != len(set(all_folders)):
+        raise MergeDeleteBlocked("所选文件夹在多条移动计划之间冲突，整批禁止执行")
+    for plan in plans:
+        if not is_nested_path(plan["source_folder"], source_root) or (
+            not is_nested_path(plan["destination_folder"], destination_root)
+        ):
+            raise MergeDeleteBlocked("预览清单中的源或目标目录超出了最终选定的根目录")
+    outcome = {"moved": [], "skipped": [], "error": "", "stopped": False,
+               "source_root": source_root, "destination_root": destination_root,
+               "total": len(plans), "preview_path": batch["preview_path"],
+               "refresh": {}, "warnings": []}
+    affected = []
+    append_merge_delete_log(
+        operation_id, "MOVE_FOLDER_EXECUTE_START",
+        source_root=source_root, destination_root=destination_root, selected=len(plans),
+    )
+    for number, plan in enumerate(plans, 1):
+        if stop_event.is_set():
+            outcome["stopped"] = True
+            break
+        current = dict(plan)
+        current["source_root"] = source_root
+        current["destination_root"] = destination_root
+        try:
+            _verify_move_folder_plan(current, source_root, destination_root, stop_event)
+            notify(number - 1, len(plans), f"正在移动作品文件夹 {number}/{len(plans)}：{plan['code']}")
+            result = _move_replace_folder(current, stop_event, operation_id)
+            affected.append(plan)
+            completed = {"code": plan["code"], "source_folder": plan["source_folder"],
+                         "destination_folder": plan["destination_folder"]}
+            outcome["moved"].append(completed)
+            if result["warnings"]:
+                outcome["warnings"].extend(result["warnings"])
+                outcome["error"] = "；".join(result["warnings"])
+            append_merge_delete_log(
+                operation_id, "MOVE_FOLDER_ITEM_DONE", **completed,
+                warnings=result["warnings"],
+            )
+            notify(number, len(plans),
+                   f"已移动 {len(outcome['moved'])}/{len(plans)} 个作品文件夹")
+            if result["warnings"]:
+                break  # 旧备份清理失败时停止后续项
+        except Interrupted:
+            outcome["stopped"] = True
+            break
+        except MoveReplacePartial as error:
+            if error.changed:
+                affected.append(plan)
+            outcome["error"] = f"{plan['code']}：{error}"
+            try:
+                append_merge_delete_log(operation_id, "MOVE_FOLDER_PARTIAL",
+                                        code=plan["code"], reason=str(error))
+            except OSError as log_error:
+                outcome["error"] += f"；无法写入部分完成日志：{log_error}"
+            break
+        except (MergeDeleteBlocked, OSError, ValueError) as error:
+            outcome["error"] = f"{plan['code']}：{error}"
+            try:
+                append_merge_delete_log(operation_id, "MOVE_FOLDER_ITEM_FAILED",
+                                        code=plan["code"], reason=str(error))
+            except OSError as log_error:
+                outcome["error"] += f"；审计日志写入失败：{log_error}"
+            break
+    # 即使用户在途中按停止，也要把已完成的文件夹更新到 UI，避免显示过期路径。
+    if affected:
+        try:
+            outcome["refresh"] = _refresh_move_scopes(
+                affected, from_prefix, to_prefix, notify,
+            )
+        except (MergeDeleteBlocked, OSError, ValueError) as error:
+            outcome["error"] += f"；局部刷新失败，须人工检查受影响目录：{error}"
+    outcome["stopped"] = outcome["stopped"] or stop_event.is_set()
+    try:
+        append_merge_delete_log(
+            operation_id,
+            "MOVE_FOLDER_STOPPED" if outcome["stopped"] else
+            ("MOVE_FOLDER_INCOMPLETE" if outcome["error"] else "MOVE_FOLDER_FINISHED"),
+            moved=outcome["moved"], error=outcome["error"],
+            warnings=outcome["warnings"],
+        )
+    except OSError as log_error:
+        outcome["error"] += f"；最终审计日志写入失败：{log_error}"
+    return outcome
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -2408,7 +2983,7 @@ class ScanWorker(QtCore.QThread):
 
     def run(self):
         try:
-            # 首次扫描时创建用户数据目录：GUI 线程绝不进行磁盘写入。
+            # 验证脚本或 EXE 所在目录可写：GUI 线程不执行磁盘写入。
             ensure_program_data_dir()
             if self.stop_event.is_set():
                 return
@@ -2703,6 +3278,78 @@ class FolderOpenWorker(QtCore.QThread):
         self.opened.emit(opened_count, manager)
 
 
+class BulkMoveSelectionModel(QtCore.QAbstractTableModel):
+    """可筛选、可勾选的整个作品文件夹移动计划。"""
+
+    count_changed = QtCore.Signal(int)
+    HEADERS = ("执行", "番号", "源作品文件夹（移走）", "目标作品文件夹（整体覆盖）", "文件数量：源 / 目标旧")
+
+    def __init__(self, plans, parent=None):
+        super().__init__(parent)
+        self.plans = list(plans)
+        self.checked = [True] * len(plans)
+
+    def rowCount(self, parent=QtCore.QModelIndex()):
+        return 0 if parent.isValid() else len(self.plans)
+
+    def columnCount(self, parent=QtCore.QModelIndex()):
+        return 0 if parent.isValid() else len(self.HEADERS)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
+            return self.HEADERS[section]
+        return None
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not (0 <= index.row() < len(self.plans)):
+            return None
+        column = index.column()
+        if column == 0 and role == Qt.ItemDataRole.CheckStateRole:
+            return Qt.CheckState.Checked if self.checked[index.row()] else Qt.CheckState.Unchecked
+        plan = self.plans[index.row()]
+        values = (
+            "", plan["code"], plan["source_folder"], plan["destination_folder"],
+            f"{plan['source_snapshot']['files']} / {plan['destination_snapshot']['files']}",
+        )
+        if role == Qt.ItemDataRole.DisplayRole:
+            return values[column]
+        if role == Qt.ItemDataRole.ToolTipRole and column > 0:
+            return values[column]
+        return None
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        flags = Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
+        if index.column() == 0:
+            flags |= Qt.ItemFlag.ItemIsUserCheckable
+        return flags
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
+        if not index.isValid() or index.column() != 0 or role != Qt.ItemDataRole.CheckStateRole:
+            return False
+        checked = value == Qt.CheckState.Checked or value == Qt.CheckState.Checked.value
+        if self.checked[index.row()] == checked:
+            return False
+        self.checked[index.row()] = checked
+        self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole])
+        self.count_changed.emit(sum(self.checked))
+        return True
+
+    def select_rows(self, rows, checked):
+        changed = False
+        for row in rows:
+            if 0 <= row < len(self.checked) and self.checked[row] != checked:
+                self.checked[row] = checked
+                changed = True
+        if changed and self.checked:
+            self.dataChanged.emit(self.index(0, 0), self.index(len(self.checked) - 1, 0),
+                                  [Qt.ItemDataRole.CheckStateRole])
+            self.count_changed.emit(sum(self.checked))
+
+    def selected_plans(self):
+        return [plan for plan, checked in zip(self.plans, self.checked) if checked]
+
 class NfoDuplicateFinder(QtWidgets.QWidget):
     """主窗口：继续使用原 cg_dedupe.py 的 PySide6，保留番号/系列、目录配置、查重。"""
 
@@ -2721,12 +3368,15 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self._storage_active = self.data_dir.is_dir()
         self.settings_file = self.data_dir / "settings.json"
         self.cache_file = self.data_dir / "video_index.sqlite3"
-        self.merge_log_file = self.data_dir / "logs" / "merge_delete.jsonl"
-        # 兼容旧版放在程序旁的配置；下次扫描会写到 APPDATA，旧文件不修改。
+        self.merge_log_file = self.data_dir / "merge_delete.jsonl"
+        # 读取旧位置的设置，不改动旧文件；保存时统一写到 .py/.exe 同级。
         legacy_settings = application_dir() / DATA_DIR_NAME / "settings.json"
-        self.settings = json_load(
-            self.settings_file if self.settings_file.is_file() else legacy_settings
+        appdata_settings = legacy_program_data_dir() / "settings.json"
+        settings_source = next(
+            (candidate for candidate in (self.settings_file, legacy_settings, appdata_settings)
+             if candidate.is_file()), self.settings_file,
         )
+        self.settings = json_load(settings_source)
         # 从旧版本继承已有的纯路径映射，不发起任何网络属性请求。
         legacy_mapping = self.settings.pop("webdav", {})
         legacy_mapping = legacy_mapping if isinstance(legacy_mapping, dict) else {}
@@ -2765,6 +3415,14 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self._render_groups = []
         self._loaded_groups = set()
         self._render_saved_id = None
+        # 分组仍默认全部展开。子项通过单个 Qt 定时器分批生成，
+        # 不为数千个分组同时创建数千个独立定时任务。
+        self._child_jobs = deque()
+        self._child_pending_codes = set()
+        self._child_render_timer = QtCore.QTimer(self)
+        self._child_render_timer.setSingleShot(True)
+        self._child_render_timer.timeout.connect(self._render_children_queue)
+        self._group_header_brush = QtGui.QBrush(QtGui.QColor(COLORS["pale"]))
         self.folder_worker = None
         self._current_probe_stats = {}
 
@@ -2780,7 +3438,55 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             f"数据目录：{self.data_dir}"
             + ("" if self._storage_active else "（首次扫描后自动生成）")
         )
+        # 仅 Qt 主线程负责心跳；后台监视器只在 GUI 连续 12 秒无法响应
+        # 时写入 Python 各线程堆栈，便于区分 Qt 绘制和磁盘/网络阻塞。
+        # 所有线程停止 Event 的语义统一为 set() = 请求停止。
+        self._last_gui_heartbeat = time.monotonic()
+        self._gui_watchdog_stop = threading.Event()
+        self._gui_heartbeat_timer = QtCore.QTimer(self)
+        self._gui_heartbeat_timer.setInterval(400)
+        self._gui_heartbeat_timer.timeout.connect(self._gui_heartbeat)
+        self._gui_heartbeat_timer.start()
+        self._gui_watchdog = threading.Thread(
+            target=self._watch_gui_responsiveness,
+            name="CGDedupe-GuiWatchdog", daemon=False,
+        )
+        self._gui_watchdog.start()
         QtCore.QTimer.singleShot(0, self._center_window)
+
+    def _gui_heartbeat(self):
+        """此方法由 Qt 主事件循环调用；只更新时间戳，不做任何磁盘 I/O。"""
+        self._last_gui_heartbeat = time.monotonic()
+
+    def _watch_gui_responsiveness(self):
+        """监视 GUI 事件循环是否长时间不运行，只在后台写卡顿诊断。"""
+        reported = False
+        while not self._gui_watchdog_stop.wait(1.0):
+            blocked_for = time.monotonic() - self._last_gui_heartbeat
+            if blocked_for < 12.0:
+                reported = False
+                continue
+            if reported:
+                continue
+            reported = True
+            path = program_data_dir() / "gui_freeze_trace.log"
+            try:
+                with open(path, "a", encoding="utf-8", newline="\n") as out:
+                    out.write(
+                        f"\n{'=' * 72}\n"
+                        f"{datetime.datetime.now().astimezone().isoformat()} "
+                        f"GUI 无响应约 {blocked_for:.1f} 秒；版本 {APP_VERSION}\n"
+                        f"Python: {sys.version.splitlines()[0]}\n"
+                    )
+                    faulthandler.dump_traceback(file=out, all_threads=True)
+                    out.flush()
+                if sys.stderr is not None:
+                    print(f"[CGDedupe] 检测到 GUI 停顿，线程堆栈已写入 {path}",
+                          file=sys.stderr, flush=True)
+            except (OSError, RuntimeError) as error:
+                if sys.stderr is not None:
+                    print(f"[CGDedupe] GUI 停顿日志写入失败：{error}",
+                          file=sys.stderr, flush=True)
 
     def _load_app_icon(self):
         """同一 ICO 用于 EXE、主窗口、任务栏；无需生成 PNG 文件。
@@ -2831,7 +3537,9 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.setWindowTitle(f"{APP_TITLE}  v{APP_VERSION}")
         self.resize(1520, 860)
         self.setMinimumSize(1090, 650)
-        self._load_app_icon()
+        # 不在 Windows 运行时向 Qt 注入 ICO/QPixmap：设置窗口图标会进入
+        # qt_imageToWinHBITMAP/CreateDIBSection，部分系统返回无效窗口句柄。
+        # 打包图标交给 PyInstaller --icon 处理，避免运行时的 GDI 转换。
         self.setStyleSheet(f"""
             QWidget {{
                 font-family: "Microsoft YaHei UI", "Segoe UI";
@@ -2915,7 +3623,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         summary = QtWidgets.QHBoxLayout()
         summary.setSpacing(7)
         self.stat_labels = []
-        for name in ("扫描条目", "重复作品", "独立版本"):
+        for name in ("扫描条目", "重复作品", "重复文件/套"):
             card = QtWidgets.QFrame()
             card.setObjectName("stat")
             card.setFixedHeight(44)
@@ -3015,6 +3723,12 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             "从本地缓存恢复无需访问 CD2；结果显示在番号组的「已读 X/Y」、分辨率和帧率列。"
         )
         self.bulk_delete_btn = QtWidgets.QPushButton("⚠ 批量清理重复项")
+        self.bulk_move_btn = QtWidgets.QPushButton("批量移动覆盖")
+        self.bulk_move_btn.setToolTip(
+            "从本次扫描根目录中选择源和目标；按重复番号匹配唯一的作品文件夹。"
+            "可筛选勾选，将源整个作品文件夹移动到目标旧路径并整体替换原目录。"
+            "目标旧 NFO/封面/STRM 也将被替换；不会访问 115/CD2 视频源。"
+        )
         self.bulk_delete_btn.setToolTip(
             "从已扫描的目录中分别选择「待删目录」和「保留目录」。"
             "仅处理待删根下重复 STRM 所在的安全作品目录；"
@@ -3050,6 +3764,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         toolbar.addWidget(self.info_btn)
         toolbar.addWidget(self.bulk_btn)
         toolbar.addWidget(self.bulk_delete_btn)
+        toolbar.addWidget(self.bulk_move_btn)
         toolbar.addWidget(QtWidgets.QLabel("探测并发"))
         toolbar.addWidget(self.concurrent_spin)
         toolbar.addWidget(self.refresh_check)
@@ -3061,7 +3776,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.tree = QtWidgets.QTreeWidget()
         self.tree.setColumnCount(13)
         self.tree.setHeaderLabels([
-            "番号 / 版本", "版本数", "重复文件路径", "分辨率", "帧率",
+            "番号 / 版本", "文件/套数", "重复文件路径", "分辨率", "帧率",
             "编码", "大小", "时长",
             "播放", "文件夹", "操作", "视频源路径", "类型",
         ])
@@ -3087,7 +3802,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             "单击「播放」启动 mpvnet；Ctrl+A 选中已加载行，"
             "也可用「读取全部重复视频」批量处理当前结果。"
         )
-        widths = [190, 58, 400, 105, 95, 78, 83, 74, 76, 86, 68, 340, 66]
+        widths = [190, 58, 400, 105, 95, 78, 83, 74, 76, 86, 68, 340, 123]
         for index, width in enumerate(widths):
             self.tree.setColumnWidth(index, width)
         # Stretch 模式会锁定该列宽度；统一改为可拖拽的 Interactive。
@@ -3095,15 +3810,9 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.tree.header().setSectionResizeMode(
             self.COL["path"], QtWidgets.QHeaderView.ResizeMode.Interactive
         )
-        self.play_icon = self.style().standardIcon(
-            QtWidgets.QStyle.StandardPixmap.SP_MediaPlay
-        )
-        self.folder_icon = self.style().standardIcon(
-            QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon
-        )
-        self.action_icon = self.style().standardIcon(
-            QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView
-        )
+        # 不调用 Windows 原生 QStyle.standardIcon 作为每条记录的图标；
+        # 在海量树节点中反复绘制 Windows HBITMAP 可能造成句柄/绘制压力。
+        # 播放、打开、更多按钮仍由文字列和点击事件实现。
         main.addWidget(self.tree, 1)
 
         footer = QtWidgets.QHBoxLayout()
@@ -3137,6 +3846,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.info_btn.clicked.connect(self.get_video_info)
         self.bulk_btn.clicked.connect(self.get_all_video_info)
         self.bulk_delete_btn.clicked.connect(self.start_bulk_cleanup_precheck)
+        self.bulk_move_btn.clicked.connect(self.start_bulk_move_precheck)
         self.concurrent_spin.valueChanged.connect(self._save_settings)
         self.refresh_check.toggled.connect(self._refresh_toggle_changed)
         self.fastplay_check.toggled.connect(self._fastplay_toggle_changed)
@@ -3263,7 +3973,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         )
 
     def choose_directory(self):
-        # 首次扫描之前选择仅保存在内存；扫描时写入 APPDATA 数据目录。
+        # 首次扫描之前选择仅保存在内存；扫描后保存到程序旁 settings.json。
         # 让原生对话框处理路径有效性；不要先在 GUI 线程 stat 可能离线的挂载盘。
         initial = self.last_directory or str(Path.home())
         selected = QtWidgets.QFileDialog.getExistingDirectory(
@@ -3336,6 +4046,10 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             not busy and bool(self.duplicates) and self._last_scan_mode == "番号"
             and bool(self._completed_scan_roots)
         )
+        self.bulk_move_btn.setEnabled(
+            not busy and bool(self.duplicates) and self._last_scan_mode == "番号"
+            and self.field_combo.currentText() == "番号" and bool(self._completed_scan_roots)
+        )
         self.concurrent_spin.setEnabled(not busy)
         self.refresh_check.setEnabled(not busy)
         self.fastplay_check.setEnabled(not self.closing_requested)
@@ -3385,6 +4099,13 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self._render_groups = []
         self._loaded_groups.clear()
         self.filter_timer.stop()
+        # 新一轮全库扫描不沿用旧搜索词，避免结果已找到但被旧过滤条件隐藏。
+        filter_blocker = QtCore.QSignalBlocker(self.filter_input)
+        self.filter_input.clear()
+        del filter_blocker
+        self._child_render_timer.stop()
+        self._child_jobs.clear()
+        self._child_pending_codes.clear()
         self.records = []
         self.duplicates = {}
         self.records_by_id = {}
@@ -3424,10 +4145,16 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
                 self.rows_by_target[key].append(entry)
         self.render_results()
         unknown = sum(not e.code for e in self.records)
+        total_duplicate_groups = len(self.duplicates)
+        visible_groups = len(self._render_groups)
+        visibility = (
+            f"（当前显示 {visible_groups} 组；检查‘至少’与筛选条件）"
+            if visible_groups != total_duplicate_groups else ""
+        )
         message = (
             f"扫描完成（{time.monotonic() - self._scan_started_at:.2f}秒）："
             f"NFO {nfo_count}，STRM {strm_count}，视频 {video_count}，"
-            f"重复 {len(self.duplicates)} 组，番号未识别 {unknown}"
+            f"重复 {total_duplicate_groups} 组{visibility}，番号未识别 {unknown}"
         )
         message += (
             f"；NFO 缓存命中 {cache_hits} / 本次解析 {cache_parsed}"
@@ -3460,7 +4187,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
                 f"快速查重中：已遍历 {current:,} 个目录，已读取 {total:,} 个 NFO"
             )
             return
-        if isinstance(self.worker, BulkDeleteWorker):
+        if isinstance(self.worker, (BulkDeleteWorker, BulkMoveWorker)):
             self.progress.setRange(0, max(1, total))
             self.progress.setValue(min(current, max(1, total)))
             if label:
@@ -3484,8 +4211,10 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         was_probe = isinstance(source, ProbeWorker)
         was_merge = isinstance(source, MergeDeleteWorker)
         was_bulk_delete = isinstance(source, BulkDeleteWorker)
+        was_bulk_move = isinstance(source, BulkMoveWorker)
         merge_outcome = source.outcome if was_merge else None
         bulk_outcome = source.outcome if was_bulk_delete else None
+        move_outcome = source.outcome if was_bulk_move else None
         source.stop_event.clear()  # worker ended; clear Event for any later task
         source.deleteLater()
         self.worker = None
@@ -3512,9 +4241,13 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             QtCore.QTimer.singleShot(
                 0, lambda response=bulk_outcome: self._handle_bulk_stage(response)
             )
+        elif was_bulk_move and move_outcome is not None:
+            QtCore.QTimer.singleShot(
+                0, lambda response=move_outcome: self._handle_bulk_move_stage(response)
+            )
 
     def render_results(self):
-        """分批创建分组并默认全部展开；版本行分批加载，避免 UI 长时间卡顿。"""
+        """所有重复组默认展开；分组和媒体子行均分批插入，避免阻塞 UI。"""
         if not hasattr(self, "tree") or self.closing_requested:
             return
         selected = self.tree.currentItem()
@@ -3548,6 +4281,9 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
 
         self._render_token += 1
         token = self._render_token
+        self._child_render_timer.stop()
+        self._child_jobs.clear()
+        self._child_pending_codes.clear()
         self._render_offset = 0
         self._render_groups = groups
         self._loaded_groups = set()
@@ -3563,40 +4299,64 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.stat_labels[0].setText(
             f"{self.scan_counts[0]} / {self.scan_counts[1]} / {self.scan_counts[2]}"
         )
-        self.stat_labels[1].setText(str(len(groups)))
+        total_groups = len(self.duplicates)
+        visible_groups = len(groups)
+        self.stat_labels[1].setText(
+            str(visible_groups) if visible_groups == total_groups
+            else f"{visible_groups} / {total_groups}"
+        )
+        self.stat_labels[1].setToolTip(
+            f"已识别重复组 {total_groups}；当前筛选显示 {visible_groups}。"
+            f"\n至少重复数：{minimum}；搜索词：{query or '无'}"
+        )
         self.stat_labels[2].setText(str(versions_total))
-        QtCore.QTimer.singleShot(0, lambda: self._render_group_batch(token))
+        if not groups and self.duplicates:
+            notice = QtWidgets.QTreeWidgetItem(self.tree)
+            notice.setText(0, "已发现重复，但当前筛选未显示任何组")
+            notice.setText(
+                self.COL["path"],
+                f"总计 {total_groups} 组；当前至少 {minimum} 套，"
+                f"搜索词：{query or '无'}。请清空搜索词或把‘至少’调至 2。",
+            )
+            notice.setData(0, Qt.ItemDataRole.UserRole, {"kind": "notice"})
+        else:
+            # 当前可见组（特别是 5 组这种小结果）立即开始显示，
+            # 剩余大量结果仍由后续时间片处理，不等待后台回调。
+            self._render_group_batch(token)
 
     def _render_group_batch(self, token: int):
         if token != self._render_token or self.closing_requested:
             return
+        # 单次最多 35 组、约 9ms；分组一创建就默认展开，
+        # 子行进入统一队列分批插入，而不是一次性构建上万行。
         start = self._render_offset
-        end = min(start + 100, len(self._render_groups))
+        end = min(start + 35, len(self._render_groups))
+        deadline = time.monotonic() + 0.009
+        actual_end = start
         self.tree.setUpdatesEnabled(False)
         try:
-            for code, _entries, count in self._render_groups[start:end]:
+            for code, entries, count in self._render_groups[start:end]:
                 root = QtWidgets.QTreeWidgetItem(self.tree)
                 root.setText(0, code)
                 root.setText(1, str(count))
                 aliases = sorted(
-                    {entry.code for entry in _entries if entry.code},
+                    {entry.code for entry in entries if entry.code},
                     key=number_sort_key,
                 )
                 if len(aliases) > 1:
                     root.setToolTip(
                         0, "等价番号（原始番号均保留）：\n"
-                        + "\n".join(aliases)
+                        + "\n".join(aliases[:20])
+                        + (f"\n……另有 {len(aliases) - 20} 个" if len(aliases) > 20 else "")
                         + "\n\n仅供查重参考；永久删除前请确认实际视频内容。"
                     )
-                unique_dirs = unique_group_folders(self.duplicates.get(code, []))
+                unique_dirs = unique_group_folders(entries)
                 root.setText(self.COL["open_folder"], "全部")
-                root.setIcon(self.COL["open_folder"], self.folder_icon)
                 root.setToolTip(
                     self.COL["open_folder"],
                     f"单击打开本组 {len(unique_dirs)} 个不同文件夹"
                 )
                 root.setText(self.COL["actions"], "更多")
-                root.setIcon(self.COL["actions"], self.action_icon)
                 root.setData(
                     0, Qt.ItemDataRole.UserRole, {"kind": "group", "code": code}
                 )
@@ -3606,23 +4366,25 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
                 font.setBold(True)
                 root.setFont(0, font)
                 for col in range(self.tree.columnCount()):
-                    root.setBackground(col, QtGui.QBrush(QtGui.QColor(COLORS["pale"])))
-                # 先保留占位项，再自动展开。itemExpanded 会触发
-                # _group_expanded()，使用现有的定时分批加载，界面不需要逐组点击。
+                    root.setBackground(col, self._group_header_brush)
                 placeholder = QtWidgets.QTreeWidgetItem(root)
-                placeholder.setText(0, "正在加载全部版本…")
-                placeholder.setData(0, Qt.ItemDataRole.UserRole, {"kind": "placeholder"})
+                placeholder.setText(0, "正在分批加载本组版本…")
+                placeholder.setData(
+                    0, Qt.ItemDataRole.UserRole, {"kind": "placeholder"}
+                )
+                # 用户原本的设计：所有重复组默认展开，无需逐组点击。
+                # 信号回调可能同步触发；_child_pending_codes 防止重复入队。
                 root.setExpanded(True)
-                # 即使某些 Qt 环境没有立即发出 itemExpanded，也主动加载；
-                # _loaded_groups 会拦截重复信号，不会产生重复子项。
                 self._group_expanded(root)
+                actual_end += 1
+                if time.monotonic() >= deadline:
+                    break
         finally:
             self.tree.setUpdatesEnabled(True)
-        self._render_offset = end
-        if end < len(self._render_groups):
-            QtCore.QTimer.singleShot(1, lambda: self._render_group_batch(token))
+        self._render_offset = actual_end
+        if actual_end < len(self._render_groups):
+            QtCore.QTimer.singleShot(12, lambda: self._render_group_batch(token))
         else:
-            # 所有分组在逐批创建时已经自动展开，不限制前 8 组。
             self._selection_changed()
 
     def _update_group_summary(self, code: str):
@@ -3650,7 +4412,8 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             root.setToolTip(
                 2,
                 "本组扫描到的重复视频/STRM 文件路径：\n"
-                + "\n".join(media_paths)
+                + "\n".join(media_paths[:25])
+                + (f"\n……其余 {len(media_paths) - 25} 条请展开查看" if len(media_paths) > 25 else "")
                 + f"\n\n探测进度：已读 {len(checked)}/{total}"
                 + (f"；缓存 {cached}" if cached else ""),
             )
@@ -3672,18 +4435,22 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         root.setForeground(2, QtGui.QBrush(QtGui.QColor(color)))
 
     def _group_expanded(self, group_item: QtWidgets.QTreeWidgetItem):
+        """自动/手动展开同一路径：子项统一入队，避免数千个 QTimer 竞争。"""
         data = group_item.data(0, Qt.ItemDataRole.UserRole)
         if not isinstance(data, dict) or data.get("kind") != "group":
             return
         code = data.get("code", "")
-        if code in self._loaded_groups:
+        if code in self._loaded_groups or code in self._child_pending_codes:
             return
-        self._loaded_groups.add(code)
+        # 在首条真实子行插入前保留占位项，避免 QTreeWidget 在短暂的
+        # "0 个子项" 状态下收回展开箭头，导致自动展开状态意外丢失。
+        has_placeholder = False
         if group_item.childCount():
-            first = group_item.child(0)
-            first_data = first.data(0, Qt.ItemDataRole.UserRole)
-            if isinstance(first_data, dict) and first_data.get("kind") == "placeholder":
-                group_item.takeChild(0)
+            first_data = group_item.child(0).data(0, Qt.ItemDataRole.UserRole)
+            has_placeholder = (
+                isinstance(first_data, dict) and first_data.get("kind") == "placeholder"
+            )
+        resume_offset = group_item.childCount() - (1 if has_placeholder else 0)
         entries = sorted(
             self.duplicates.get(code, []),
             key=lambda entry: (
@@ -3692,41 +4459,67 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
                 ntpath.basename(entry.media_path).casefold(),
             ),
         )
-        token = self._render_token
-        QtCore.QTimer.singleShot(
-            0, lambda: self._render_child_batch(token, group_item, entries, 0)
-        )
-
-    def _render_child_batch(
-        self, token: int, root: QtWidgets.QTreeWidgetItem,
-        entries: list[MediaEntry], offset: int
-    ):
-        if token != self._render_token or self.closing_requested:
+        if resume_offset >= len(entries):
+            self._loaded_groups.add(code)
             return
+        self._child_pending_codes.add(code)
+        self._child_jobs.append((self._render_token, group_item, code, entries, resume_offset))
+        if not self._child_render_timer.isActive():
+            self._child_render_timer.start(0)
+
+    def _render_children_queue(self):
+        """单个定时器公平地分片填充所有已展开的组，Qt 绘制仍在主线程。"""
+        if self.closing_requested:
+            return
+        deadline = time.monotonic() + 0.008
+        rows_added = 0
         self.tree.setUpdatesEnabled(False)
         try:
-            end = min(offset + 140, len(entries))
-            for entry in entries[offset:end]:
-                child = QtWidgets.QTreeWidgetItem(root)
-                child.setData(
-                    0, Qt.ItemDataRole.UserRole,
-                    {"kind": "media", "id": entry.identifier}
-                )
-                child.setText(
-                    0, ntpath.basename(entry.folder) or ntpath.basename(entry.media_path)
-                )
-                if entry.disc is not None:
-                    child.setText(0, child.text(0) + f" · CD{entry.disc}")
-                self.tree_items[entry.identifier] = child
-                self._set_entry_cells(child, entry)
-                if self._render_saved_id == entry.identifier:
-                    self.tree.setCurrentItem(child)
+            while self._child_jobs and rows_added < 60:
+                token, root, code, entries, offset = self._child_jobs.popleft()
+                if token != self._render_token or not root.isExpanded():
+                    self._child_pending_codes.discard(code)
+                    continue
+                # 每次仅服务少量子行后轮换到另一组，防止大组独占界面。
+                limit = min(offset + 16, len(entries))
+                while offset < limit and rows_added < 60:
+                    entry = entries[offset]
+                    child = QtWidgets.QTreeWidgetItem(root)
+                    # 确保任何时刻父组至少有一个子项；首条媒体就位后
+                    # 再移除占位项，后续追加不会引起树结构塌缩。
+                    if root.childCount() >= 2:
+                        first_data = root.child(0).data(0, Qt.ItemDataRole.UserRole)
+                        if (isinstance(first_data, dict)
+                                and first_data.get("kind") == "placeholder"):
+                            root.takeChild(0)
+                    child.setData(
+                        0, Qt.ItemDataRole.UserRole,
+                        {"kind": "media", "id": entry.identifier}
+                    )
+                    child.setText(
+                        0, ntpath.basename(entry.folder) or ntpath.basename(entry.media_path)
+                    )
+                    if entry.disc is not None:
+                        child.setText(0, child.text(0) + f" · CD{entry.disc}")
+                    self.tree_items[entry.identifier] = child
+                    self._set_entry_cells(child, entry)
+                    if self._render_saved_id == entry.identifier:
+                        self.tree.setCurrentItem(child)
+                    offset += 1
+                    rows_added += 1
+                    if time.monotonic() >= deadline:
+                        break
+                if offset < len(entries):
+                    self._child_jobs.append((token, root, code, entries, offset))
+                else:
+                    self._child_pending_codes.discard(code)
+                    self._loaded_groups.add(code)
+                if time.monotonic() >= deadline:
+                    break
         finally:
             self.tree.setUpdatesEnabled(True)
-        if end < len(entries):
-            QtCore.QTimer.singleShot(
-                1, lambda: self._render_child_batch(token, root, entries, end)
-            )
+        if self._child_jobs and not self.closing_requested:
+            self._child_render_timer.start(12)
 
     def _set_entry_cells(self, item: QtWidgets.QTreeWidgetItem, entry: MediaEntry):
         info = entry.info
@@ -3742,7 +4535,10 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             item.setToolTip(
                 2, f"仅有 NFO 元数据：{entry.media_path}\n状态：{entry.info_status}"
             )
-        item.setText(self.COL["type"], entry.media_type)
+        media_label = entry.media_type
+        if entry.media_type in ("STRM", "视频"):
+            media_label += " · 有NFO" if entry.nfo_path else " · 单文件"
+        item.setText(self.COL["type"], media_label)
         item.setText(self.COL["quality"], str(info.get("resolution") or "—"))
         item.setText(self.COL["fps"], str(info.get("fps") or "—"))
         item.setText(self.COL["codec"], str(info.get("codec") or "—"))
@@ -3750,14 +4546,10 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         item.setText(self.COL["duration"], human_duration(info.get("duration")))
         if entry.target_kind in ("path", "url"):
             item.setText(self.COL["play"], "播放")
-            item.setIcon(self.COL["play"], self.play_icon)
         else:
             item.setText(self.COL["play"], "—")
-            item.setIcon(self.COL["play"], QtGui.QIcon())
         item.setText(self.COL["open_folder"], "打开")
-        item.setIcon(self.COL["open_folder"], self.folder_icon)
         item.setText(self.COL["actions"], "更多")
-        item.setIcon(self.COL["actions"], self.action_icon)
         item.setText(self.COL["source"], entry.target or entry.media_path)
         item.setToolTip(
             self.COL["source"], f"{entry.target or entry.media_path}\n{entry.info_status}"
@@ -4213,6 +5005,79 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             ),
         )
 
+    def _apply_incremental_changes(
+        self, *, completed_steps=(), moved_paths=(), replacements=(), nfo_deleted_count=0,
+    ) -> int:
+        """只调整本次扫描的内存记录及树视图，绝不再次遍历两万个目录。"""
+        from bisect import bisect_right
+        removed_files = {nt_key(path) for path in moved_paths}
+        removed_folders = []
+        for step in completed_steps:
+            if "：" not in step:
+                continue
+            label, path = step.split("：", 1)
+            if label in ("真实视频单文件", "STRM 单文件", "视频单文件"):
+                removed_files.add(nt_key(path))
+            elif label in ("STRM 刮削目录", "视频所在文件夹"):
+                removed_folders.append(path)
+        updates = {item["destination_id"]: item for item in replacements}
+        if not removed_files and not removed_folders and not updates:
+            return 0
+        folder_prefixes = sorted({nt_key(folder).rstrip("\\/") + "\\"
+                                  for folder in removed_folders})
+
+        def folder_was_removed(path_key):
+            if not folder_prefixes:
+                return False
+            index = bisect_right(folder_prefixes, path_key) - 1
+            return index >= 0 and path_key.startswith(folder_prefixes[index])
+
+        retained = []
+        removed_ids = set()
+        removed_rows = []
+        for entry in self.records:
+            key = nt_key(entry.media_path)
+            deleted = key in removed_files or folder_was_removed(key)
+            if deleted:
+                removed_rows.append(entry)
+                removed_ids.add(entry.identifier)
+                continue
+            updated = updates.get(entry.identifier)
+            if updated:
+                old_identity = target_identity(entry.target, entry.target_kind)
+                entry.raw_target = updated["raw"]
+                entry.target = updated["target"]
+                entry.target_kind = updated["kind"]
+                if old_identity != target_identity(entry.target, entry.target_kind):
+                    entry.info = {}
+                entry.info_status = "移动覆盖后已更新（未重新扫描）"
+            elif entry.target_kind == "path" and nt_key(entry.target) in removed_files:
+                entry.info = {}
+                entry.info_status = "源视频已被删除；STRM 仍在，须人工核查"
+            retained.append(entry)
+        self.records = retained
+        self.records_by_id = {entry.identifier: entry for entry in retained}
+        # 保留之前的精确/系列匹配组合；只剔除已成功删除的条目。
+        updated_groups = {}
+        for code, group in self.duplicates.items():
+            current = [row for row in group if row.identifier not in removed_ids]
+            if version_count(current) >= 2:
+                updated_groups[code] = current
+        self.duplicates = updated_groups
+        self.rows_by_target = defaultdict(list)
+        for entry in retained:
+            if entry.target and entry.target_kind in ("path", "url"):
+                self.rows_by_target[target_identity(entry.target, entry.target_kind)].append(entry)
+        self.scan_counts = (
+            max(0, self.scan_counts[0] - int(nfo_deleted_count)),
+            max(0, self.scan_counts[1] - sum(e.media_type == "STRM" for e in removed_rows)),
+            max(0, self.scan_counts[2] - sum(e.media_type == "视频" for e in removed_rows)),
+        )
+        # render_results 只更新 QTreeWidget，不执行 scan_library 或磁盘 I/O。
+        self.render_results()
+        self._update_buttons()
+        return len(removed_rows)
+
     def _handle_merge_stage(self, result: dict):
         """QThread 已结束；才在主线程弹出确认对话框。"""
         if self.closing_requested:
@@ -4233,7 +5098,17 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
                 "若出现部分删除，请按日志人工核对。"
             )
             if phase == "execute":
-                QtCore.QTimer.singleShot(0, self.start_scan)
+                plan = result.get("plan") or {}
+                finished = result.get("completed", [])
+                nfo_deleted = (
+                    ((plan.get("scrape_folder_contents") or {}).get("nfo_count", 0)
+                     if plan.get("media_type") == "STRM" else
+                     (plan.get("video_folder_contents") or {}).get("nfo_count", 0))
+                    if any("目录：" in item for item in finished) else 0
+                )
+                self._apply_incremental_changes(
+                    completed_steps=finished, nfo_deleted_count=nfo_deleted,
+                )
             return
         if phase == "precheck":
             plan = result.get("plan")
@@ -4250,8 +5125,18 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
                 self, "合并删除完成",
                 "操作步骤：\n" + "\n".join(completed)
                 + f"\n\n日志：\n{log_file}"
+                + "\n\n查重列表已经同步更新，无需重新扫描。"
             )
-            QtCore.QTimer.singleShot(0, self.start_scan)
+            plan = result.get("plan") or {}
+            nfo_deleted = (
+                ((plan.get("scrape_folder_contents") or {}).get("nfo_count", 0)
+                 if plan.get("media_type") == "STRM" else
+                 (plan.get("video_folder_contents") or {}).get("nfo_count", 0))
+                if any("目录：" in item for item in completed) else 0
+            )
+            self._apply_incremental_changes(
+                completed_steps=completed, nfo_deleted_count=nfo_deleted,
+            )
 
     def _confirm_merge_plan(self, plan: dict):
         """预检通过后仅弹出一次是/否确认，不要求键入字符。"""
@@ -4467,9 +5352,15 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
                 QtWidgets.QMessageBox.warning(self, "批量清理中止 / 部分完成", message)
             else:
                 QtWidgets.QMessageBox.information(self, "批量清理完成", message)
-            # 删完重新扫描；不依赖旧列表复用已被删除的条目。
-            if deleted and not self.closing_requested:
-                QtCore.QTimer.singleShot(0, self.start_scan)
+            # 批量完成或部分完成都根据实际成功步骤更新内存，不重扫硬盘。
+            steps = [step for done in deleted for step in done.get("steps", [])]
+            steps.extend(outcome.get("partial_steps", []))
+            nfo_deleted = sum(done.get("nfo_deleted", 0) for done in deleted)
+            nfo_deleted += outcome.get("partial_nfo_deleted", 0)
+            if steps:
+                self._apply_incremental_changes(
+                    completed_steps=steps, nfo_deleted_count=nfo_deleted,
+                )
 
     def _confirm_bulk_cleanup(self, batch: dict):
         """两级确认：全量文本清单 -> 手工输入确认词。"""
@@ -4544,11 +5435,303 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             worker, f"批量执行：计划删除 {ready} 项；115/CD2 每条间隔至少 3 秒，按停止可中断",
         )
 
+    def start_bulk_move_precheck(self):
+        """先指定已扫描的源/目标根目录，再按重复番号核查整个作品文件夹。"""
+        if self._task_active() or self.closing_requested:
+            return
+        if (self._last_scan_mode != "番号" or self.field_combo.currentText() != "番号"
+                or not self._completed_scan_roots
+                or tuple(map(nt_key, self.directories)) !=
+                tuple(map(nt_key, self._completed_scan_roots))):
+            QtWidgets.QMessageBox.warning(
+                self, "请先按番号完成扫描",
+                "移动覆盖只支持本次按番号扫描所得的重复组；目录更改后需重新扫描。",
+            )
+            return
+        roots = list(self._completed_scan_roots)
+        if len(roots) < 2:
+            QtWidgets.QMessageBox.warning(
+                self, "至少需要两个扫描目录",
+                "请先扫描至少两个相互独立的根目录，分别选择来源和覆盖目标。",
+            )
+            return
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("批量移动覆盖 - 选择源目录和目标目录")
+        dialog.setMinimumWidth(770)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        message = QtWidgets.QLabel(
+            f"本次扫描发现 {len(self.duplicates)} 个重复番号组。\n"
+            "从已扫描的根目录中选择「源」与「目标」，两个目录必须不同且不嵌套。\n"
+            "每个番号只在两侧分别唯一定位到一个作品文件夹时才会进入预览。"
+        )
+        message.setWordWrap(True)
+        layout.addWidget(message)
+        form = QtWidgets.QFormLayout()
+        source_combo = QtWidgets.QComboBox(dialog)
+        dest_combo = QtWidgets.QComboBox(dialog)
+        source_combo.addItem("— 请选择要移动的源扫描目录 —", "")
+        dest_combo.addItem("— 请选择接收覆盖的目标扫描目录 —", "")
+        for root in roots:
+            source_combo.addItem(root, root)
+            dest_combo.addItem(root, root)
+        source_combo.setMinimumWidth(540)
+        dest_combo.setMinimumWidth(540)
+        form.addRow("源目录（要移走的作品）：", source_combo)
+        form.addRow("目标目录（被覆盖的作品）：", dest_combo)
+        layout.addLayout(form)
+        note = QtWidgets.QLabel(
+            "⚠ 覆盖是整个作品文件夹替换：目标旧目录内的 STRM、NFO、封面、字幕等"
+            "都会被源目录的内容替换，而不是两边合并。源文件夹移到目标旧路径。\n"
+            "不会删除或修改 STRM 所指向的 115/CD2 真实视频；先预检、勾选、最终确认才执行。"
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setText("开始作品文件夹预检")
+        def accept_roots():
+            try:
+                validate_move_roots(
+                    source_combo.currentData() or "",
+                    dest_combo.currentData() or "", roots,
+                )
+            except MergeDeleteBlocked as error:
+                QtWidgets.QMessageBox.warning(dialog, "目录选择无效", str(error))
+                return
+            dialog.accept()
+        buttons.accepted.connect(accept_roots)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        source_root = str(source_combo.currentData())
+        destination_root = str(dest_combo.currentData())
+        operation_id = (datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                        + "-" + secrets.token_hex(4))
+        worker = BulkMoveWorker(
+            "precheck", self.duplicates, self.records, roots,
+            self.path_mapping.get("source_prefix", ""),
+            self.path_mapping.get("target_prefix", ""), operation_id,
+            source_root=source_root, destination_root=destination_root,
+        )
+        self._begin_task(
+            worker,
+            f"预检作品文件夹：源 {source_root} → 目标 {destination_root}",
+        )
+
+    def _apply_scoped_move_refresh(self, refresh: dict) -> int:
+        """仅用后台读出的受影响作品目录结果替换内存记录，绝不重新扫描全库。"""
+        from bisect import bisect_right
+        paths = refresh.get("scopes", [])
+        if not paths:
+            return 0
+        prefixes = sorted({nt_key(path).rstrip("\\/") + "\\" for path in paths})
+        def affected(path: str) -> bool:
+            normalized = nt_key(path)
+            index = bisect_right(prefixes, normalized) - 1
+            return index >= 0 and normalized.startswith(prefixes[index])
+        old_infos = {}
+        retained = []
+        removed = []
+        for entry in self.records:
+            if affected(entry.media_path):
+                removed.append(entry)
+                if entry.info.get("verified"):
+                    old_infos[target_identity(entry.target, entry.target_kind)] = (
+                        dict(entry.info), entry.info_status,
+                    )
+            else:
+                retained.append(entry)
+        last_id = max((item.identifier for item in self.records), default=0)
+        fresh = list(refresh.get("records", []))
+        for entry in fresh:
+            last_id += 1
+            entry.identifier = last_id
+            previous = old_infos.get(target_identity(entry.target, entry.target_kind))
+            if previous:
+                entry.info = dict(previous[0])
+                entry.info_status = previous[1]
+        self.records = retained + fresh
+        self.records_by_id = {entry.identifier: entry for entry in self.records}
+        # 仅在内存中重新匹配番号，复杂度随记录数线性增长，不进行全目录扫描。
+        self.duplicates = group_duplicates(self.records, mode="番号")
+        self.rows_by_target = defaultdict(list)
+        for entry in self.records:
+            if entry.target and entry.target_kind in ("path", "url"):
+                self.rows_by_target[target_identity(entry.target, entry.target_kind)].append(entry)
+        self.scan_counts = (
+            max(0, self.scan_counts[0] +
+                int(refresh["new_nfo_count"]) - int(refresh["old_nfo_count"])),
+            max(0, self.scan_counts[1] - sum(e.media_type == "STRM" for e in removed)
+                + sum(e.media_type == "STRM" for e in fresh)),
+            max(0, self.scan_counts[2] - sum(e.media_type == "视频" for e in removed)
+                + sum(e.media_type == "视频" for e in fresh)),
+        )
+        self.render_results()
+        self._update_buttons()
+        return len(removed)
+
+    def _handle_bulk_move_stage(self, result: dict):
+        if self.closing_requested:
+            return
+        phase = result.get("phase")
+        if not result.get("success"):
+            error = result.get("error") or "移动任务已中止"
+            QtWidgets.QMessageBox.warning(
+                self, "移动覆盖未完成", f"{error}\n\n审计日志：{self.merge_log_file}",
+            )
+            self._set_status(f"移动覆盖未完成：{error}")
+            return
+        if phase == "precheck":
+            batch = result.get("batch")
+            if batch:
+                self._confirm_bulk_move(batch)
+        elif phase == "execute":
+            outcome = result.get("outcome") or {}
+            refresh = outcome.get("refresh") or {}
+            if refresh:
+                self._apply_scoped_move_refresh(refresh)
+            moved = outcome.get("moved", [])
+            issues = outcome.get("warnings", []) + refresh.get("errors", [])
+            error = outcome.get("error", "")
+            message = (
+                f"源：{outcome.get('source_root', '') or '已选源目录'}\n"
+                f"计划 {outcome.get('total', 0)} 个作品文件夹，"
+                f"已成功移动并整体覆盖 {len(moved)} 个。"
+                + ("\n已按请求停止。" if outcome.get("stopped") else "")
+                + (f"\n异常：{error}" if error else "")
+                + ("\n提示：" + "；".join(issues[:5]) if issues else "")
+                + "\n\n源作品目录已移动到目标目录原路径；目标旧目录内容整体被替换。"
+                + "\n不会访问或删除 STRM 指向的 115/CD2 视频。"
+                + "\n查重列表仅更新受影响作品文件夹，无需重新扫描整个库。"
+                + f"\n预览：{outcome.get('preview_path', '')}"
+                + f"\n审计日志：{self.merge_log_file}"
+            )
+            self._set_status(message.replace("\n", "  "))
+            if error or issues or outcome.get("stopped"):
+                QtWidgets.QMessageBox.warning(self, "文件夹移动覆盖部分完成 / 已停止", message)
+            else:
+                QtWidgets.QMessageBox.information(self, "文件夹批量移动覆盖完成", message)
+
+    def _confirm_bulk_move(self, batch: dict):
+        if self._task_active() or self.closing_requested:
+            return
+        plans = batch["plans"]
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("批量移动覆盖 · 勾选作品文件夹")
+        dialog.resize(1160, 700)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        hint = QtWidgets.QLabel(
+            f"源：{batch['source_root']}\n目标：{batch['destination_root']}\n"
+            f"全部重复组 {batch['group_count']}，两侧匹配 {batch['matched_groups']}，"
+            f"可选 {len(plans)} 个作品文件夹，跳过 {len(batch['skipped'])}。\n"
+            "每项操作会把源作品文件夹移动到目标作品文件夹原路径，"
+            "用源目录整个替换目标旧目录（包括 NFO、封面、字幕及 STRM）。"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        search = QtWidgets.QLineEdit(dialog)
+        search.setPlaceholderText("筛选番号或文件夹路径；下方选择操作只对当前筛选结果生效")
+        layout.addWidget(search)
+        model = BulkMoveSelectionModel(plans, dialog)
+        proxy = QtCore.QSortFilterProxyModel(dialog)
+        proxy.setSourceModel(model)
+        proxy.setFilterKeyColumn(-1)
+        proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        search.textChanged.connect(proxy.setFilterFixedString)
+        view = QtWidgets.QTableView(dialog)
+        view.setModel(proxy)
+        view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        view.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.AllEditTriggers)
+        view.setAlternatingRowColors(True)
+        view.setSortingEnabled(False)
+        view.verticalHeader().hide()
+        view.setColumnWidth(0, 52)
+        view.setColumnWidth(1, 128)
+        view.setColumnWidth(2, 345)
+        view.setColumnWidth(3, 345)
+        view.setColumnWidth(4, 210)
+        layout.addWidget(view, 1)
+        bar = QtWidgets.QHBoxLayout()
+        selected_label = QtWidgets.QLabel(f"已勾选 {len(plans)} / {len(plans)}")
+        model.count_changed.connect(
+            lambda count: selected_label.setText(f"已勾选 {count} / {len(plans)}")
+        )
+        select_btn = QtWidgets.QPushButton("勾选筛选结果")
+        clear_btn = QtWidgets.QPushButton("取消筛选结果")
+        def set_visible(checked):
+            rows = (proxy.mapToSource(proxy.index(i, 0)).row()
+                    for i in range(proxy.rowCount()))
+            model.select_rows(rows, checked)
+        select_btn.clicked.connect(lambda: set_visible(True))
+        clear_btn.clicked.connect(lambda: set_visible(False))
+        bar.addWidget(select_btn)
+        bar.addWidget(clear_btn)
+        bar.addWidget(selected_label)
+        bar.addStretch()
+        layout.addLayout(bar)
+        warning = QtWidgets.QLabel(
+            "⚠ 目标文件夹中独有的文件也会被替换删除，绝非简单的文件合并。"
+            "成功后不保留旧目标备份；失败会尽可能回滚，并在审计日志记录备份路径。"
+        )
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+        path_label = QtWidgets.QLabel(f"完整预检及跳过原因：{batch['preview_path']}")
+        path_label.setWordWrap(True)
+        layout.addWidget(path_label)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        proceed = buttons.addButton("确认勾选作品文件夹", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole)
+        proceed.setEnabled(bool(plans))
+        def proceed_checked():
+            if not model.selected_plans():
+                QtWidgets.QMessageBox.warning(dialog, "尚未勾选", "请选择至少一个作品文件夹。")
+                return
+            dialog.accept()
+        buttons.accepted.connect(proceed_checked)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            self.writer.submit_merge_event(batch["operation_id"], "MOVE_FOLDER_CANCELLED",
+                                           reason="取消勾选预览")
+            return
+        selected_plans = model.selected_plans()
+        word, accepted = QtWidgets.QInputDialog.getText(
+            self, "最终确认：移动并整体覆盖作品文件夹",
+            f"来源根目录：{batch['source_root']}\n"
+            f"目标根目录：{batch['destination_root']}\n"
+            f"已选择 {len(selected_plans)} 个作品文件夹。\n\n"
+            "源文件夹将移动至目标旧路径；目标文件夹原有的所有文件"
+            "（NFO、STRM、图片等）都将被整体替换，且成功后不自动保留备份。\n"
+            "不会删除 STRM 所指向的 115/CD2 视频。\n\n"
+            "确认已核对路径后，请输入：覆盖整个作品文件夹",
+            QtWidgets.QLineEdit.EchoMode.Normal,
+        )
+        if not accepted or word.strip() != "覆盖整个作品文件夹":
+            self.writer.submit_merge_event(batch["operation_id"], "MOVE_FOLDER_CANCELLED",
+                                           reason="最终确认词不匹配或用户取消")
+            return
+        selected_batch = dict(batch)
+        selected_batch["selected_plans"] = selected_plans
+        worker = BulkMoveWorker(
+            "execute", self.duplicates, self.records, self._completed_scan_roots,
+            self.path_mapping.get("source_prefix", ""),
+            self.path_mapping.get("target_prefix", ""), batch["operation_id"],
+            source_root=batch["source_root"],
+            destination_root=batch["destination_root"],
+            confirmed_batch=selected_batch,
+        )
+        self._begin_task(worker,
+                         f"执行目录整体移动覆盖：{len(selected_plans)} 个作品文件夹")
+
     def closeEvent(self, event: QtGui.QCloseEvent):
         if not self.close_save_requested:
             self.close_save_requested = True
             self._save_settings()
             self.writer.stop_event.set()
+            self._gui_watchdog_stop.set()
+            self._gui_heartbeat_timer.stop()
         self.closing_requested = True
         if self.worker is not None and self.worker.isRunning():
             self.worker.stop()
@@ -4561,13 +5744,14 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             self._set_status("退出中：等待文件管理器打开任务结束")
             event.ignore()
             return
-        if self.writer.is_alive():
+        if self.writer.is_alive() or self._gui_watchdog.is_alive():
             event.ignore()
-            self._set_status(f"退出中：正在写入 {self.settings_file}")
+            self._set_status(f"退出中：正在完成后台日志/设置写入 {self.settings_file}")
             QtCore.QTimer.singleShot(150, self.close)
             return
-        # 所有 Event 的语义均为 set 请求停止；退出时清理状态。
+        # 所有 Event 的语义均为 set 请求停止；线程退出后清理状态。
         self.writer.stop_event.clear()
+        self._gui_watchdog_stop.clear()
         event.accept()
 
 
@@ -4645,6 +5829,8 @@ class MergeDeleteWorker(QtCore.QThread):
                 raise ValueError("无效的合并删除阶段")
         except (Interrupted, MergeDeleteBlocked, OSError, ValueError) as error:
             result["error"] = str(error) or "用户停止或取消操作"
+            if isinstance(error, MergeDeletePartial):
+                result["completed"] = list(error.completed_steps)
             stage = "PRECHECK_BLOCKED" if self.phase == "precheck" else "EXECUTE_ABORTED"
             try:
                 append_merge_delete_log(
@@ -4729,6 +5915,65 @@ class BulkDeleteWorker(QtCore.QThread):
         self.outcome = result
         self.result.emit(result)
 
+
+class BulkMoveWorker(QtCore.QThread):
+    """移动预检/执行均在后台线程；stop_event.set() 表示请求停止。"""
+
+    progress = QtCore.Signal(int, int, str)
+    result = QtCore.Signal(object)
+
+    def __init__(self, phase, duplicates, records, roots, from_prefix, to_prefix,
+                 operation_id, *, source_root, destination_root, confirmed_batch=None):
+        super().__init__()
+        self.phase = phase
+        self.duplicates = dict(duplicates)
+        self.records = list(records)
+        self.roots = list(roots)
+        self.from_prefix = from_prefix
+        self.to_prefix = to_prefix
+        self.operation_id = operation_id
+        self.source_root = source_root
+        self.destination_root = destination_root
+        self.confirmed_batch = confirmed_batch
+        self.stop_event = threading.Event()  # set() = 请求停止；finished 后 GUI 清理
+        self.outcome = None
+
+    def stop(self):
+        self.stop_event.set()
+
+    def run(self):
+        result = {"phase": self.phase, "success": False, "error": ""}
+        try:
+            if self.phase == "precheck":
+                result["batch"] = precheck_bulk_move(
+                    self.duplicates, self.records, self.roots,
+                    self.from_prefix, self.to_prefix, self.stop_event,
+                    self.progress.emit, operation_id=self.operation_id,
+                    source_root=self.source_root,
+                    destination_root=self.destination_root,
+                )
+            elif self.phase == "execute":
+                if not self.confirmed_batch:
+                    raise MergeDeleteBlocked("缺少用户勾选并确认的作品文件夹移动计划")
+                batch = self.confirmed_batch
+                if (batch["operation_id"] != self.operation_id
+                        or nt_key(batch["source_root"]) != nt_key(self.source_root)
+                        or nt_key(batch["destination_root"]) != nt_key(self.destination_root)):
+                    raise MergeDeleteBlocked("执行阶段的根目录与用户预检确认内容不一致")
+                result["outcome"] = execute_bulk_move(
+                    batch, self.records, self.roots,
+                    self.from_prefix, self.to_prefix,
+                    self.stop_event, self.progress.emit,
+                )
+            else:
+                raise ValueError("无效的移动任务阶段")
+            result["success"] = True
+        except Interrupted:
+            result["error"] = "用户请求停止移动任务"
+        except (MergeDeleteBlocked, OSError, ValueError, sqlite3.Error) as error:
+            result["error"] = str(error)
+        self.outcome = result
+        self.result.emit(result)
 
 if __name__ == "__main__":
     if sys.platform != "win32":
