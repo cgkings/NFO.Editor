@@ -14,12 +14,10 @@ NFO Editor 主程序 - PySide6 业务逻辑层
      不再操作 GridLayout columnStretch
   7. load_image 直接传原图 QPixmap,由 AdaptiveImageLabel 自动缩放
   8. import 路径: from nfo_editor_ui import NFOEditorQt
-  9. v9.8.3: 移动文件夹采用 Windows 本地磁盘单 worker 队列：
-     同卷 rename 快速路径；跨卷 CopyFileExW/分块复制；移动后批量刷新 UI。
+  9. 文件夹移动改用 Windows IFileOperation；其他编辑功能保持原样。
 """
 
 import copy
-import errno
 import json
 import os
 import re
@@ -85,6 +83,8 @@ from nfo_utils import (
     find_numbered_trailer,
     find_trailer_in_movie_folder,
     is_path_within,
+    move_directory_fast_or_shell,
+    WindowsShellMoveInterrupted,
     parse_xml_file,
     preferred_image_file,
     read_series_text,
@@ -844,557 +844,103 @@ class SettingsDialog(QDialog):
 
 # ================ 文件移动线程 ================
 
-class MoveCancelled(Exception):
-    """Internal control-flow exception for a user-cancelled move."""
-
-
 class FileOperationThread(QThread):
-    """Single-worker move queue.
+    """Single-worker Windows Shell move queue (one folder per COM operation).
 
-    Priority:
-      1. Try os.rename() first.  Same-volume moves only update directory entries
-         and are therefore ideal for SSD folders containing STRM/NFO/images.
-      2. If rename is unavailable (normally cross-volume), copy one folder at a
-         time into a staging directory, then publish it atomically and delete
-         the source only after the copy is complete.
-      3. Copy operations check the stop event frequently.  On Windows,
-         CopyFileExW is used so a large video can be cancelled during the file
-         copy instead of waiting for the whole file to finish.
+    This thread never manipulates QWidget objects.
 
-    There is deliberately only ONE active folder operation.  Running several
-    HDD cross-volume copies concurrently usually hurts throughput and stability.
+    stop_event.set() == request to STOP before the next folder.
+    stop_event.clear() == allow work. Windows owns the currently running
+    IFileOperation; its own progress dialog can cancel the current folder.
     """
 
-    progress = pyqtSignal(int)          # number of queue items consumed
+    progress = pyqtSignal(int)
     error = pyqtSignal(str)
     status = pyqtSignal(str)
-    moved = pyqtSignal(str, str)        # old_folder, new_folder
-
-    _COPY_STATUS_INTERVAL = 0.25
-    _COPY_BUFFER_SIZE = 8 * 1024 * 1024
+    moved = pyqtSignal(str, str)
 
     def __init__(self, operation_type, **kwargs):
         super().__init__()
         self.operation_type = operation_type
         self.kwargs = kwargs
         self.moved_paths = []
-        self._stop_event = threading.Event()
-        self.fast_moved_count = 0
-        self.copied_moved_count = 0
         self.failed_count = 0
         self.cancelled_during_item = False
-        self._last_copy_status_at = 0.0
+        self.error_messages = []
+        self._stop_event = threading.Event()
+        # 限制数百次移动时的 GUI 更新频率。
+        self._last_progress_at = 0.0
 
     @property
     def is_stopped(self):
         return self._stop_event.is_set()
 
-    def run(self):
-        try:
-            if self.operation_type == "move":
-                self.move_files()
-        except Exception as exc:
-            self.error.emit(f"移动线程异常: {exc}")
-
     def stop(self):
+        """Event.set(): request that no subsequent folder move is started."""
         self._stop_event.set()
 
-    @staticmethod
-    def _human_size(value):
-        value = float(max(0, value or 0))
-        units = ("B", "KB", "MB", "GB", "TB")
-        for unit in units:
-            if value < 1024.0 or unit == units[-1]:
-                if unit == "B":
-                    return f"{int(value)} {unit}"
-                return f"{value:.1f} {unit}"
-            value /= 1024.0
-        return f"{value:.1f} TB"
+    def clear_stop_request(self):
+        """Only call after Qt has emitted QThread.finished."""
+        self._stop_event.clear()
 
-    def _emit_copy_status(
-        self,
-        queue_index,
-        queue_total,
-        folder_name,
-        file_name,
-        transferred,
-        file_total,
-        *,
-        force=False,
-    ):
-        now = time.monotonic()
-        if not force and now - self._last_copy_status_at < self._COPY_STATUS_INTERVAL:
+    def run(self):
+        from ctypes import ArgumentError as COMArgumentError
+
+        if self.operation_type != "move":
+            self.failed_count += 1
+            self.error.emit(f"不支持的文件操作：{self.operation_type}")
             return
-        self._last_copy_status_at = now
 
-        if file_total > 0:
-            detail = (
-                f"{file_name}\n"
-                f"{self._human_size(transferred)} / {self._human_size(file_total)}"
-            )
-        else:
-            detail = file_name
-        self.status.emit(
-            f"队列 {queue_index}/{queue_total}：跨盘复制 {folder_name}\n{detail}"
-        )
+        try:
+            src_paths = unique_paths(self.kwargs.get("src_paths", []))
+            dest_parent = self.kwargs.get("dest_path")
+            owner_hwnd = int(self.kwargs.get("owner_hwnd", 0) or 0)
+        except (OSError, ValueError, TypeError) as exc:
+            self.failed_count += 1
+            self.error.emit(f"文件移动参数错误：{exc}")
+            return
 
-    def move_files(self):
-        queue = unique_paths(self.kwargs.get("src_paths", []))
-        dest_parent = self.kwargs.get("dest_path")
-        total = len(queue)
-
-        for index, src_path in enumerate(queue, 1):
+        total = len(src_paths)
+        for index, src_path in enumerate(src_paths, 1):
             if self._stop_event.is_set():
                 break
 
             folder_name = os.path.basename(os.path.normpath(src_path))
-            self.status.emit(
-                f"队列 {index}/{total}：{folder_name}\n"
-                "正在尝试快速移动..."
-            )
+            now = time.monotonic()
+            if index == 1 or now - self._last_progress_at >= 0.2:
+                self.status.emit(
+                    f"移动 {index}/{total}：{folder_name}\n"
+                    "同卷直接重命名；跨卷由 Windows 处理"
+                )
+                self._last_progress_at = now
 
-            consumed = False
             try:
-                moved_path, mode = self._move_one(
+                new_path = move_directory_fast_or_shell(
                     src_path,
                     dest_parent,
-                    queue_index=index,
-                    queue_total=total,
+                    owner_hwnd=owner_hwnd,
+                    stop_event=self._stop_event,
                 )
-                if mode == "rename":
-                    self.fast_moved_count += 1
-                else:
-                    self.copied_moved_count += 1
-
-                self.moved_paths.append((src_path, moved_path))
-                self.moved.emit(src_path, moved_path)
-                consumed = True
-
-            except MoveCancelled:
+            except WindowsShellMoveInterrupted as exc:
                 self.cancelled_during_item = True
-                self.status.emit(
-                    f"已取消：{folder_name}\n"
-                    "源文件夹保持不变；未继续处理后续队列。"
-                )
+                message = f"{folder_name}：{exc}"
+                self.error_messages.append(message)
+                self.error.emit(message)
                 break
-
-            except Exception as exc:
+            except (OSError, ValueError, TypeError, RuntimeError,
+                    AttributeError, COMArgumentError) as exc:
                 self.failed_count += 1
-                consumed = True
-                self.error.emit(f"{folder_name}：移动失败：{exc}")
-
+                message = f"{folder_name}：移动失败：{exc}"
+                self.error_messages.append(message)
+                self.error.emit(message)
+            else:
+                self.moved_paths.append((src_path, new_path))
+                # 移动完成由 finished 统一汇报，无需 458 次 moved GUI 信号。
             finally:
-                if consumed:
+                now = time.monotonic()
+                if index == total or now - self._last_progress_at >= 0.2:
                     self.progress.emit(index)
-
-    def _move_one(self, src_path, dest_parent, *, queue_index, queue_total):
-        if self._stop_event.is_set():
-            raise MoveCancelled()
-
-        if not src_path or not os.path.isdir(src_path):
-            raise OSError(f"源文件夹不存在或不是目录: {src_path}")
-        if not dest_parent or not os.path.isdir(dest_parent):
-            raise OSError(f"目标目录不存在或不是目录: {dest_parent}")
-
-        src_path = os.path.normpath(src_path)
-        dest_parent = os.path.normpath(dest_parent)
-        folder_name = os.path.basename(src_path)
-        if not folder_name:
-            raise OSError("无法确定源文件夹名称")
-
-        dest_path = os.path.join(dest_parent, folder_name)
-        if os.path.exists(dest_path):
-            raise FileExistsError(f"目标已存在同名文件夹: {dest_path}")
-
-        # Windows 本地磁盘优先走 rename：同卷移动只改目录项，SSD/HDD 都很快。
-        # 只有明确的“跨卷/跨设备”错误才降级到复制。权限不足、文件占用等
-        # 同卷错误必须直接暴露，避免把一个本应瞬时完成的大视频目录误变成慢复制。
-        try:
-            os.rename(src_path, dest_path)
-            self.status.emit(
-                f"队列 {queue_index}/{queue_total}：{folder_name}\n"
-                "快速移动完成"
-            )
-            return dest_path, "rename"
-        except OSError as exc:
-            is_cross_device = (
-                exc.errno == errno.EXDEV
-                or getattr(exc, "winerror", None) == 17  # ERROR_NOT_SAME_DEVICE
-            )
-            if not is_cross_device:
-                raise OSError(f"快速移动失败: {exc}") from exc
-            if os.path.exists(dest_path):
-                raise FileExistsError(f"目标已存在同名文件夹: {dest_path}")
-
-        if self._stop_event.is_set():
-            raise MoveCancelled()
-
-        stage_path = os.path.join(
-            dest_parent,
-            f".{folder_name}.nfoeditor-moving-{os.getpid()}-{time.time_ns()}",
-        )
-
-        self.status.emit(
-            f"队列 {queue_index}/{queue_total}：跨盘复制 {folder_name}\n"
-            "正在创建临时目标..."
-        )
-
-        try:
-            self._copy_tree_cancelable(
-                src_path,
-                stage_path,
-                queue_index=queue_index,
-                queue_total=queue_total,
-                folder_name=folder_name,
-            )
-
-            if self._stop_event.is_set():
-                raise MoveCancelled()
-
-            # Publish only after the whole folder has copied successfully.
-            os.rename(stage_path, dest_path)
-
-            # From this point the destination is complete.  Finish source
-            # cleanup as one transaction; cancellation applies to the next
-            # queue item, not halfway through source deletion.
-            self.status.emit(
-                f"队列 {queue_index}/{queue_total}：{folder_name}\n"
-                "复制完成，正在删除源目录..."
-            )
-            try:
-                shutil.rmtree(src_path)
-            except Exception as exc:
-                # Destination is already complete.  Never delete it here:
-                # retaining both copies is safer than risking data loss.
-                raise OSError(
-                    "文件已完整复制到目标，但源目录删除失败；"
-                    f"为安全起见保留两份。目标: {dest_path}；原因: {exc}"
-                ) from exc
-
-            self.status.emit(
-                f"队列 {queue_index}/{queue_total}：{folder_name}\n"
-                "跨盘移动完成"
-            )
-            return dest_path, "copy"
-
-        except MoveCancelled:
-            self._cleanup_stage_best_effort(stage_path)
-            raise
-        except Exception:
-            self._cleanup_stage_best_effort(stage_path)
-            raise
-
-    def _cleanup_stage_best_effort(self, stage_path):
-        if not stage_path or not os.path.exists(stage_path):
-            return
-        try:
-            shutil.rmtree(stage_path)
-        except OSError:
-            # 临时目录清理失败不覆盖原始移动错误；源目录仍保持不变。
-            pass
-
-    def _copy_tree_cancelable(
-        self,
-        src_dir,
-        dst_dir,
-        *,
-        queue_index,
-        queue_total,
-        folder_name,
-    ):
-        if self._stop_event.is_set():
-            raise MoveCancelled()
-
-        os.makedirs(dst_dir, exist_ok=False)
-        try:
-            with os.scandir(src_dir) as entries:
-                for entry in entries:
-                    if self._stop_event.is_set():
-                        raise MoveCancelled()
-
-                    src_entry = entry.path
-                    dst_entry = os.path.join(dst_dir, entry.name)
-
-                    try:
-                        is_dir = entry.is_dir(follow_symlinks=True)
-                    except OSError:
-                        is_dir = os.path.isdir(src_entry)
-
-                    if is_dir:
-                        self._copy_tree_cancelable(
-                            src_entry,
-                            dst_entry,
-                            queue_index=queue_index,
-                            queue_total=queue_total,
-                            folder_name=folder_name,
-                        )
-                        continue
-
-                    try:
-                        file_size = entry.stat(follow_symlinks=True).st_size
-                    except OSError:
-                        file_size = 0
-
-                    self._copy_file_cancelable(
-                        src_entry,
-                        dst_entry,
-                        queue_index=queue_index,
-                        queue_total=queue_total,
-                        folder_name=folder_name,
-                        file_name=entry.name,
-                        file_total=file_size,
-                    )
-
-                    # 轻量校验目标大小，不对 HDD 大视频做全文件哈希，
-                    # 避免为安全检查额外读取几十 GB 数据。
-                    try:
-                        copied_size = os.path.getsize(dst_entry)
-                    except OSError as exc:
-                        raise OSError(f"无法校验目标文件: {dst_entry}: {exc}") from exc
-                    if file_size >= 0 and copied_size != file_size:
-                        raise OSError(
-                            f"目标文件大小校验失败: {entry.name} "
-                            f"({copied_size} != {file_size})"
-                        )
-
-            try:
-                shutil.copystat(src_dir, dst_dir, follow_symlinks=True)
-            except OSError:
-                pass
-        except Exception:
-            raise
-
-    def _copy_file_cancelable(
-        self,
-        src_file,
-        dst_file,
-        *,
-        queue_index,
-        queue_total,
-        folder_name,
-        file_name,
-        file_total,
-    ):
-        if self._stop_event.is_set():
-            raise MoveCancelled()
-
-        os.makedirs(os.path.dirname(dst_file), exist_ok=True)
-
-        if os.name == "nt":
-            try:
-                self._copy_file_windows(
-                    src_file,
-                    dst_file,
-                    queue_index=queue_index,
-                    queue_total=queue_total,
-                    folder_name=folder_name,
-                    file_name=file_name,
-                    file_total=file_total,
-                )
-                return
-            except MoveCancelled:
-                raise
-            except OSError:
-                # CopyFileExW 不可用时退回普通分块复制；仍保持单 worker 串行。
-                try:
-                    if os.path.exists(dst_file):
-                        os.remove(dst_file)
-                except OSError:
-                    pass
-
-        self._copy_file_chunked(
-            src_file,
-            dst_file,
-            queue_index=queue_index,
-            queue_total=queue_total,
-            folder_name=folder_name,
-            file_name=file_name,
-            file_total=file_total,
-        )
-
-    @staticmethod
-    def _windows_extended_path(path):
-        path = os.path.abspath(path)
-        if path.startswith("\\\\?\\"):
-            return path
-        if path.startswith("\\\\"):
-            return "\\\\?\\UNC\\" + path[2:]
-        return "\\\\?\\" + path
-
-    def _copy_file_windows(
-        self,
-        src_file,
-        dst_file,
-        *,
-        queue_index,
-        queue_total,
-        folder_name,
-        file_name,
-        file_total,
-    ):
-        import ctypes
-        from ctypes import wintypes
-
-        PROGRESS_CONTINUE = 0
-        PROGRESS_CANCEL = 1
-        COPY_FILE_FAIL_IF_EXISTS = 0x00000001
-        ERROR_REQUEST_ABORTED = 1235
-
-        progress_routine_type = ctypes.WINFUNCTYPE(
-            wintypes.DWORD,
-            ctypes.c_longlong,  # TotalFileSize
-            ctypes.c_longlong,  # TotalBytesTransferred
-            ctypes.c_longlong,  # StreamSize
-            ctypes.c_longlong,  # StreamBytesTransferred
-            wintypes.DWORD,     # dwStreamNumber
-            wintypes.DWORD,     # dwCallbackReason
-            wintypes.HANDLE,    # hSourceFile
-            wintypes.HANDLE,    # hDestinationFile
-            wintypes.LPVOID,    # lpData
-        )
-
-        @progress_routine_type
-        def progress_callback(
-            total_size,
-            transferred,
-            _stream_size,
-            _stream_transferred,
-            _stream_number,
-            _callback_reason,
-            _source_handle,
-            _dest_handle,
-            _data,
-        ):
-            effective_total = int(total_size) if total_size else int(file_total or 0)
-            self._emit_copy_status(
-                queue_index,
-                queue_total,
-                folder_name,
-                file_name,
-                int(transferred),
-                effective_total,
-            )
-            if self._stop_event.is_set():
-                return PROGRESS_CANCEL
-            return PROGRESS_CONTINUE
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        copy_file_ex = kernel32.CopyFileExW
-        copy_file_ex.argtypes = [
-            wintypes.LPCWSTR,
-            wintypes.LPCWSTR,
-            progress_routine_type,
-            wintypes.LPVOID,
-            ctypes.POINTER(wintypes.BOOL),
-            wintypes.DWORD,
-        ]
-        copy_file_ex.restype = wintypes.BOOL
-
-        cancel_flag = wintypes.BOOL(False)
-        ok = copy_file_ex(
-            self._windows_extended_path(src_file),
-            self._windows_extended_path(dst_file),
-            progress_callback,
-            None,
-            ctypes.byref(cancel_flag),
-            COPY_FILE_FAIL_IF_EXISTS,
-        )
-
-        if not ok:
-            error_code = ctypes.get_last_error()
-            if self._stop_event.is_set() or error_code == ERROR_REQUEST_ABORTED:
-                try:
-                    if os.path.exists(dst_file):
-                        os.remove(dst_file)
-                except OSError:
-                    pass
-                raise MoveCancelled()
-            raise OSError(
-                error_code,
-                ctypes.FormatError(error_code),
-                src_file,
-            )
-
-        self._emit_copy_status(
-            queue_index,
-            queue_total,
-            folder_name,
-            file_name,
-            file_total,
-            file_total,
-            force=True,
-        )
-        try:
-            shutil.copystat(src_file, dst_file, follow_symlinks=True)
-        except OSError:
-            pass
-
-    def _copy_file_chunked(
-        self,
-        src_file,
-        dst_file,
-        *,
-        queue_index,
-        queue_total,
-        folder_name,
-        file_name,
-        file_total,
-    ):
-        transferred = 0
-        try:
-            with open(src_file, "rb", buffering=0) as src_handle, open(
-                dst_file, "xb", buffering=0
-            ) as dst_handle:
-                buffer = bytearray(self._COPY_BUFFER_SIZE)
-                view = memoryview(buffer)
-                while True:
-                    if self._stop_event.is_set():
-                        raise MoveCancelled()
-
-                    read_count = src_handle.readinto(buffer)
-                    if not read_count:
-                        break
-
-                    written = 0
-                    while written < read_count:
-                        if self._stop_event.is_set():
-                            raise MoveCancelled()
-                        count = dst_handle.write(view[written:read_count])
-                        if not count:
-                            raise OSError(f"写入目标文件失败: {dst_file}")
-                        written += count
-
-                    transferred += read_count
-                    self._emit_copy_status(
-                        queue_index,
-                        queue_total,
-                        folder_name,
-                        file_name,
-                        transferred,
-                        file_total,
-                    )
-
-            self._emit_copy_status(
-                queue_index,
-                queue_total,
-                folder_name,
-                file_name,
-                transferred,
-                file_total,
-                force=True,
-            )
-            try:
-                shutil.copystat(src_file, dst_file, follow_symlinks=True)
-            except OSError:
-                pass
-
-        except Exception:
-            try:
-                if os.path.exists(dst_file):
-                    os.remove(dst_file)
-            except OSError:
-                pass
-            raise
+                    self._last_progress_at = now
 
 
 class BatchNFOOperationThread(QThread):
@@ -2646,6 +2192,48 @@ class NFOEditorQt6(NFOEditorQt):
         self.sorted_tree.addTopLevelItem(item)
         self.sorted_tree.sortItems(0, Qt.AscendingOrder)
 
+    def _append_target_folders_bulk(self, folder_paths):
+        """批量添加移动成功的目标文件夹；只重排一次目标树。"""
+        if not self.current_target_path:
+            return
+
+        target_key = self._event_path_key(self.current_target_path)
+        existing_names = {
+            self.sorted_tree.topLevelItem(i).text(0)
+            for i in range(self.sorted_tree.topLevelItemCount())
+        }
+        pending = set()
+        for folder_path in folder_paths:
+            folder_path = self._normalize_event_path(folder_path)
+            if not folder_path:
+                continue
+            if self._event_path_key(os.path.dirname(folder_path)) != target_key:
+                continue
+            name = os.path.basename(folder_path)
+            if name and name not in existing_names:
+                pending.add(name)
+
+        if not pending:
+            return
+
+        if self._target_dir_icon is None:
+            self._target_dir_icon = self.style().standardIcon(
+                QStyle.StandardPixmap.SP_DirIcon
+            )
+
+        items = []
+        for name in sorted(pending, key=str.casefold):
+            item = QTreeWidgetItem([name])
+            item.setIcon(0, self._target_dir_icon)
+            items.append(item)
+
+        self.sorted_tree.setUpdatesEnabled(False)
+        try:
+            self.sorted_tree.addTopLevelItems(items)
+            self.sorted_tree.sortItems(0, Qt.AscendingOrder)
+        finally:
+            self.sorted_tree.setUpdatesEnabled(True)
+
     def _apply_folder_path_change(self, old_path, new_path, event_type):
         old_path = self._normalize_event_path(old_path)
         new_path = self._normalize_event_path(new_path)
@@ -2724,7 +2312,12 @@ class NFOEditorQt6(NFOEditorQt):
             )
             for event in outbound_moves:
                 self._remove_target_folder_item(event.get("old_path", ""))
-                self._append_target_folder(event.get("path", ""))
+
+            # 458 个移动结果只更新目标树一次：
+            # 旧代码每添加一个文件夹都立即排序整个 QTreeWidget。
+            self._append_target_folders_bulk(
+                [event.get("path", "") for event in outbound_moves]
+            )
 
         for event in remaining_events:
             event_type = event.get("type", "")
@@ -3205,11 +2798,11 @@ class NFOEditorQt6(NFOEditorQt):
 
 
     def start_move_thread(self):
-        if not self._confirm_unsaved_changes("移动文件夹"):
+        # QThread.finished 尚未清理时，也要禁止快捷键重复发起移动。
+        if self.move_thread is not None:
+            self.status_bar.showMessage("文件移动尚未结束，请勿重复操作", 3000)
             return
-        # 工具栏按钮被禁用时，Ctrl+Right 快捷键仍可能触发此方法。
-        if self.move_thread is not None and self.move_thread.isRunning():
-            self.status_bar.showMessage("文件移动正在进行，请勿重复操作", 3000)
+        if not self._confirm_unsaved_changes("移动文件夹"):
             return
 
         try:
@@ -3237,6 +2830,28 @@ class NFOEditorQt6(NFOEditorQt):
                 src_paths.append(src_path)
 
             src_paths = unique_paths(src_paths)
+            # 若同时选中父目录与子目录，只移动父目录，避免第二次移动报错。
+            # 通过父路径集合判重：O(文件夹数 × 目录深度)。
+            # 不对 458 个路径逐对调用 is_path_within(realpath)，
+            # 否则窗口会在移动开始前执行约 20 万次磁盘路径解析。
+            selected_keys = {
+                os.path.normcase(os.path.abspath(path))
+                for path in src_paths
+            }
+
+            def parent_is_selected(path):
+                parent = os.path.dirname(os.path.abspath(path))
+                while True:
+                    if os.path.normcase(parent) in selected_keys:
+                        return True
+                    next_parent = os.path.dirname(parent)
+                    if next_parent == parent:
+                        return False
+                    parent = next_parent
+
+            src_paths = [
+                path for path in src_paths if not parent_is_selected(path)
+            ]
             if skipped_root:
                 QMessageBox.warning(
                     self, "根目录保护",
@@ -3296,14 +2911,14 @@ class NFOEditorQt6(NFOEditorQt):
                 self.move_progress = None
 
             self.move_progress = QProgressDialog(
-                f"已建立移动队列，共 {len(src_paths)} 个文件夹",
-                "取消",
+                f"准备移动 {len(src_paths)} 个文件夹：同卷快速移动，跨卷 Windows 处理。",
+                "停止后续",
                 0,
                 len(src_paths),
                 self,
             )
-            self.move_progress.setWindowTitle("移动队列")
-            self.move_progress.setWindowModality(Qt.WindowModal)
+            self.move_progress.setWindowTitle("Windows 文件移动")
+            self.move_progress.setWindowModality(Qt.NonModal)
             self.move_progress.setMinimumDuration(0)
             self.move_progress.setAutoClose(False)
             self.move_progress.setAutoReset(False)
@@ -3313,6 +2928,8 @@ class NFOEditorQt6(NFOEditorQt):
                 operation_type="move",
                 src_paths=src_paths,
                 dest_path=dest_path,
+                # winId() 在 GUI 线程获取，传给 Windows Shell 作为父窗口。
+                owner_hwnd=int(self.winId()),
             )
             self.move_thread.progress.connect(self.move_progress.setValue)
             self.move_thread.status.connect(self.move_progress.setLabelText)
@@ -3340,10 +2957,8 @@ class NFOEditorQt6(NFOEditorQt):
     @pyqtSlot(str, str)
     def _on_move_item_moved(self, old_path, new_path):
         """记录单个成功移动结果，完成后由事件队列局部更新。"""
+        # 只记录真实完成的移动；finished 后去重并统一刷新 UI。
         self._move_results.append((old_path, new_path))
-        self._queue_library_event(
-            "folder_moved", new_path, old_path=old_path
-        )
 
     @pyqtSlot()
     def _cancel_move(self):
@@ -3352,9 +2967,9 @@ class NFOEditorQt6(NFOEditorQt):
             thread.stop()
             if self.move_progress is not None:
                 self.move_progress.setLabelText(
-                    "正在取消当前任务...\n"
-                    "跨盘复制会在当前复制块/系统回调处停止；"
-                    "已完成的项目不会回滚。"
+                    "已请求停止后续移动。\n"
+                    "当前文件夹由 Windows 处理；要取消当前跨盘移动，"
+                    "请使用 Windows 进度窗口中的取消。"
                 )
             self.status_bar.showMessage("正在取消移动队列...", 3000)
 
@@ -3386,6 +3001,8 @@ class NFOEditorQt6(NFOEditorQt):
                     signal.disconnect(slot)
                 except (RuntimeError, TypeError):
                     pass
+            if not thread.isRunning():
+                thread.clear_stop_request()
             thread.deleteLater()
 
         self._set_moving_busy(False)
@@ -3396,8 +3013,14 @@ class NFOEditorQt6(NFOEditorQt):
     @pyqtSlot()
     def on_move_finished(self):
         thread = self.move_thread
-        canceled = bool(thread is not None and thread.is_stopped)
-        errors = list(self._move_error_messages)
+        canceled = bool(
+            thread is not None
+            and (thread.is_stopped or thread.cancelled_during_item)
+        )
+        errors = list(dict.fromkeys(
+            list(self._move_error_messages)
+            + list(getattr(thread, "error_messages", []) or [])
+        ))
 
         # QThread.finished 到达时，线程内 moved_paths 已经完整。
         # 用它补齐可能尚未投递到 GUI 事件队列的 moved 信号，避免漏掉局部更新。
@@ -3420,8 +3043,6 @@ class NFOEditorQt6(NFOEditorQt):
             )
 
         moved_count = len(successful_moves)
-        fast_count = int(getattr(thread, "fast_moved_count", 0) or 0)
-        copied_count = int(getattr(thread, "copied_moved_count", 0) or 0)
         failed_count = int(getattr(thread, "failed_count", 0) or 0)
         reload_target = self._target_reload_after_move
         self._target_reload_after_move = False
@@ -3448,16 +3069,13 @@ class NFOEditorQt6(NFOEditorQt):
             QMessageBox.critical(self, "移动未完全成功", details)
         elif canceled:
             self.status_bar.showMessage(
-                f"移动队列已取消：成功 {moved_count} 个"
-                f"（快速 {fast_count}，复制 {copied_count}），"
-                f"失败 {failed_count} 个",
+                f"移动已中止：成功 {moved_count} 个，失败 {failed_count} 个；"
+                "当前项请检查源与目标位置",
                 6000,
             )
         else:
             self.status_bar.showMessage(
-                f"移动队列完成：成功 {moved_count} 个"
-                f"（快速 {fast_count}，复制 {copied_count}），"
-                f"失败 {failed_count} 个",
+                f"Windows 移动完成：成功 {moved_count} 个，失败 {failed_count} 个",
                 6000,
             )
 
@@ -4910,10 +4528,9 @@ class NFOEditorQt6(NFOEditorQt):
                     running_threads.append("文件加载")
             if self.move_thread is not None and self.move_thread.isRunning():
                 self.move_thread.stop()
-                # 文件系统 I/O 可能暂时阻塞。关闭窗口时只做很短的等待，
-                # 保持 GUI 可响应；线程未退则拒绝关闭而不是硬杀线程。
-                if not self.move_thread.wait(250):
-                    running_threads.append("文件移动")
+                # 当前 IFileOperation 正由 Windows Shell 处理。
+                # 不在 GUI 线程等待；拒绝关闭并保持 Qt 对象存活。
+                running_threads.append("文件移动")
             if self.batch_thread is not None and self.batch_thread.isRunning():
                 self.batch_thread.stop()
                 if not self.batch_thread.wait(5000):

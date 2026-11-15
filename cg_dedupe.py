@@ -3425,6 +3425,9 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self._current_probe_stats = {}
 
         self._init_ui()
+        # PyInstaller --icon 只设置 EXE 文件图标，不会自动设置 Qt 窗口/任务栏图标。
+        # 在 QApplication 和主窗口均已创建后，把同一图标应用到应用及主窗口。
+        self._load_app_icon()
         self._connect()
         self._load_options()
         if initial_directory:
@@ -3535,9 +3538,7 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
         self.setWindowTitle(f"{APP_TITLE}  v{APP_VERSION}")
         self.resize(1520, 860)
         self.setMinimumSize(1090, 650)
-        # 不在 Windows 运行时向 Qt 注入 ICO/QPixmap：设置窗口图标会进入
-        # qt_imageToWinHBITMAP/CreateDIBSection，部分系统返回无效窗口句柄。
-        # 打包图标交给 PyInstaller --icon 处理，避免运行时的 GDI 转换。
+        # 窗口图标在 __init__ 中统一加载；这里不重复创建 QPixmap/QIcon。
         self.setStyleSheet(f"""
             QWidget {{
                 font-family: "Microsoft YaHei UI", "Segoe UI";

@@ -451,6 +451,312 @@ def write_xml_root_atomic(root: ET.Element, path: str) -> None:
     atomic_write_text(path, serialize_pretty_xml(root))
 
 
+class WindowsShellMoveInterrupted(OSError):
+    """Windows Shell reports that the operation was canceled or interrupted."""
+
+
+
+def move_directory_fast_or_shell(
+    src_path: str,
+    dest_parent: str,
+    *,
+    owner_hwnd: int = 0,
+    stop_event=None,
+) -> str:
+    """同卷直接调用 Windows 系统目录重命名；仅跨卷时使用 IFileOperation。
+
+    不扫描文件、不读取图片、不复制 STRM/NFO 文件。
+    os.rename() 返回非跨卷错误时直接失败，绝不误入复制流程。
+    """
+    import errno
+
+    # Event.set() = 请求停止后续目录；当前系统调用不做强制中断。
+    if stop_event is not None and stop_event.is_set():
+        raise WindowsShellMoveInterrupted("用户已请求停止后续移动")
+    if not src_path or not os.path.isdir(src_path):
+        raise OSError(f"源文件夹不存在或不是目录：{src_path}")
+    if not dest_parent or not os.path.isdir(dest_parent):
+        raise OSError(f"目标目录不存在或不是目录：{dest_parent}")
+
+    src_path = os.path.abspath(os.path.normpath(os.fspath(src_path)))
+    dest_parent = os.path.abspath(os.path.normpath(os.fspath(dest_parent)))
+    folder_name = os.path.basename(src_path)
+    if not folder_name:
+        raise OSError("无法确定源文件夹名称")
+
+    dest_path = os.path.join(dest_parent, folder_name)
+    if same_path(src_path, dest_path):
+        raise OSError("源目录和目标目录相同，未移动")
+    if is_path_within(dest_parent, src_path, include_equal=True):
+        raise OSError("不能移动到源文件夹自身或其子目录")
+    if os.path.lexists(dest_path):
+        raise FileExistsError(f"目标已有同名文件夹或链接，未覆盖：{dest_path}")
+
+    try:
+        os.rename(src_path, dest_path)
+    except OSError as exc:
+        # Windows ERROR_NOT_SAME_DEVICE (17) / errno.EXDEV 才代表跨卷。
+        # 占用、权限、重名等错误不得自动改走复制。
+        if exc.errno == errno.EXDEV or getattr(exc, "winerror", None) == 17:
+            return move_directory_windows_shell(
+                src_path, dest_parent,
+                owner_hwnd=owner_hwnd,
+                stop_event=stop_event,
+            )
+        raise OSError(f"同卷目录移动失败（未复制）：{exc}") from exc
+
+    return dest_path
+
+
+def move_directory_windows_shell(
+    src_path: str,
+    dest_parent: str,
+    *,
+    owner_hwnd: int = 0,
+    stop_event=None,
+) -> str:
+    """Move one folder through native Windows IFileOperation (same/cross-volume).
+
+    The shell is responsible for the actual rename/copy/delete work and its
+    own progress dialog. The caller can request that the NEXT folder be
+    skipped using stop_event; while PerformOperations() is running, the user
+    cancels the CURRENT folder through the Windows progress dialog.
+
+    This function never calls shutil.move(), copytree(), or rmtree().
+    """
+    if os.name != "nt":
+        raise OSError("Windows IFileOperation 仅支持 Windows 系统")
+
+    # Event.set() requests stopping the queue; Event.clear() permits work.
+    if stop_event is not None and stop_event.is_set():
+        raise WindowsShellMoveInterrupted("用户已请求停止后续移动")
+
+    if not src_path or not os.path.isdir(src_path):
+        raise OSError(f"源文件夹不存在或不是目录：{src_path}")
+    if not dest_parent or not os.path.isdir(dest_parent):
+        raise OSError(f"目标目录不存在或不是目录：{dest_parent}")
+
+    src_path = os.path.abspath(os.path.normpath(os.fspath(src_path)))
+    dest_parent = os.path.abspath(os.path.normpath(os.fspath(dest_parent)))
+    folder_name = os.path.basename(src_path)
+    if not folder_name:
+        raise OSError("无法确定源文件夹名称")
+
+    dest_path = os.path.join(dest_parent, folder_name)
+    if same_path(src_path, dest_path):
+        raise OSError("源目录与目标目录相同")
+    if is_path_within(dest_parent, src_path, include_equal=True):
+        raise OSError("不能将文件夹移动到自身或自身子目录")
+    if os.path.lexists(dest_path):
+        raise FileExistsError(f"目标已存在同名文件夹，不执行覆盖：{dest_path}")
+
+    # Avoid additional COM dependencies; use the documented Windows ABI.
+    # COM IID and vtable ordering are from Microsoft's shobjidl_core.h:
+    # https://learn.microsoft.com/windows/win32/api/shobjidl_core/nn-shobjidl_core-ifileoperation
+    import ctypes
+    from ctypes import wintypes
+    import uuid
+
+    class GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", ctypes.c_uint32),
+            ("Data2", ctypes.c_uint16),
+            ("Data3", ctypes.c_uint16),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+        @classmethod
+        def from_string(cls, value: str):
+            return cls.from_buffer_copy(uuid.UUID(value).bytes_le)
+
+    # GUIDs from the official Windows SDK (not Python package-generated IDs).
+    CLSID_FileOperation = GUID.from_string(
+        "3AD05575-8857-4850-9277-11B85BDB8E09"
+    )
+    IID_IFileOperation = GUID.from_string(
+        "947AAB5F-0A5C-4C13-B4D6-4BF7836FC9F8"
+    )
+    IID_IShellItem = GUID.from_string(
+        "43826D1E-E718-42EE-BC55-A1E261C37BFE"
+    )
+
+    ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+
+    ole_initialize = ole32.OleInitialize
+    ole_initialize.argtypes = [ctypes.c_void_p]
+    ole_initialize.restype = ctypes.c_long
+
+    ole_uninitialize = ole32.OleUninitialize
+    ole_uninitialize.argtypes = []
+    ole_uninitialize.restype = None
+
+    co_create_instance = ole32.CoCreateInstance
+    co_create_instance.argtypes = [
+        ctypes.POINTER(GUID),
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(GUID),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    co_create_instance.restype = ctypes.c_long
+
+    sh_create_item = shell32.SHCreateItemFromParsingName
+    sh_create_item.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.c_void_p,
+        ctypes.POINTER(GUID),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    sh_create_item.restype = ctypes.c_long
+
+    def check_hr(hr: int, action: str) -> None:
+        if hr < 0:
+            code = ctypes.c_uint32(hr).value
+            raise OSError(f"{action}失败，HRESULT=0x{code:08X}")
+
+    def call_com(interface, slot: int, restype, argtypes: tuple, *args):
+        """Call a documented COM vtable method (IUnknown = slots 0,1,2)."""
+        vtable = ctypes.cast(
+            interface, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+        ).contents
+        addr = vtable[slot]
+        if not addr:
+            raise OSError(f"Windows COM 接口方法不可用：slot={slot}")
+        prototype = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)
+        return prototype(addr)(interface, *args)
+
+    def release_com(interface) -> None:
+        if interface.value:
+            call_com(interface, 2, wintypes.ULONG, ())
+            interface.value = None
+
+    com_initialized = False
+    operation = ctypes.c_void_p()
+    source_item = ctypes.c_void_p()
+    destination_item = ctypes.c_void_p()
+
+    try:
+        # IFileOperation requires an STA. OleInitialize initializes STA+OLE
+        # within the worker thread; do NOT initialize it in the GUI thread.
+        check_hr(ole_initialize(None), "初始化 Windows Shell")
+        com_initialized = True
+
+        CLSCTX_ALL = 0x17
+        check_hr(
+            co_create_instance(
+                ctypes.byref(CLSID_FileOperation),
+                None,
+                CLSCTX_ALL,
+                ctypes.byref(IID_IFileOperation),
+                ctypes.byref(operation),
+            ),
+            "创建 IFileOperation",
+        )
+
+        # FOF_NOERRORUI + FOFX_EARLYFAILURE: stop on error, do not silently
+        # skip an item; FOFX_SHOWELEVATIONPROMPT allows a UAC request.
+        # Deliberately omit FOF_NOCONFIRMATION, FOF_RENAMEONCOLLISION,
+        # FOF_SILENT, and FOF_NORECURSION. The Windows progress UI remains.
+        FOF_NOERRORUI = 0x0400
+        FOFX_EARLYFAILURE = 0x00100000
+        FOFX_SHOWELEVATIONPROMPT = 0x00040000
+        flags = FOF_NOERRORUI | FOFX_EARLYFAILURE | FOFX_SHOWELEVATIONPROMPT
+        check_hr(
+            call_com(operation, 5, ctypes.c_long, (wintypes.DWORD,), flags),
+            "设置 Windows 移动选项",
+        )
+
+        if owner_hwnd:
+            check_hr(
+                call_com(
+                    operation, 9, ctypes.c_long,
+                    (wintypes.HWND,), int(owner_hwnd),
+                ),
+                "设置 Windows 移动窗口",
+            )
+
+        check_hr(
+            sh_create_item(
+                src_path, None, ctypes.byref(IID_IShellItem),
+                ctypes.byref(source_item),
+            ),
+            "获取源文件夹 Shell 项",
+        )
+        check_hr(
+            sh_create_item(
+                dest_parent, None, ctypes.byref(IID_IShellItem),
+                ctypes.byref(destination_item),
+            ),
+            "获取目标文件夹 Shell 项",
+        )
+
+        if stop_event is not None and stop_event.is_set():
+            raise WindowsShellMoveInterrupted("用户已请求停止后续移动")
+        if os.path.lexists(dest_path):
+            raise FileExistsError(f"移动开始前目标出现同名文件夹：{dest_path}")
+
+        # IFileOperation: MoveItem slot 14, PerformOperations slot 21,
+        # GetAnyOperationsAborted slot 22. MoveItem only QUEUES the move.
+        check_hr(
+            call_com(
+                operation, 14, ctypes.c_long,
+                (
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    wintypes.LPCWSTR, ctypes.c_void_p,
+                ),
+                source_item, destination_item, None, None,
+            ),
+            "提交移动请求",
+        )
+
+        perform_hr = call_com(operation, 21, ctypes.c_long, ())
+        aborted = wintypes.BOOL(0)
+        # Must be called even when PerformOperations returns an error.
+        aborted_hr = call_com(
+            operation, 22, ctypes.c_long,
+            (ctypes.POINTER(wintypes.BOOL),), ctypes.byref(aborted),
+        )
+        check_hr(aborted_hr, "检查 Windows 移动结果")
+        if aborted.value:
+            result_code = ctypes.c_uint32(perform_hr).value
+            raise WindowsShellMoveInterrupted(
+                f"Windows 已取消或中断此项移动（HRESULT=0x{result_code:08X}）；"
+                f"源目录存在={os.path.lexists(src_path)}，"
+                f"目标目录存在={os.path.lexists(dest_path)}；"
+                "请检查两个位置，不会将其计为成功"
+            )
+        check_hr(perform_hr, "执行 Windows 移动")
+
+        # The exact source folder must disappear and the exact destination
+        # folder must exist. Anything else is NOT reported as a success.
+        source_exists = os.path.lexists(src_path)
+        target_exists = os.path.isdir(dest_path)
+        if source_exists or not target_exists:
+            raise OSError(
+                "Windows 返回完成，但移动结果不符合预期："
+                f"源目录存在={source_exists}，目标目录存在={target_exists}。"
+                "已判定为移动失败，请检查源和目标（不会自动清理文件）"
+            )
+
+        return dest_path
+
+    finally:
+        # COM objects must be released within the SAME STA thread in which
+        # they were created, before OleUninitialize.
+        try:
+            release_com(destination_item)
+        finally:
+            try:
+                release_com(source_item)
+            finally:
+                try:
+                    release_com(operation)
+                finally:
+                    if com_initialized:
+                        ole_uninitialize()
+
+
 def safe_move_directory(src_path: str, dest_parent: str) -> str:
     """Move one directory without deleting/overwriting an existing destination."""
     if not src_path or not os.path.isdir(src_path):
