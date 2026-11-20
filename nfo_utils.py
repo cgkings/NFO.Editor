@@ -6,7 +6,6 @@ import json
 import os
 import re
 import time
-import shutil
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -119,6 +118,25 @@ def unique_paths(paths: Iterable[str]) -> list[str]:
         if key not in seen:
             seen.add(key)
             result.append(os.path.normpath(path))
+    return result
+
+
+def unique_paths_lexical(paths: Iterable[str]) -> list[str]:
+    """Deduplicate selection paths without touching disk (GUI hot path).
+
+    Security-sensitive checks still run inside the moving worker using
+    move_directory_fast_or_shell, including canonical/symlink validation.
+    """
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw_path in paths:
+        if not raw_path:
+            continue
+        path = os.path.abspath(os.path.normpath(os.fspath(raw_path)))
+        key = os.path.normcase(path)
+        if key not in seen:
+            seen.add(key)
+            result.append(path)
     return result
 
 
@@ -462,10 +480,12 @@ def move_directory_fast_or_shell(
     *,
     owner_hwnd: int = 0,
     stop_event=None,
+    on_cross_volume=None,
 ) -> str:
     """同卷直接调用 Windows 系统目录重命名；仅跨卷时使用 IFileOperation。
 
-    不扫描文件、不读取图片、不复制 STRM/NFO 文件。
+    同卷不扫描文件、不读取影片；跨卷必须经调用方明确授权后，
+    才使用 Windows Shell 的复制-删除移动流程。
     os.rename() 返回非跨卷错误时直接失败，绝不误入复制流程。
     """
     import errno
@@ -498,6 +518,16 @@ def move_directory_fast_or_shell(
         # Windows ERROR_NOT_SAME_DEVICE (17) / errno.EXDEV 才代表跨卷。
         # 占用、权限、重名等错误不得自动改走复制。
         if exc.errno == errno.EXDEV or getattr(exc, "winerror", None) == 17:
+            # 安全默认：未经调用方明确确认，绝不发生跨卷复制。
+            # on_cross_volume 必须先得到用户授权；拒绝时应抛出 OSError。
+            if on_cross_volume is None:
+                raise OSError(
+                    "检测到跨卷移动，已阻止自动复制；源文件夹保持不变。"
+                    "请通过主界面移动并确认跨卷复制。"
+                ) from exc
+            on_cross_volume(src_path, dest_path)
+            if stop_event is not None and stop_event.is_set():
+                raise WindowsShellMoveInterrupted("用户已取消跨卷移动")
             return move_directory_windows_shell(
                 src_path, dest_parent,
                 owner_hwnd=owner_hwnd,
@@ -758,48 +788,13 @@ def move_directory_windows_shell(
 
 
 def safe_move_directory(src_path: str, dest_parent: str) -> str:
-    """Move one directory without deleting/overwriting an existing destination."""
-    if not src_path or not os.path.isdir(src_path):
-        raise OSError(f"源文件夹不存在或不是目录: {src_path}")
-    if not dest_parent or not os.path.isdir(dest_parent):
-        raise OSError(f"目标目录不存在或不是目录: {dest_parent}")
+    """兼容旧入口：只允许真正的同卷目录重命名，不允许隐式复制。
 
-    src_path = os.path.normpath(src_path)
-    dest_parent = os.path.normpath(dest_parent)
-    folder_name = os.path.basename(src_path)
-    if not folder_name:
-        raise OSError("无法确定源文件夹名称")
+    保留函数名以兼容已有调用方；若检测到跨卷，则安全失败。
+    GUI 入口需要经过用户确认后才能使用 Windows Shell 跨卷移动。
+    """
+    return move_directory_fast_or_shell(src_path, dest_parent)
 
-    dest_path = os.path.join(dest_parent, folder_name)
-    if same_path(src_path, dest_path):
-        raise OSError("源目录和目标目录相同，已取消移动")
-    if is_path_within(dest_parent, src_path, include_equal=True):
-        raise OSError("不能把文件夹移动到自身或自身子目录")
-    if os.path.exists(dest_path):
-        raise FileExistsError(f"目标已存在同名文件夹，未执行覆盖: {dest_path}")
-
-    src_drive = os.path.splitdrive(canonical_path(src_path))[0]
-    dest_drive = os.path.splitdrive(canonical_path(dest_parent))[0]
-    if src_drive == dest_drive:
-        shutil.move(src_path, dest_path)
-        return dest_path
-
-    try:
-        shutil.copytree(src_path, dest_path)
-    except Exception:
-        if os.path.exists(dest_path):
-            shutil.rmtree(dest_path, ignore_errors=True)
-        raise
-
-    try:
-        shutil.rmtree(src_path)
-    except Exception as exc:
-        # Keep the verified destination copy; deleting it here could turn a recoverable
-        # duplicate into data loss if the source is only partially removable.
-        raise OSError(
-            f"文件已复制到目标，但源目录删除失败；为安全起见保留两份: {exc}"
-        ) from exc
-    return dest_path
 
 
 def preferred_nfo_file(folder_path: str, preferred_stem: Optional[str] = None) -> Optional[str]:
