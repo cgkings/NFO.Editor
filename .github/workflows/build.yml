@@ -2,11 +2,6 @@ name: Build PySide6 Windows Release
 
 on:
   push:
-    branches:
-      - main
-      - master
-      - QT6
-      - qt6
     tags:
       - "v*"
   pull_request:
