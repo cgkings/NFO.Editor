@@ -1753,7 +1753,7 @@ class NFOEditorQt6(NFOEditorQt):
                     self._tree_item_index[self._event_path_key(nfo_path)] = item
             finally:
                 self.file_tree.setUpdatesEnabled(old_updates)
-                del blocker
+                blocker.unblock()
 
     @pyqtSlot(int, int)
     def _on_load_result(self, count, parsed_count):
@@ -2235,7 +2235,7 @@ class NFOEditorQt6(NFOEditorQt):
                     self.file_tree.takeTopLevelItem(index)
         finally:
             self.file_tree.setUpdatesEnabled(True)
-            del blocker
+            blocker.unblock()
 
         self.nfo_cache.remove_many(affected)
         self.nfo_files = [
@@ -2759,7 +2759,7 @@ class NFOEditorQt6(NFOEditorQt):
                     item.setSelected(True)
                     self.file_tree.scrollToItem(item)
             finally:
-                del blocker
+                blocker.unblock()
         finally:
             self._selection_change_guard = False
 
@@ -3363,7 +3363,7 @@ class NFOEditorQt6(NFOEditorQt):
                     position -= 1
             finally:
                 tree.setUpdatesEnabled(previous_updates)
-                del blocker
+                blocker.unblock()
             yield f"正在更新影片列表：{tree_total - position - 1}/{tree_total}"
 
         # 统一清理缓存和更新索引。新 NFO 的 XML 内容没有改变，因此无需重读。
@@ -3449,7 +3449,7 @@ class NFOEditorQt6(NFOEditorQt):
                         pos -= 1
                 finally:
                     target_tree.setUpdatesEnabled(previous_updates)
-                    del blocker
+                    blocker.unblock()
                 yield "正在清理目标列表中的旧文件夹名称..."
 
         if not destination_names:
@@ -3482,7 +3482,7 @@ class NFOEditorQt6(NFOEditorQt):
                 target_tree.addTopLevelItems(items)
             finally:
                 target_tree.setUpdatesEnabled(previous_updates)
-                del blocker
+                blocker.unblock()
             yield f"正在添加目标文件夹：{min(start + 128, len(pending))}/{len(pending)}"
 
         target_tree.sortItems(0, Qt.AscendingOrder)
@@ -3957,7 +3957,7 @@ class NFOEditorQt6(NFOEditorQt):
                             self._last_selected_item = selected_item
         finally:
             self.file_tree.setUpdatesEnabled(previous_updates)
-            del blocker
+            blocker.unblock()
 
     # ================================================================
     #  排序 & 筛选
