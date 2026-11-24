@@ -38,6 +38,7 @@ class CropConfig:
         "wuma": "wuma.png",
         "leak": "leak.png",
         "umr": "umr.png",
+        "ltx": "ltx.png",
     }
     
     WATERMARK_POSITIONS = {
@@ -46,6 +47,7 @@ class CropConfig:
         "wuma": (None, 0), 
         "leak": (None, 0),
         "umr": (None, 0),
+        "ltx": (None, 0),
     }
     
     # 样式配置
@@ -134,7 +136,7 @@ class CropParams:
 class WatermarkSettings:
     """水印设置数据类"""
     enable_subtitle: bool = False
-    mark_type: str = "none"  # none, umr, leak, wuma, youma
+    mark_type: str = "none"  # none, umr, leak, wuma, youma, ltx
     
     def get_active_marks(self) -> List[str]:
         """获取活跃的水印列表"""
@@ -354,9 +356,7 @@ class WatermarkProcessor:
     """水印处理器 - 专门处理水印相关操作"""
     
     def __init__(self, watermark_path: str = ""):
-        self.watermark_path = watermark_path or os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "img"
-        )
+        self.watermark_path = watermark_path or get_resource_path("img")
     
     def get_watermark_path(self, mark_type: str) -> str:
         """获取水印图片路径"""
@@ -640,8 +640,22 @@ class CropDisplayWidget(QLabel):
             return
             
         painter = QPainter(self)
-        painter.drawPixmap(self.crop_params.offset_x, self.crop_params.offset_y, 
-                          self.image_processor.scaled_pixmap)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+
+        # 裁剪框、鼠标及偏移量始终使用逻辑像素。
+        # 直接从当前旋转后的原图绘制到逻辑目标矩形，由 Qt 按当前
+        # 绘图设备的 DPR 渲染，避免低分辨率预览被二次放大。
+        # scaled_pixmap 仅用于保持既有逻辑尺寸和裁剪坐标计算。
+        original = self.image_processor.original_pixmap
+        logical_preview = self.image_processor.scaled_pixmap
+        if original is not None and not original.isNull():
+            target = QRect(
+                self.crop_params.offset_x,
+                self.crop_params.offset_y,
+                logical_preview.width(),
+                logical_preview.height(),
+            )
+            painter.drawPixmap(target, original, original.rect())
         
         if self.crop_params.crop_rect is not None and not self.crop_params.crop_rect.isNull():
             self._draw_crop_overlay(painter)
@@ -734,8 +748,8 @@ class CropDisplayWidget(QLabel):
         # 获取图片边界
         img_left = self.crop_params.offset_x
         img_top = self.crop_params.offset_y
-        img_right = img_left + self.image_processor.scaled_pixmap.width()
-        img_bottom = img_top + self.image_processor.scaled_pixmap.height()
+        img_right = img_left + self.image_processor.scaled_pixmap.width() - 1
+        img_bottom = img_top + self.image_processor.scaled_pixmap.height() - 1
         
         # 约束水平边界
         if rect.left() < img_left:
@@ -901,7 +915,7 @@ class WatermarkControlWidget(QGroupBox):
         # 创建水印选项
         mark_options = [
             [("有码", "youma"), ("无码", "wuma"), ("流出", "leak")],
-            [("破解", "umr"), ("无", "none")]
+            [("破解", "umr"), ("LTX", "ltx"), ("无", "none")]
         ]
         
         for row_options in mark_options:
@@ -1226,6 +1240,8 @@ class EmbyPosterCrop(QDialog):
     
     def set_watermark_options(self, enable_subtitle: bool = False, mark_type: str = "none"):
         """设置水印选项 - 用于命令行参数"""
+        if mark_type == "LTX破解":
+            mark_type = "ltx"
         try:
             if enable_subtitle:
                 self.watermark_control.sub_check.setChecked(True)
@@ -1242,11 +1258,7 @@ class EmbyPosterCrop(QDialog):
 # ================================ 程序入口 ================================
 if __name__ == "__main__":
     try:
-        # 启用高DPI支持
-        if hasattr(Qt, "AA_EnableHighDpiScaling"):
-            QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-        if hasattr(Qt, "AA_UseHighDpiPixmaps"):
-            QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+        # Qt6 默认启用高 DPI 支持，无需设置 Qt5 的高 DPI 属性。
         
         app = QApplication(sys.argv)
         app.setStyle("Fusion")
@@ -1264,7 +1276,7 @@ if __name__ == "__main__":
         parser.add_argument("--image", help="要处理的图片路径")
         parser.add_argument("--nfo-name", help="NFO文件基础名称") 
         parser.add_argument("--subtitle", action="store_true", help="是否添加字幕水印")
-        parser.add_argument("--mark-type", choices=["none", "umr", "leak", "wuma", "youma"], 
+        parser.add_argument("--mark-type", choices=["none", "umr", "leak", "wuma", "youma", "ltx", "LTX破解"], 
                           default="none", help="水印类型")
         args = parser.parse_args()
         

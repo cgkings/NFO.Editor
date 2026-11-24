@@ -4799,13 +4799,15 @@ class NFOEditorQt6(NFOEditorQt):
             root = parse_xml_file(self.current_file_path).getroot()
             has_subtitle = False
             mark_type = "none"
-            priority = {"none": 0, "wuma": 1, "leak": 2, "umr": 3}
+            priority = {"none": 0, "wuma": 1, "leak": 2, "umr": 3, "ltx": 4}
             for tag in root.findall("tag"):
                 tag_text = (tag.text or "").casefold()
                 if "中文字幕" in tag_text:
                     has_subtitle = True
                 candidate = "none"
-                if "无码破解" in tag_text:
+                if "ltx破解" in tag_text:
+                    candidate = "ltx"
+                elif "无码破解" in tag_text:
                     candidate = "umr"
                 elif "无码流出" in tag_text:
                     candidate = "leak"
