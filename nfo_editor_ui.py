@@ -57,7 +57,8 @@ import qfluentwidgets 时,某些静态资源会触发 QPixmap 等 QWidget 派生
 import os
 import sys
 
-from PySide6.QtCore import Qt, QSettings, QSize
+from PySide6.QtCore import Qt, QSize
+from nfo_utils import portable_qsettings
 from nfo_version import get_app_version
 from PySide6.QtGui import QCursor, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
@@ -449,14 +450,14 @@ class NFOEditorQt(QMainWindow):
         super().closeEvent(event)
 
     def _save_window_state(self):
-        settings = QSettings("NFOEditor", "WindowState")
+        settings = portable_qsettings("WindowState")
         settings.setValue("geometry", self.saveGeometry())
         settings.setValue("windowState", self.saveState())
         if hasattr(self, "main_splitter"):
             settings.setValue("splitterState", self.main_splitter.saveState())
 
     def restore_window_state(self):
-        settings = QSettings("NFOEditor", "WindowState")
+        settings = portable_qsettings("WindowState")
         geometry = settings.value("geometry")
         state = settings.value("windowState")
         splitter_state = settings.value("splitterState")

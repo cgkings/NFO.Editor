@@ -3,13 +3,189 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import ntpath
+import sqlite3
 import os
 import re
+import sys
 import time
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
+
+
+
+def application_dir() -> Path:
+    """开发时取 .py 所在目录；PyInstaller 打包后取真实 EXE 所在目录。
+
+    不能用当前工作目录，也不能把 _MEIPASS 临时解包目录作为写入基准。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def program_config_dir() -> Path:
+    """配置与持久化缓存统一放在程序同级 config 目录。"""
+    return application_dir() / "config"
+
+
+def program_log_dir() -> Path:
+    """审计、事件等日志统一放在程序同级 log 目录。"""
+    return application_dir() / "log"
+
+
+
+SHARED_NFO_SCHEMA = 1
+SHARED_NFO_REQUIRED = frozenset({
+    "num", "title", "originaltitle", "sorttitle", "series",
+    "plot", "release", "rating", "actors", "tags",
+})
+
+
+def shared_nfo_key(path: str) -> str:
+    """Windows 同一路径忽略大小写；Linux 测试中也使用相同的纯字符串格式。"""
+    return ntpath.normcase(ntpath.normpath(os.fspath(path)))
+
+
+def shared_nfo_valid(data) -> bool:
+    """仅信任全字段 NFO 元数据；早期版本的精简缓存不能当成完整数据。"""
+    return (
+        isinstance(data, dict)
+        and SHARED_NFO_REQUIRED.issubset(data)
+        and isinstance(data.get("actors"), list)
+        and isinstance(data.get("tags"), list)
+    )
+
+
+class SharedNFOCache:
+    """三个程序共享的 NFO XML 元数据缓存，不存 STRM、视频参数或图片像素。
+
+    SQLite WAL + busy_timeout 允许多个独立进程读写；每个工作线程独占连接。
+    缓存读取必须用文件的 mtime_ns + size 检验，任何一项变化都要重新解析。
+    """
+
+    BATCH_SIZE = 300
+
+    def __init__(self, db_path=None):
+        self.db_path = Path(db_path) if db_path is not None else program_config_dir() / "shared_nfo_cache.sqlite3"
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(str(self.db_path), timeout=10.0)
+        try:
+            self.connection.execute("PRAGMA busy_timeout=10000")
+            self.connection.execute("PRAGMA journal_mode=WAL")
+            self.connection.execute("PRAGMA synchronous=NORMAL")
+            self.connection.execute(
+                "CREATE TABLE IF NOT EXISTS shared_nfo_cache ("
+                "path_key TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, "
+                "size INTEGER NOT NULL, payload TEXT NOT NULL, "
+                "schema_version INTEGER NOT NULL)"
+            )
+            self.connection.commit()
+        except (sqlite3.Error, OSError):
+            self.connection.close()
+            raise
+
+    def get_many(self, paths):
+        """返回 {原始路径: (mtime_ns, size, 完整 dict)}；不触碰影片文件。"""
+        originals = {}
+        for path in paths:
+            if path:
+                originals.setdefault(shared_nfo_key(path), []).append(os.fspath(path))
+        results = {}
+        keys = list(originals)
+        for start in range(0, len(keys), self.BATCH_SIZE):
+            batch = keys[start:start + self.BATCH_SIZE]
+            placeholders = ",".join("?" for _ in batch)
+            sql = (
+                "SELECT path_key, mtime_ns, size, payload FROM shared_nfo_cache "
+                "WHERE schema_version = ? AND path_key IN (" + placeholders + ")"
+            )
+            for key, mtime, size, payload in self.connection.execute(
+                sql, (SHARED_NFO_SCHEMA, *batch)
+            ):
+                try:
+                    metadata = json.loads(payload)
+                except (TypeError, ValueError):
+                    continue
+                if not shared_nfo_valid(metadata):
+                    continue
+                for path in originals[key]:
+                    results[path] = (mtime, size, metadata)
+        return results
+
+    def store_many(self, rows):
+        """rows: [(path, mtime_ns, size, 全字段 NFO dict)]；调用方须已复核 stat。"""
+        payloads = [
+            (shared_nfo_key(path), int(mtime), int(size),
+             json.dumps(data, ensure_ascii=False), SHARED_NFO_SCHEMA)
+            for path, mtime, size, data in rows
+            if shared_nfo_valid(data)
+        ]
+        if not payloads:
+            return
+        try:
+            self.connection.executemany(
+                "INSERT INTO shared_nfo_cache "
+                "(path_key, mtime_ns, size, payload, schema_version) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(path_key) DO UPDATE SET "
+                "mtime_ns=excluded.mtime_ns, size=excluded.size, "
+                "payload=excluded.payload, schema_version=excluded.schema_version",
+                payloads,
+            )
+            self.connection.commit()
+        except sqlite3.Error:
+            self.connection.rollback()
+            raise
+
+    def close(self):
+        self.connection.close()
+
+
+def editor_event_file(library_root: str) -> str:
+    """按 NFO 库根目录区分事件文件，防止多个媒体库互相串事件。"""
+    if not library_root:
+        raise ValueError("library_root 不能为空")
+    canonical = os.path.normcase(os.path.abspath(os.fspath(library_root)))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    return str(program_log_dir() / f"nfo_editor_events_{digest}.jsonl")
+
+
+def portable_qsettings(scope: str):
+    """Qt 设置写入程序同级 config/*.ini；首次使用时迁移旧 QSettings。
+
+    PySide6 采用延迟导入，nfo_utils 的纯文件操作函数不依赖 GUI 模块。
+    """
+    from PySide6.QtCore import QSettings
+
+    files = {
+        "Directories": "nfo_editor_directories.ini",
+        "WindowState": "nfo_editor_window_state.ini",
+        "PhotoWall": "cg_photo_wall.ini",
+    }
+    if scope not in files:
+        raise ValueError(f"未知 Qt 设置范围：{scope}")
+
+    settings_path = program_config_dir() / files[scope]
+    if not settings_path.is_file():
+        # 迁移 Windows 注册表 / 旧 Qt 用户设置，仅复制有值的项。
+        old_settings = QSettings("NFOEditor", scope)
+        legacy_keys = old_settings.allKeys()
+        if legacy_keys:
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            new_settings = QSettings(str(settings_path), QSettings.IniFormat)
+            for key in legacy_keys:
+                new_settings.setValue(key, old_settings.value(key))
+            new_settings.sync()
+            if new_settings.status() != QSettings.NoError:
+                raise OSError(f"无法迁移旧 Qt 设置至：{settings_path}")
+            return new_settings
+
+    # QFileDialog/QSettings 创建操作均由现有界面调用；此处只定位和创建小目录。
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    return QSettings(str(settings_path), QSettings.IniFormat)
 
 
 IMAGE_EXTENSIONS: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
@@ -220,10 +396,9 @@ def append_editor_event(
         payload["source"] = str(source)
     payload.update(extra)
 
-    event_file = os.path.join(
-        os.path.normpath(library_root),
-        ".nfo_editor_events.jsonl",
-    )
+    # 外部组件事件也是日志；新版本不再往 NFO 媒体库根目录写隐藏文件。
+    event_file = editor_event_file(library_root)
+    os.makedirs(os.path.dirname(event_file), exist_ok=True)
     encoded = (
         json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         + "\n"

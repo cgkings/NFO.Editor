@@ -122,9 +122,9 @@ COMPACT_NUMBER_PATTERN = re.compile(
 # 已识别的分碟后缀只是文件分段，不应分裂为不同番号。
 DISC_SUFFIX_PATTERN = re.compile(r"^(?:CD|DISC|DISK|PART)0?[1-9]$", re.I)
 
-# 文件名中的 U/C 一般用作发行版本标记。仅在 NFO 配对时允许其
-# 回退匹配同一基础番号，不将 A/B 或其他有区分意义的后缀混为一组。
-RELEASE_SUFFIXES_FOR_NFO = frozenset({"U", "C"})
+# 文件名中已知的发行版本标记，可在无 NFO 时直接用于查重。
+# LTX 是本次样本中的发行标签；A/B 等不同作品后缀继续保留。
+RELEASE_SUFFIXES_FOR_NFO = frozenset({"U", "C", "LTX"})
 
 
 IGNORED_PREFIX = {
@@ -171,36 +171,37 @@ def application_dir() -> Path:
 
 
 def program_data_dir() -> Path:
-    """便携模式：日志、SQLite 缓存和配置随 .py/.exe 同目录存放。
+    """可写配置和 SQLite 缓存：.py/.exe 所在目录下的 config 子目录。"""
+    return application_dir() / "config"
 
-    使用 application_dir 而非 sys._MEIPASS：onefile 的解压目录是临时目录。
-    如安装于 Program Files 等受保护目录，须将程序移到可写位置。
-    """
-    return application_dir()
+
+def program_log_dir() -> Path:
+    """运行、审计和预览日志：.py/.exe 所在目录下的 log 子目录。"""
+    return application_dir() / "log"
 
 
 def legacy_program_data_dir() -> Path:
-    """仅读取旧版 APPDATA 配置；新的可写文件不再存放在此。"""
+    """返回 APPDATA 程序专属目录；保留旧函数名兼容现有调用。"""
     appdata = os.environ.get("APPDATA")
     base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
     return base / DATA_DIR_NAME
 
 
 def ensure_program_data_dir() -> Path:
-    """在后台线程验证可执行文件或源码同级目录是否可写。"""
-    directory = program_data_dir()
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        probe = directory / f".write_test_{os.getpid()}_{secrets.token_hex(4)}"
-        with open(probe, "xb") as stream:
-            stream.write(b"ok")
-        probe.unlink()
-    except OSError as error:
-        raise OSError(
-            f"程序所在目录不可写：{directory}\n"
-            "请将 .py/.exe 放在有写入权限的目录；缓存和日志需要保存在这里。"
-        ) from error
-    return directory
+    """在后台线程创建并验证 config、log 目录；主线程不执行磁盘检查。"""
+    for directory in (program_data_dir(), program_log_dir()):
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            probe = directory / f".write_test_{os.getpid()}_{secrets.token_hex(4)}"
+            with open(probe, "xb") as stream:
+                stream.write(b"ok")
+            probe.unlink()
+        except OSError as error:
+            raise OSError(
+                f"程序旁的目录不可写：{directory}\n"
+                "请将 .py/.exe 放在允许写入的文件夹内，以保存配置、缓存和日志。"
+            ) from error
+    return program_data_dir()
 
 
 
@@ -376,7 +377,7 @@ def number_equivalence_key(code: str) -> str:
 
 
 def filename_release_base_key(code: str) -> str:
-    """U/C 发行标记可回退到主番号；A/B 等真实区分后缀不合并。"""
+    """U/C/LTX 等已知发行标记可归并到主番号；A/B 等真实区分后缀不合并。"""
     if not code:
         return ""
     base, delim, suffix = code.rpartition("-")
@@ -386,7 +387,7 @@ def filename_release_base_key(code: str) -> str:
 
 
 def duplicate_number_key(code: str) -> str:
-    """仅合并发行版 U/C 和无后缀番号；保留其他字母后缀的差异。"""
+    """仅合并已知发行标记和无后缀番号；保留其他有区分意义的后缀。"""
     return filename_release_base_key(code) or number_equivalence_key(code)
 
 
@@ -407,7 +408,7 @@ def normalize_series(value: str | None) -> str:
     return re.sub(r"\s+", " ", (value or "").strip()).casefold()
 
 
-def read_nfo(path: str, *, strict: bool = False) -> dict[str, str]:
+def read_nfo(path: str, *, strict: bool = False) -> dict:
     try:
         # 限制大小，避免异常文件拖慢 SSD 查重。
         with open(path, "rb") as handle:
@@ -434,11 +435,29 @@ def read_nfo(path: str, *, strict: bool = False) -> dict[str, str]:
             if strict:
                 raise ValueError("NFO XML 或字符编码无效")
             return {}
+    # 输出完整、可跨程序复用的字段，保持既有 num/title/series 识别行为。
     data = {}
-    for tag in ("num", "title", "originaltitle", "sorttitle", "series"):
+    for tag in (
+        "num", "title", "originaltitle", "sorttitle",
+        "series", "plot", "release",
+    ):
         data[tag] = (root.findtext(tag) or "").strip()
     if not data.get("series"):
-        data["series"] = (root.findtext("./set/name") or "").strip()
+        data["series"] = (
+            root.findtext("./set/name") or root.findtext("./set") or ""
+        ).strip()
+    try:
+        data["rating"] = float((root.findtext("rating") or "").strip() or 0)
+    except ValueError:
+        data["rating"] = 0.0
+    data["actors"] = [
+        name for actor in root.findall("actor")
+        if (name := (actor.findtext("name") or "").strip())
+    ]
+    data["tags"] = [
+        name for tag in root.findall("tag")
+        if (name := (tag.text or "").strip())
+    ]
     return data
 
 
@@ -545,6 +564,13 @@ def get_edition_group(path: str, disc: int | None) -> str:
 def determine_key(nfo: dict, media_path: str, target: str, mode: str) -> str:
     if mode == "系列":
         return normalize_series(nfo.get("series"))
+    # 在番号模式下，独立提取 STRM/视频文件名中的番号，不依赖 NFO。
+    if ntpath.splitext(media_path)[1].casefold() in MEDIA_EXTS:
+        stem = ntpath.splitext(ntpath.basename(media_path))[0]
+        file_code = extract_number(stem)
+        if file_code:
+            return file_code
+    # 文件名识别失败时，才回退到 NFO、目录名及其他候选。
     candidates = (
         nfo.get("num", ""),
         ntpath.splitext(ntpath.basename(media_path))[0],
@@ -788,6 +814,113 @@ def group_duplicates(
     return result
 
 
+
+SHARED_NFO_SCHEMA = 1
+SHARED_NFO_REQUIRED = frozenset({
+    "num", "title", "originaltitle", "sorttitle", "series",
+    "plot", "release", "rating", "actors", "tags",
+})
+
+
+def shared_nfo_key(path: str) -> str:
+    """Windows 同一路径忽略大小写；Linux 测试中也使用相同的纯字符串格式。"""
+    return ntpath.normcase(ntpath.normpath(os.fspath(path)))
+
+
+def shared_nfo_valid(data) -> bool:
+    """仅信任全字段 NFO 元数据；早期版本的精简缓存不能当成完整数据。"""
+    return (
+        isinstance(data, dict)
+        and SHARED_NFO_REQUIRED.issubset(data)
+        and isinstance(data.get("actors"), list)
+        and isinstance(data.get("tags"), list)
+    )
+
+
+class SharedNFOCache:
+    """三个程序共享的 NFO XML 元数据缓存，不存 STRM、视频参数或图片像素。
+
+    SQLite WAL + busy_timeout 允许多个独立进程读写；每个工作线程独占连接。
+    缓存读取必须用文件的 mtime_ns + size 检验，任何一项变化都要重新解析。
+    """
+
+    BATCH_SIZE = 300
+
+    def __init__(self, db_path=None):
+        self.db_path = Path(db_path) if db_path is not None else program_data_dir() / "shared_nfo_cache.sqlite3"
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(str(self.db_path), timeout=10.0)
+        try:
+            self.connection.execute("PRAGMA busy_timeout=10000")
+            self.connection.execute("PRAGMA journal_mode=WAL")
+            self.connection.execute("PRAGMA synchronous=NORMAL")
+            self.connection.execute(
+                "CREATE TABLE IF NOT EXISTS shared_nfo_cache ("
+                "path_key TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, "
+                "size INTEGER NOT NULL, payload TEXT NOT NULL, "
+                "schema_version INTEGER NOT NULL)"
+            )
+            self.connection.commit()
+        except (sqlite3.Error, OSError):
+            self.connection.close()
+            raise
+
+    def get_many(self, paths):
+        """返回 {原始路径: (mtime_ns, size, 完整 dict)}；不触碰影片文件。"""
+        originals = {}
+        for path in paths:
+            if path:
+                originals.setdefault(shared_nfo_key(path), []).append(os.fspath(path))
+        results = {}
+        keys = list(originals)
+        for start in range(0, len(keys), self.BATCH_SIZE):
+            batch = keys[start:start + self.BATCH_SIZE]
+            placeholders = ",".join("?" for _ in batch)
+            sql = (
+                "SELECT path_key, mtime_ns, size, payload FROM shared_nfo_cache "
+                "WHERE schema_version = ? AND path_key IN (" + placeholders + ")"
+            )
+            for key, mtime, size, payload in self.connection.execute(
+                sql, (SHARED_NFO_SCHEMA, *batch)
+            ):
+                try:
+                    metadata = json.loads(payload)
+                except (TypeError, ValueError):
+                    continue
+                if not shared_nfo_valid(metadata):
+                    continue
+                for path in originals[key]:
+                    results[path] = (mtime, size, metadata)
+        return results
+
+    def store_many(self, rows):
+        """rows: [(path, mtime_ns, size, 全字段 NFO dict)]；调用方须已复核 stat。"""
+        payloads = [
+            (shared_nfo_key(path), int(mtime), int(size),
+             json.dumps(data, ensure_ascii=False), SHARED_NFO_SCHEMA)
+            for path, mtime, size, data in rows
+            if shared_nfo_valid(data)
+        ]
+        if not payloads:
+            return
+        try:
+            self.connection.executemany(
+                "INSERT INTO shared_nfo_cache "
+                "(path_key, mtime_ns, size, payload, schema_version) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(path_key) DO UPDATE SET "
+                "mtime_ns=excluded.mtime_ns, size=excluded.size, "
+                "payload=excluded.payload, schema_version=excluded.schema_version",
+                payloads,
+            )
+            self.connection.commit()
+        except sqlite3.Error:
+            self.connection.rollback()
+            raise
+
+    def close(self):
+        self.connection.close()
+
+
 class LocalTextCache:
     """SQLite 仅由扫描管理线程写入；只读快照供本地小文件线程共享。"""
 
@@ -868,7 +1001,8 @@ def iter_scan_folders(roots, stop_event, errors):
             yield folder, nfos, media
 
 
-def read_scan_folder(job, snapshot, mode, source_prefix, mount_prefix, stop_event):
+def read_scan_folder(job, snapshot, mode, source_prefix, mount_prefix, stop_event,
+                     shared_snapshot=None):
     folder, nfo_items, media_items = job
     # 先记住原目录是否存在媒体，避免“只有预告片 + 普通 NFO”
     # 被错误视为纯 NFO 目录，重新生成一条假版本。
@@ -877,8 +1011,9 @@ def read_scan_folder(job, snapshot, mode, source_prefix, mount_prefix, stop_even
     media_items = [item for item in media_items if not is_trailer_filename(item.name)]
     nfo_items.sort(key=lambda item: item.name.casefold())
     media_items.sort(key=lambda item: item.name.casefold())
-    changed, errors, records = [], [], []
-    hits = {"nfo": 0, "strm": 0}
+    changed, errors, records, shared_updates = [], [], [], []
+    shared_snapshot = shared_snapshot or {}
+    hits = {"nfo": 0, "strm": 0, "shared_nfo": 0}
     reads = {"nfo": 0, "strm": 0}
 
     def load(item, kind):
@@ -887,24 +1022,43 @@ def read_scan_folder(job, snapshot, mode, source_prefix, mount_prefix, stop_even
         try:
             st = item.stat(follow_symlinks=False)
             key = nt_key(item.path)
+            fingerprint = (st.st_mtime_ns, st.st_size)
+            shared = shared_snapshot.get(item.path) if kind == "nfo" else None
+            # 优先复用其它程序创建的完整 NFO 元数据，不读取 NFO 正文。
+            if (shared is not None and shared[:2] == fingerprint
+                    and shared_nfo_valid(shared[2])):
+                hits["nfo"] += 1
+                hits["shared_nfo"] += 1
+                cached = snapshot.get(key)
+                if not cached or cached[:2] != fingerprint:
+                    changed.append((
+                        key, st.st_mtime_ns, st.st_size,
+                        json.dumps(shared[2], ensure_ascii=False)
+                    ))
+                return shared[2]
+
             cached = snapshot.get(key)
-            if cached and cached[:2] == (st.st_mtime_ns, st.st_size):
+            if cached and cached[:2] == fingerprint:
                 try:
                     value = json.loads(cached[2])
-                    if ((kind == "nfo" and isinstance(value, dict)) or
-                            (kind == "strm" and isinstance(value, str))):
+                    if kind == "strm" and isinstance(value, str):
                         hits[kind] += 1
+                        return value
+                    if kind == "nfo" and shared_nfo_valid(value):
+                        hits[kind] += 1
+                        shared_updates.append((item.path, *fingerprint, value))
                         return value
                 except (ValueError, TypeError):
                     pass
             reads[kind] += 1
             value = (read_nfo(item.path, strict=True) if kind == "nfo"
                      else read_strm(item.path, strict=True))
-            # DirEntry.stat 有缓存；此处有意 fresh stat，避免读取期间变动被缓存。
+            # Fresh stat 防止文件在读取过程中被修改后仍写入缓存。
             after = os.stat(item.path, follow_symlinks=False)
-            if (after.st_mtime_ns, after.st_size) == (st.st_mtime_ns, st.st_size):
-                changed.append((key, st.st_mtime_ns, st.st_size,
-                                json.dumps(value, ensure_ascii=False)))
+            if (after.st_mtime_ns, after.st_size) == fingerprint:
+                changed.append((key, *fingerprint, json.dumps(value, ensure_ascii=False)))
+                if kind == "nfo" and shared_nfo_valid(value):
+                    shared_updates.append((item.path, *fingerprint, value))
             return value
         except (OSError, ValueError) as error:
             if len(errors) < 25:
@@ -975,7 +1129,7 @@ def read_scan_folder(job, snapshot, mode, source_prefix, mount_prefix, stop_even
                 disc=disc, info_status="仅 NFO",
                 nfo_num=str(parsed.get(path, {}).get("num") or ""),
             ))
-    return records, changed, hits, reads, errors
+    return records, changed, hits, reads, errors, shared_updates
 
 
 def scan_library(
@@ -987,6 +1141,7 @@ def scan_library(
     """本地文件有界并行；SQLite 在管理线程；目标视频零 I/O。"""
     entries, errors = [], []
     cache = None
+    shared_cache = None  # 只在扫描管理线程操作 SQLite，避免跨线程连接。
     snapshot = {}
     if cache_path is not None:
         try:
@@ -994,15 +1149,20 @@ def scan_library(
             snapshot = cache.snapshot
         except (OSError, sqlite3.Error) as error:
             errors.append(f"本地文本缓存不可用，本次直接读取：{error}")
+    try:
+        shared_cache = SharedNFOCache()
+    except (OSError, sqlite3.Error) as error:
+        errors.append(f"共享 NFO 缓存不可用，继续原有扫描：{error}")
     nfo_total = strm_total = video_total = visited = processed = 0
-    stats = {"hits": 0, "parsed": 0, "strm_hits": 0, "strm_read": 0}
+    stats = {"hits": 0, "parsed": 0, "strm_hits": 0,
+             "strm_read": 0, "shared_nfo_hits": 0}
     workers = max(1, min(int(scan_workers), 16))
     pending = []
     last_notify = time.monotonic()
 
     def consume(result):
-        nonlocal processed, cache, last_notify, strm_total, video_total
-        records, changed, hits, reads, notices = result
+        nonlocal processed, cache, shared_cache, last_notify, strm_total, video_total
+        records, changed, hits, reads, notices, shared_updates = result
         entries.extend(records)
         # 统计实际保留下来的媒体，不把预告片计入扫描结果。
         strm_total += sum(entry.media_type == "STRM" for entry in records)
@@ -1012,7 +1172,15 @@ def scan_library(
         stats["parsed"] += reads["nfo"]
         stats["strm_hits"] += hits["strm"]
         stats["strm_read"] += reads["strm"]
+        stats["shared_nfo_hits"] += hits["shared_nfo"]
         errors.extend(notices[:max(0, 25 - len(errors))])
+        if shared_cache is not None and shared_updates:
+            try:
+                shared_cache.store_many(shared_updates)
+            except (OSError, sqlite3.Error) as error:
+                errors.append(f"共享 NFO 缓存写入失败，继续扫描：{error}")
+                shared_cache.close()
+                shared_cache = None
         if cache is not None:
             try:
                 cache.store_many(changed)
@@ -1027,6 +1195,20 @@ def scan_library(
             notify(visited, processed)
             last_notify = now
 
+    def shared_rows(job):
+        nonlocal shared_cache
+        if shared_cache is None:
+            return {}
+        try:
+            return shared_cache.get_many(
+                [item.path for item in job[1] if not is_trailer_filename(item.name)]
+            )
+        except (OSError, sqlite3.Error) as error:
+            errors.append(f"共享 NFO 缓存读取失败，继续原有扫描：{error}")
+            shared_cache.close()
+            shared_cache = None
+            return {}
+
     try:
         # 仅保留最多 2*workers 个目录任务，不把整库 Future 堆进内存。
         executor = (ThreadPoolExecutor(max_workers=workers, thread_name_prefix="CGDedupe-Local")
@@ -1040,11 +1222,17 @@ def scan_library(
                     nfo_total += sum(
                         not is_trailer_filename(item.name) for item in job[1]
                     )
+                    current_shared = shared_rows(job)
                     if pool is None:
-                        consume(read_scan_folder(job, snapshot, mode, source_prefix, mount_prefix, stop_event))
+                        consume(read_scan_folder(
+                            job, snapshot, mode, source_prefix, mount_prefix,
+                            stop_event, current_shared
+                        ))
                         continue
-                    pending.append(pool.submit(read_scan_folder, job, snapshot, mode,
-                                               source_prefix, mount_prefix, stop_event))
+                    pending.append(pool.submit(
+                        read_scan_folder, job, snapshot, mode, source_prefix,
+                        mount_prefix, stop_event, current_shared
+                    ))
                     if len(pending) >= workers * 2:
                         # 按提交顺序归并，保证每次扫描 ID/显示顺序稳定。
                         consume(pending.pop(0).result())
@@ -1066,6 +1254,11 @@ def scan_library(
                 cache.close()
             except sqlite3.Error as error:
                 errors.append(f"缓存保存失败：{error}")
+        if shared_cache is not None:
+            try:
+                shared_cache.close()
+            except sqlite3.Error as error:
+                errors.append(f"共享 NFO 缓存关闭失败：{error}")
     for identifier, entry in enumerate(entries, 1):
         entry.identifier = identifier
     notify(visited, processed)
@@ -1318,7 +1511,7 @@ def append_unrecognized_scan_log(
     if not unknown:
         return ""
 
-    log_file = program_data_dir() / "scan_unrecognized.jsonl"
+    log_file = program_log_dir() / "scan_unrecognized.jsonl"
     log_file.parent.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.datetime.now(
         datetime.timezone.utc
@@ -1471,8 +1664,8 @@ class MergeDeletePartial(MergeDeleteBlocked):
 
 
 def merge_delete_log_path() -> Path:
-    """合并删除审计日志：脚本或 EXE 同级 merge_delete.jsonl。"""
-    return program_data_dir() / "merge_delete.jsonl"
+    """合并删除审计日志：程序旁的 log/merge_delete.jsonl。"""
+    return program_log_dir() / "merge_delete.jsonl"
 
 
 def append_merge_delete_log(operation_id: str, stage: str, **data):
@@ -2167,7 +2360,7 @@ def format_bulk_preview(batch: dict) -> str:
 
 
 def _save_bulk_preview(operation_id: str, content: str) -> str:
-    path = program_data_dir() / f"bulk_preview_{operation_id}.txt"
+    path = program_log_dir() / f"bulk_preview_{operation_id}.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "x", encoding="utf-8", newline="\n") as handle:
         handle.write(content)
@@ -2612,7 +2805,7 @@ def precheck_bulk_move(
              "destination_root": destination_root, "group_count": len(groups),
              "matched_groups": matched, "plans": valid, "skipped": skipped}
     preview = format_bulk_move_preview(batch)
-    path = program_data_dir() / f"move_preview_{operation_id}.txt"
+    path = program_log_dir() / f"move_preview_{operation_id}.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "x", encoding="utf-8", newline="\n") as stream:
         stream.write(preview)
@@ -2831,7 +3024,7 @@ def _refresh_move_scopes(plans: list[dict], from_prefix: str, to_prefix: str,
             # 每个作品目录单独遍历，避免 unique_scan_roots 对大量路径进行 O(N²) 去重。
             for job in iter_scan_folders([path], unchanged_event, errors):
                 new_nfo_count += sum(not is_trailer_filename(item.name) for item in job[1])
-                fresh, changed, _hits, _reads, notices = read_scan_folder(
+                fresh, changed, _hits, _reads, notices, _shared_updates = read_scan_folder(
                     job, {}, "番号", from_prefix, to_prefix, unchanged_event,
                 )
                 all_records.extend(fresh)
@@ -2981,7 +3174,7 @@ class ScanWorker(QtCore.QThread):
 
     def run(self):
         try:
-            # 验证脚本或 EXE 所在目录可写：GUI 线程不执行磁盘写入。
+            # 验证程序旁的 config/log 可写：GUI 线程不执行磁盘写入。
             ensure_program_data_dir()
             if self.stop_event.is_set():
                 return
@@ -3361,18 +3554,20 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
 
     def __init__(self, initial_directory: str | None = None):
         super().__init__()
-        # 只计算路径并尝试读取旧便携配置；首次扫描前不创建数据目录。
+        # 按 .py/.exe 所在目录定位 config、log；首次扫描前不创建目录。
         self.data_dir = program_data_dir()
         self._storage_active = self.data_dir.is_dir()
         self.settings_file = self.data_dir / "settings.json"
         self.cache_file = self.data_dir / "video_index.sqlite3"
-        self.merge_log_file = self.data_dir / "merge_delete.jsonl"
-        # 读取旧位置的设置，不改动旧文件；保存时统一写到 .py/.exe 同级。
+        self.merge_log_file = program_log_dir() / "merge_delete.jsonl"
+        # 新设置始终写入 config；旧便携目录及 APPDATA 仅作首次读取备选。
+        portable_settings = application_dir() / "settings.json"
         legacy_settings = application_dir() / DATA_DIR_NAME / "settings.json"
         appdata_settings = legacy_program_data_dir() / "settings.json"
         settings_source = next(
-            (candidate for candidate in (self.settings_file, legacy_settings, appdata_settings)
-             if candidate.is_file()), self.settings_file,
+            (candidate for candidate in (
+                self.settings_file, portable_settings, legacy_settings, appdata_settings
+            ) if candidate.is_file()), self.settings_file,
         )
         self.settings = json_load(settings_source)
         # 从旧版本继承已有的纯路径映射，不发起任何网络属性请求。
@@ -3470,8 +3665,9 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             if reported:
                 continue
             reported = True
-            path = program_data_dir() / "gui_freeze_trace.log"
+            path = program_log_dir() / "gui_freeze_trace.log"
             try:
+                path.parent.mkdir(parents=True, exist_ok=True)
                 with open(path, "a", encoding="utf-8", newline="\n") as out:
                     out.write(
                         f"\n{'=' * 72}\n"
@@ -4156,7 +4352,8 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             f"重复 {total_duplicate_groups} 组{visibility}，番号未识别 {unknown}"
         )
         message += (
-            f"；NFO 缓存命中 {cache_hits} / 本次解析 {cache_parsed}"
+            f"；NFO 缓存命中 {cache_hits}（其中共享缓存 {stats.get('shared_nfo_hits', 0)}）"
+            f" / 本次解析 {cache_parsed}"
             f"；STRM 缓存命中 {strm_hits} / 本次读取 {strm_read}"
             f"；已恢复视频参数 {restored_video_rows} 条（14天内）"
         )

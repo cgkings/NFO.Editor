@@ -1,6 +1,9 @@
+import json
 import os
+import sqlite3
 import sys
 import subprocess
+import threading
 import xml.etree.ElementTree as ET
 from functools import lru_cache
 from collections import OrderedDict
@@ -24,7 +27,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QFrame,
 )
-from PySide6.QtCore import Qt, Signal, QSize, QTimer, QSettings, QObject
+from PySide6.QtCore import Qt, Signal, QSize, QTimer, QObject, QThread
 from PySide6.QtGui import (
     QPixmap,
     QIcon,
@@ -37,6 +40,10 @@ import concurrent.futures
 from enum import Enum
 from nfo_version import get_app_version
 from nfo_utils import (
+    portable_qsettings,
+    program_config_dir,
+    SharedNFOCache,
+    shared_nfo_valid,
     is_path_within,
     preferred_image_from_names,
     preferred_nfo_from_names,
@@ -47,6 +54,192 @@ from nfo_utils import (
 class LoadStage(Enum):
     SCANNING = 1
     LOADING = 2
+
+
+
+class PhotoWallMetadataWorker(QThread):
+    """后台枚举海报/NFO；优先读取编辑器的持久化 SQLite 索引。
+
+    只有缓存记录的 mtime_ns、size 与现有 NFO 完全相同时才命中。
+    stop_event.set() = 请求停止；每次任务新建 Event，退出时清理。
+    不访问视频文件；不在子线程更新任何 GUI 控件。
+    """
+
+    progress = Signal(str, int, int)
+    completed = Signal(list, int, int)  # posters, SQLite hits, XML parses
+    error = Signal(str)
+    BATCH_SIZE = 350
+
+    def __init__(self, folder_path):
+        super().__init__()
+        self.folder_path = os.path.normpath(folder_path)
+        self.stop_event = threading.Event()
+
+    def stop(self):
+        self.stop_event.set()
+
+    @staticmethod
+    def _parse_nfo(path):
+        root = ET.parse(path).getroot()
+        def field(name):
+            return (root.findtext(name) or "").strip()
+
+        release = field("release")
+        actors = []
+        for actor in root.findall("actor"):
+            name = (actor.findtext("name") or "").strip()
+            if name:
+                actors.append(name)
+        tags = [(tag.text or "").strip() for tag in root.findall("tag")]
+        try:
+            rating = float(field("rating") or 0)
+        except ValueError:
+            rating = 0.0
+        return {
+            "num": field("num"),
+            "title": field("title"),
+            "originaltitle": field("originaltitle"),
+            "sorttitle": field("sorttitle"),
+            "plot": field("plot"),
+            "release": release,
+            "year": release.split("-", 1)[0] if release else "",
+            "rating": rating,
+            "actors": actors,
+            "tags": [tag for tag in tags if tag],
+            "series": read_series_text(root),
+        }
+
+    def run(self):
+        conn = None
+        shared_cache = None
+        try:
+            pairs = []
+            directory_count = 0
+            for folder, directories, names in os.walk(
+                self.folder_path, topdown=True, followlinks=False
+            ):
+                if self.stop_event.is_set():
+                    return
+                directories.sort(key=str.casefold)
+                preferred_stem = os.path.basename(folder)
+                poster = preferred_image_from_names(
+                    folder, names, "poster", preferred_stem
+                )
+                nfo = preferred_nfo_from_names(folder, names, preferred_stem)
+                if poster and nfo:
+                    pairs.append((poster, nfo, folder))
+                directory_count += 1
+                if directory_count % 200 == 0:
+                    self.progress.emit("扫描目录", directory_count, 0)
+
+            if self.stop_event.is_set():
+                return
+
+            try:
+                shared_cache = SharedNFOCache()
+            except (OSError, sqlite3.Error) as error:
+                print(f"共享 NFO 缓存不可用，回退原编辑器索引：{error}")
+
+            # 以只读方式打开，不会创建、更不会改写编辑器数据库。
+            db_path = program_config_dir() / "nfo_index.sqlite3"
+            if db_path.is_file():
+                try:
+                    uri = db_path.resolve().as_uri() + "?mode=ro"
+                    conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+                    conn.execute("PRAGMA query_only=ON")
+                except (sqlite3.Error, OSError, ValueError):
+                    if conn is not None:
+                        conn.close()
+                    conn = None
+
+            posters = []
+            hits = 0
+            parsed = 0
+            total = len(pairs)
+            for start in range(0, total, self.BATCH_SIZE):
+                if self.stop_event.is_set():
+                    return
+                batch = pairs[start:start + self.BATCH_SIZE]
+                indexed = {}
+                shared_rows = {}
+                if shared_cache is not None:
+                    try:
+                        shared_rows = shared_cache.get_many([nfo for _, nfo, _ in batch])
+                    except (OSError, sqlite3.Error) as error:
+                        print(f"共享 NFO 缓存读取失败，使用原索引：{error}")
+                        shared_cache.close()
+                        shared_cache = None
+                shared_to_write = []
+                if conn is not None:
+                    placeholders = ",".join("?" for _ in batch)
+                    params = [self.folder_path, *(nfo for _, nfo, _ in batch)]
+                    try:
+                        query = (
+                            "SELECT nfo_path, mtime_ns, size, data_json FROM nfo_index "
+                            "WHERE root_path = ? AND nfo_path IN (" + placeholders + ")"
+                        )
+                        indexed = {
+                            nfo: (mtime, size, payload)
+                            for nfo, mtime, size, payload in conn.execute(query, params)
+                        }
+                    except sqlite3.Error:
+                        # 缺失旧表 / 锁定 / 不兼容数据库时不阻断照片墙。
+                        conn.close()
+                        conn = None
+
+                for poster_path, nfo_path, folder in batch:
+                    if self.stop_event.is_set():
+                        return
+                    try:
+                        stat = os.stat(nfo_path)
+                        fingerprint = (stat.st_mtime_ns, stat.st_size)
+                        shared_row = shared_rows.get(nfo_path)
+                        metadata = None
+                        if (shared_row is not None and shared_row[:2] == fingerprint
+                                and shared_nfo_valid(shared_row[2])):
+                            metadata = shared_row[2]
+                            hits += 1
+                        if metadata is None:
+                            row = indexed.get(nfo_path)
+                            if row is not None and row[:2] == fingerprint:
+                                try:
+                                    candidate = json.loads(row[2])
+                                    if shared_nfo_valid(candidate):
+                                        metadata = candidate
+                                        hits += 1
+                                except (json.JSONDecodeError, TypeError, UnicodeError):
+                                    pass
+                        if metadata is None:
+                            metadata = self._parse_nfo(nfo_path)
+                            parsed += 1
+                        if (shared_cache is not None and shared_nfo_valid(metadata)
+                                and (shared_row is None or shared_row[:2] != fingerprint)):
+                            after = os.stat(nfo_path)
+                            if (after.st_mtime_ns, after.st_size) == fingerprint:
+                                shared_to_write.append((nfo_path, *fingerprint, metadata))
+                        posters.append((poster_path, os.path.basename(folder), metadata))
+                    except (OSError, ET.ParseError, UnicodeError) as exc:
+                        print(f"照片墙 NFO 读取失败 {nfo_path}: {exc}")
+
+                if shared_cache is not None and shared_to_write:
+                    try:
+                        shared_cache.store_many(shared_to_write)
+                    except (OSError, sqlite3.Error) as error:
+                        print(f"共享 NFO 缓存写入失败，继续展示照片墙：{error}")
+                        shared_cache.close()
+                        shared_cache = None
+                self.progress.emit("读取元数据", min(start + len(batch), total), total)
+
+            if not self.stop_event.is_set():
+                self.completed.emit(posters, hits, parsed)
+        except OSError as exc:
+            self.error.emit(f"扫描照片墙目录失败：{exc}")
+        finally:
+            if conn is not None:
+                conn.close()
+            if shared_cache is not None:
+                shared_cache.close()
+            self.stop_event.clear()
 
 
 class BluePalette(QPalette):
@@ -305,7 +498,11 @@ class PhotoWallDialog(QDialog):
         self._reset_image_manager()
 
         self.is_loading = False
-        self.settings = QSettings("NFOEditor", "PhotoWall")
+        self._metadata_thread = None
+        self._pending_metadata_folder = None
+        self._metadata_result_received = False
+        self._close_after_metadata = False
+        self.settings = portable_qsettings("PhotoWall")
 
         # UI刷新计数器（每N个容器刷新一次界面）
         self.ui_refresh_interval = 50
@@ -378,7 +575,7 @@ class PhotoWallDialog(QDialog):
 
     def init_ui(self):
         """初始化UI"""
-        self.setWindowTitle(f"大锤 照片墙 {get_app_version("photo_wall", prefixed=True)}")
+        self.setWindowTitle(f"大锤 照片墙 {get_app_version('photo_wall', prefixed=True)}")
         self.setStyleSheet(
             """
             QDialog {
@@ -548,11 +745,19 @@ class PhotoWallDialog(QDialog):
 
         # 设置窗口图标
         try:
-            icon_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "cg_photo_wall.ico"
-            )
-            if os.path.exists(icon_path):
-                self.setWindowIcon(QIcon(icon_path))
+            if getattr(sys, "frozen", False):
+                roots = (
+                    getattr(sys, "_MEIPASS", ""),
+                    os.path.dirname(os.path.abspath(sys.executable)),
+                )
+            else:
+                roots = (os.path.dirname(os.path.abspath(__file__)),)
+            for base in roots:
+                if base:
+                    icon_path = os.path.join(base, "cg_photo_wall.ico")
+                    if os.path.isfile(icon_path):
+                        self.setWindowIcon(QIcon(icon_path))
+                        break
         except Exception:
             pass
 
@@ -795,37 +1000,46 @@ class PhotoWallDialog(QDialog):
         }
 
     def _build_posters_from_editor_cache(self, folder_path):
-        """优先复用主窗口已经加载好的 nfo_cache，避免照片墙再次 os.walk + ET.parse。"""
+        """只使用已经加载到编辑器的元数据与海报目录快照，不重新扫描磁盘。"""
         editor = self.parent_window
-        if not editor:
+        if editor is None:
             return []
 
         cache = getattr(editor, "nfo_cache", None)
-        nfo_paths = list(getattr(editor, "nfo_files", []) or [])
-        if not cache or not nfo_paths:
+        paths = getattr(editor, "nfo_files", None) or []
+        poster_map = getattr(editor, "poster_by_directory", {})
+        if cache is None or not paths:
             return []
 
+        root_key = os.path.normcase(os.path.abspath(folder_path))
         posters = []
-        for nfo_path in nfo_paths:
+        for nfo_path in paths:
+            if not nfo_path:
+                continue
+            # 纯字符串判断扫描范围，不调用 realpath/exists 访问磁盘。
+            nfo_key = os.path.normcase(os.path.abspath(nfo_path))
             try:
-                if not nfo_path or not os.path.exists(nfo_path):
+                if os.path.commonpath((root_key, nfo_key)) != root_key:
                     continue
-                if not is_path_within(nfo_path, folder_path):
-                    continue
-                data = cache.get(nfo_path)
-                if not data:
-                    data = self.parse_nfo(nfo_path)
-                nfo_dir = os.path.dirname(nfo_path)
-                poster_file = self._find_poster_for_folder(nfo_dir)
-                if not poster_file:
-                    continue
-                posters.append((
-                    poster_file,
-                    os.path.basename(nfo_dir),
-                    self._normalize_editor_cache_data(data),
-                ))
-            except Exception as e:
-                print(f"从主窗口缓存读取照片墙数据失败 {nfo_path}: {str(e)}")
+            except ValueError:  # 不同 Windows 盘符
+                continue
+            data = cache.get(nfo_path)
+            if not isinstance(data, dict) or not data:
+                continue
+            directory = os.path.dirname(nfo_path)
+            folder_key = os.path.normcase(os.path.abspath(directory))
+            if folder_key in poster_map:
+                poster_path = poster_map[folder_key]
+            else:
+                # 兼容未携带海报快照的旧编辑器版本。
+                poster_path = self._find_poster_for_folder(directory)
+            if not poster_path:
+                continue
+            posters.append((
+                poster_path,
+                os.path.basename(directory),
+                self._normalize_editor_cache_data(data),
+            ))
         return posters
 
     def _rebuild_sort_keys_for_current_list(self):
@@ -845,97 +1059,120 @@ class PhotoWallDialog(QDialog):
         columns, poster_width, poster_height, title_height = self.calculate_grid_dimensions()
         self._render_page(columns, poster_width, poster_height, title_height)
 
-    def load_posters(self, folder_path):
-        """加载照片墙。
+    def _display_posters(self, posters, source_text):
+        """主线程集中接收元数据，并复用现有图片分页/线程池渲染。"""
+        self.master_posters = posters
+        self.all_posters = posters.copy()
+        self.current_wall_source = posters.copy()
+        self._rebuild_sort_keys_for_current_list()
 
-        从主程序打开时，优先复用 NFO Editor 已经加载好的 nfo_cache/nfo_files；
-        只有独立运行或主程序缓存为空时，才退回扫描磁盘和解析 NFO。
-        """
-        if not folder_path or not os.path.exists(folder_path):
+        self.is_loading = False  # 元数据完成；图片阶段会按需重新设为 True
+        self.progress_bar.setFormat("准备渲染...")
+        self.progress_bar.setValue(0)
+        self._render_first_page()
+        self.update_status(len(self.all_posters))
+        self.status_label.setText(
+            f"共显示 {len(self.all_posters)} 个影片（来源：{source_text}）"
+        )
+        if not self._pending_image_batches:
+            self.progress_bar.hide()
+            self.cancel_button.hide()
+
+    def load_posters(self, folder_path):
+        """编辑器启动直接读内存；独立启动后台读取同级 config 的 SQLite。"""
+        if not folder_path:
+            return
+
+        # 扫描尚未结束时，先用 Event 停止；finished 信号到达后再启动新任务。
+        if self._metadata_thread is not None:
+            self._pending_metadata_folder = folder_path
+            self._metadata_thread.stop()
+            self.status_label.setText("正在停止旧扫描并切换目录...")
             return
 
         self.folder_path = folder_path
         self.clear_all_data()
+        self.cancel_button.setEnabled(True)
 
+        editor = self.parent_window
+        if (editor is not None and
+                getattr(editor, "nfo_files", None) and
+                getattr(editor, "nfo_cache", None) is not None):
+            # 编辑器已加载完整数据时，即使没有海报也不回退全盘扫描。
+            cached = self._build_posters_from_editor_cache(folder_path)
+            self._display_posters(cached, "编辑器内存缓存")
+            return
+
+        self.progress_bar.setFormat("后台扫描 NFO/海报...")
         self.progress_bar.show()
         self.cancel_button.show()
         self.is_loading = True
+        self.status_label.setText("正在后台枚举目录...")
+        self._metadata_result_received = False
 
-        try:
-            self.progress_bar.setFormat("读取主程序缓存...")
-            self.update_status(0, None, LoadStage.LOADING)
-            QApplication.processEvents()
+        worker = PhotoWallMetadataWorker(folder_path)
+        self._metadata_thread = worker
+        worker.progress.connect(self._on_metadata_progress)
+        worker.completed.connect(self._on_metadata_completed)
+        worker.error.connect(self._on_metadata_error)
+        worker.finished.connect(self._on_metadata_thread_finished)
+        worker.start()
 
-            cached_posters = self._build_posters_from_editor_cache(folder_path)
-            if cached_posters:
-                self.master_posters = cached_posters
-                source_text = "主程序缓存"
-            else:
-                self.progress_bar.setFormat("扫描文件中...")
-                self.update_status(0, None, LoadStage.SCANNING)
-                QApplication.processEvents()
+    def _on_metadata_progress(self, stage, current, total):
+        if self._close_after_metadata or self._pending_metadata_folder:
+            return
+        if total:
+            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(current)
+            self.status_label.setText(f"{stage}：{current}/{total}")
+        else:
+            self.status_label.setText(f"{stage}：{current} 个目录")
 
-                poster_nfo_pairs = []
-                for root, dirs, files in os.walk(folder_path):
-                    if not self.is_loading:
-                        return
-                    dirs.sort(key=str.lower)
-                    preferred_stem = os.path.basename(root)
-                    # os.walk 已经给出 files，直接从这一份列表选择，
-                    # 避免每个目录再执行两次 os.scandir。
-                    poster_file = preferred_image_from_names(
-                        root, files, "poster", preferred_stem
-                    )
-                    nfo_file = preferred_nfo_from_names(
-                        root, files, preferred_stem
-                    )
-                    if poster_file and nfo_file:
-                        poster_nfo_pairs.append((poster_file, nfo_file, root))
+    def _on_metadata_completed(self, posters, hits, parsed):
+        if self._close_after_metadata or self._pending_metadata_folder:
+            return
+        self._metadata_result_received = True
+        normalized = [
+            (path, folder, self._normalize_editor_cache_data(data))
+            for path, folder, data in posters
+        ]
+        self._display_posters(
+            normalized, f"SQLite 命中 {hits} 个 / 新解析 {parsed} 个"
+        )
 
-                total_items = len(poster_nfo_pairs)
-                if total_items == 0:
-                    self.update_status(0)
-                    self.progress_bar.hide()
-                    self.cancel_button.hide()
-                    self.is_loading = False
-                    return
+    def _on_metadata_error(self, message):
+        if self._close_after_metadata or self._pending_metadata_folder:
+            return
+        self._metadata_result_received = True
+        self.is_loading = False
+        self.progress_bar.hide()
+        self.cancel_button.hide()
+        self.status_label.setText(message)
+        QMessageBox.warning(self, "照片墙读取失败", message)
 
-                self.progress_bar.setFormat("加载影片: %v/%m")
-                self.progress_bar.setMaximum(total_items)
+    def _on_metadata_thread_finished(self):
+        thread = self.sender()
+        if thread is None:
+            return
+        if thread is not self._metadata_thread:
+            thread.deleteLater()
+            return
 
-                for index, (poster_file, nfo_file, root) in enumerate(poster_nfo_pairs):
-                    if not self.is_loading:
-                        return
-                    try:
-                        nfo_data = self.parse_nfo(nfo_file)
-                        folder_name = os.path.basename(root)
-                        self.master_posters.append((poster_file, folder_name, nfo_data))
-                        if (index + 1) % self.ui_refresh_interval == 0:
-                            self.progress_bar.setValue(index + 1)
-                            self.update_status(index + 1, total_items, LoadStage.LOADING)
-                            QApplication.processEvents()
-                    except Exception as e:
-                        print(f"处理文件失败 {nfo_file}: {str(e)}")
+        self._metadata_thread = None
+        thread.deleteLater()
+        if self._close_after_metadata:
+            QTimer.singleShot(0, self.close)
+            return
 
-                source_text = "磁盘扫描"
-
-            self.all_posters = self.master_posters.copy()
-            self.current_wall_source = self.master_posters.copy()
-            self._rebuild_sort_keys_for_current_list()
-
-            self.progress_bar.setFormat("准备渲染...")
-            self.progress_bar.setValue(0)
-            QApplication.processEvents()
-
-            self._render_first_page()
-            self.update_status(len(self.all_posters))
-            self.status_label.setText(f"共显示 {len(self.all_posters)} 个影片（来源：{source_text}）")
-
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"加载海报失败: {str(e)}")
+        pending = self._pending_metadata_folder
+        self._pending_metadata_folder = None
+        if pending:
+            QTimer.singleShot(0, lambda path=pending: self.load_posters(path))
+        elif not self._metadata_result_received:
             self.is_loading = False
             self.progress_bar.hide()
             self.cancel_button.hide()
+            self.status_label.setText("已取消照片墙元数据扫描")
 
     def _render_page(self, columns, poster_width, poster_height, title_height):
         """向下渲染下一页容器到 grid，异步加载这一页的图片。
@@ -1221,7 +1458,7 @@ class PhotoWallDialog(QDialog):
 
             # 绑定事件
             poster_path = os.path.dirname(poster_file)
-            if poster_path and os.path.exists(poster_path):
+            if poster_path:
                 poster_label.mousePressEvent = lambda e, p=poster_path: self.play_video(p)
                 title_widget.mousePressEvent = lambda e, p=poster_path: self.select_in_editor(p)
 
@@ -2067,7 +2304,13 @@ class PhotoWallDialog(QDialog):
             return {}
 
     def cancel_loading(self):
-        """取消当前墙面的全部图片加载批次。"""
+        """扫描通过 Event 取消；图片仍按原有批次取消机制处理。"""
+        if self._metadata_thread is not None:
+            self._pending_metadata_folder = None
+            self._metadata_thread.stop()
+            self.cancel_button.setEnabled(False)
+            self.status_label.setText("正在取消元数据扫描...")
+            return
         if self.is_loading:
             pending = len(self._pending_image_batches)
             self._reset_image_manager()
@@ -2077,7 +2320,14 @@ class PhotoWallDialog(QDialog):
             self.status_label.setText(f"已取消图片加载（{pending} 个批次）")
 
     def closeEvent(self, event):
-        """关闭窗口时清理资源"""
+        """先等待后台扫描通过 finished 退出，再释放界面，避免销毁运行中的线程。"""
+        if self._metadata_thread is not None:
+            self._close_after_metadata = True
+            self._pending_metadata_folder = None
+            self._metadata_thread.stop()
+            self.hide()
+            event.ignore()
+            return
         try:
             self._stop_category_rendering()
             if self.is_loading:

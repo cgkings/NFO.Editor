@@ -43,7 +43,6 @@ from PySide6.QtCore import (
     Qt,
     QEvent,
     QFileSystemWatcher,
-    QSettings,
     QSignalBlocker,
     QtMsgType,
     QThread,
@@ -79,6 +78,13 @@ from PySide6.QtWidgets import (
 
 from nfo_editor_ui import NFOEditorQt
 from nfo_utils import (
+    application_dir,
+    editor_event_file,
+    preferred_image_from_names,
+    portable_qsettings,
+    program_config_dir,
+    SharedNFOCache,
+    shared_nfo_valid,
     atomic_write_text,
     find_numbered_trailer,
     find_trailer_in_movie_folder,
@@ -154,14 +160,10 @@ class NFODiskIndex:
 
     @staticmethod
     def _resolve_db_path():
-        """返回 nfo_index.sqlite3 的可写路径。"""
-        appdata = os.environ.get("APPDATA")
-        if appdata:
-            base_dir = os.path.join(appdata, "NFOEditor")
-        else:
-            base_dir = os.path.join(os.path.expanduser("~"), ".nfoeditor")
-        os.makedirs(base_dir, exist_ok=True)
-        return os.path.join(base_dir, "nfo_index.sqlite3")
+        """NFO SQLite 持久化索引存放于 .py/.exe 同级 config 目录。"""
+        directory = program_config_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        return str(directory / "nfo_index.sqlite3")
 
     def connect(self):
         conn = sqlite3.connect(self.db_path)
@@ -352,6 +354,7 @@ class LoadFilesThread(QThread):
         self.discover_seconds = 0.0
         self.process_seconds = 0.0
         self.directory_count = 0
+        self.posters_by_folder = {}  # 本轮目录枚举顺便取得的海报路径
 
     @property
     def is_stopped(self):
@@ -382,7 +385,9 @@ class LoadFilesThread(QThread):
         else:
             first_level = second_level = ""
             nfo_name = parts[-1]
-        return (nfo_path, first_level, second_level, nfo_name, data)
+        folder_key = os.path.normcase(os.path.abspath(os.path.dirname(nfo_path)))
+        poster_path = self.posters_by_folder.get(folder_key, "")
+        return (nfo_path, first_level, second_level, nfo_name, data, poster_path)
 
     def _discover_nfo_entries(self):
         """目录只枚举一遍，尽可能使用 Windows DirEntry 缓存的文件元数据。
@@ -402,6 +407,7 @@ class LoadFilesThread(QThread):
             folder = pending.pop()
             subdirs = []
             nfo_entries = []
+            file_names = []  # 复用本次枚举结果，照片墙无需逐目录再查一次
             try:
                 with os.scandir(folder) as entries:
                     for entry in entries:
@@ -413,6 +419,7 @@ class LoadFilesThread(QThread):
                                     subdirs.append((entry.name, entry.path))
                                 continue
 
+                            file_names.append(entry.name)
                             if not entry.name.lower().endswith(".nfo"):
                                 continue
 
@@ -432,6 +439,13 @@ class LoadFilesThread(QThread):
                 # 与 os.walk 默认 onerror=None 一致，跳过无权限/已消失目录。
                 continue
 
+            if nfo_entries:
+                folder_key = os.path.normcase(os.path.abspath(folder))
+                self.posters_by_folder[folder_key] = (
+                    preferred_image_from_names(
+                        folder, file_names, "poster", os.path.basename(folder)
+                    ) or ""
+                )
             nfo_entries.sort(key=lambda item: item[0].lower())
             result.extend((path, file_stat) for _name, path, file_stat in nfo_entries)
             subdirs.sort(key=lambda item: item[0].lower())
@@ -446,6 +460,7 @@ class LoadFilesThread(QThread):
 
     def run(self):
         conn = None
+        shared_cache = None
         # Event.set() 表示请求停止：任何阶段均不强制中断正在执行的磁盘调用。
         try:
             scan_id = time.time_ns()
@@ -458,6 +473,11 @@ class LoadFilesThread(QThread):
             processing_start = time.perf_counter()
             conn = self.disk_index.connect()
             self.disk_index.begin_read_only_scan_tracking(conn)
+            # 共享缓存失败不影响原有 NFO 索引、扫描和 GUI。
+            try:
+                shared_cache = SharedNFOCache()
+            except (OSError, sqlite3.Error) as error:
+                print(f"共享 NFO 缓存不可用，继续本地索引扫描：{error}")
 
             total = len(nfo_entries)
             parsed_count = 0
@@ -470,8 +490,17 @@ class LoadFilesThread(QThread):
                 cached_rows = self.disk_index.get_cached_many(
                     conn, self.folder_path, paths
                 )
+                shared_rows = {}
+                if shared_cache is not None:
+                    try:
+                        shared_rows = shared_cache.get_many(paths)
+                    except (OSError, sqlite3.Error) as error:
+                        print(f"共享 NFO 缓存读取失败：{error}")
+                        shared_cache.close()
+                        shared_cache = None
                 batch = []
                 changed_rows = []
+                shared_to_write = []
 
                 for offset, (nfo_path, discovered_stat) in enumerate(entries, start + 1):
                     if self._stop_event.is_set():
@@ -486,24 +515,39 @@ class LoadFilesThread(QThread):
                             if discovered_stat is not None
                             else os.stat(nfo_path)
                         )
-                        if (
-                            cached_row is not None
-                            and cached_row[0] == stat_result.st_mtime_ns
-                            and cached_row[1] == stat_result.st_size
-                        ):
+                        fingerprint = (stat_result.st_mtime_ns, stat_result.st_size)
+                        shared_row = shared_rows.get(nfo_path)
+                        # 原有编辑器索引命中时不重新解析 XML。
+                        if cached_row is not None and cached_row[:2] == fingerprint:
                             data = self._read_cached_data(cached_row, nfo_path)
+                            if not shared_nfo_valid(data):
+                                # 旧版只缓存精简字段，需补全一次才可跨程序共享。
+                                data = None
                         else:
                             data = None
+
+                        if data is None and shared_row is not None:
+                            if shared_row[:2] == fingerprint and shared_nfo_valid(shared_row[2]):
+                                data = dict(shared_row[2])
+                                data["path"] = nfo_path
+                                # 共享缓存可让从未由编辑器扫描过的 NFO 免 XML 解析。
+                                changed_rows.append((
+                                    nfo_path, *fingerprint, data
+                                ))
 
                         if data is None:
                             data = self._parse_nfo(nfo_path)
                             parsed_count += 1
                             changed_rows.append((
-                                nfo_path,
-                                stat_result.st_mtime_ns,
-                                stat_result.st_size,
-                                data,
+                                nfo_path, *fingerprint, data
                             ))
+
+                        if (shared_cache is not None and shared_nfo_valid(data)
+                                and (shared_row is None or shared_row[:2] != fingerprint)):
+                            # 读取/解析期间文件改变则不能写入旧的元数据。
+                            after = os.stat(nfo_path)
+                            if (after.st_mtime_ns, after.st_size) == fingerprint:
+                                shared_to_write.append((nfo_path, *fingerprint, data))
                         batch.append(self._make_tree_row(nfo_path, data))
 
                     except (ET.ParseError, OSError, UnicodeError) as exc:
@@ -526,6 +570,13 @@ class LoadFilesThread(QThread):
                         conn, self.folder_path, changed_rows, scan_id
                     )
                     conn.commit()
+                if shared_cache is not None and shared_to_write:
+                    try:
+                        shared_cache.store_many(shared_to_write)
+                    except (OSError, sqlite3.Error) as error:
+                        print(f"共享 NFO 缓存写入失败：{error}")
+                        shared_cache.close()
+                        shared_cache = None
                 if batch:
                     self.batch_ready.emit(batch)
 
@@ -543,6 +594,8 @@ class LoadFilesThread(QThread):
         finally:
             if conn is not None:
                 conn.close()
+            if shared_cache is not None:
+                shared_cache.close()
 
     def _parse_nfo(self, nfo_path):
         tree = ET.parse(nfo_path)
@@ -550,11 +603,12 @@ class LoadFilesThread(QThread):
 
         data = {
             'path': nfo_path,
-            'num': '', 'title': '', 'plot': '', 'series': '',
+            'num': '', 'title': '', 'originaltitle': '', 'sorttitle': '',
+            'plot': '', 'series': '',
             'rating': 0.0, 'release': '', 'actors': [], 'tags': [],
         }
 
-        for field in ['num', 'title', 'plot']:
+        for field in ['num', 'title', 'originaltitle', 'sorttitle', 'plot']:
             elem = root.find(field)
             if elem is not None and elem.text:
                 data[field] = elem.text.strip()
@@ -633,7 +687,7 @@ def parse_single_nfo(nfo_path):
 
 class ConfigManager:
     def __init__(self):
-        # 工程规范: 可写文件必须存 APPDATA, 不能写程序目录(CWD)
+        # 配置写入程序同级 config；与查重程序的 settings.json 分开命名。
         self.config_file = self._resolve_config_path()
         self.default_config = {
             "search_sites": {
@@ -653,43 +707,53 @@ class ConfigManager:
 
     @staticmethod
     def _resolve_config_path():
-        """返回 settings.json 的可写路径。
+        """NFO Editor 配置统一保存至 config/nfo_editor_settings.json。
 
-        Windows: %APPDATA%\\NFOEditor\\settings.json
-        其它平台 / APPDATA 缺失: ~/.nfoeditor/settings.json (兜底)
-
-        若旧版本曾在程序目录(CWD)写过 settings.json, 自动迁移一次,
-        保证老用户升级后配置不丢。
+        首次升级时，从旧 APPDATA 或历史程序目录迁移有效配置；
+        不导入查重工具的 config/settings.json，防止配置互相覆盖。
         """
+        config_path = program_config_dir() / "nfo_editor_settings.json"
+        if config_path.is_file():
+            return str(config_path)
+
         appdata = os.environ.get("APPDATA")
+        candidates = []
         if appdata:
-            config_dir = os.path.join(appdata, "NFOEditor")
-        else:
-            config_dir = os.path.join(os.path.expanduser("~"), ".nfoeditor")
+            candidates.append(Path(appdata) / "NFOEditor" / "settings.json")
+        candidates.extend((
+            Path.home() / ".nfoeditor" / "settings.json",
+            application_dir() / "settings.json",
+            Path.cwd() / "settings.json",
+            program_config_dir() / "settings.json",
+        ))
 
-        try:
-            os.makedirs(config_dir, exist_ok=True)
-        except OSError as e:
-            print(f"创建配置目录失败, 回退到当前目录: {e}")
-            return "settings.json"
-
-        config_path = os.path.join(config_dir, "settings.json")
-
-        # 一次性迁移旧的 CWD 配置
-        legacy_path = "settings.json"
-        if os.path.exists(legacy_path) and not os.path.exists(config_path):
+        seen = set()
+        for old_path in candidates:
+            key = os.path.normcase(os.path.abspath(str(old_path)))
+            if key in seen:
+                continue
+            seen.add(key)
             try:
-                shutil.copy2(legacy_path, config_path)
-                print(f"已迁移旧配置 {legacy_path} -> {config_path}")
-            except OSError as e:
-                print(f"迁移旧配置失败(忽略): {e}")
+                if not old_path.is_file():
+                    continue
+                data = json.loads(old_path.read_text(encoding="utf-8-sig"))
+                if not isinstance(data, dict) or not (
+                    "search_sites" in data or "trailer" in data
+                ):
+                    # 同目录可能还有 cg_dedupe 的 settings.json，不能混用。
+                    continue
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(old_path), str(config_path))
+                break
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                print(f"NFO Editor 旧配置迁移失败（不修改原文件）{old_path}: {error}")
 
-        return config_path
+        return str(config_path)
 
     def load_config(self):
         try:
             if os.path.exists(self.config_file):
-                with open(self.config_file, 'r', encoding='utf-8') as f:
+                with open(self.config_file, 'r', encoding='utf-8-sig') as f:
                     config = json.load(f)
                 return self._merge_config(self.default_config, config)
             return copy.deepcopy(self.default_config)
@@ -1336,6 +1400,7 @@ class NFOEditorQt6(NFOEditorQt):
         self._loaded_snapshot = None
         self._nfo_path_index = {}
         self._tree_item_index = {}
+        self.poster_by_directory = {}  # 与 nfo_files 同步的海报文件名快照
 
         # 事件驱动刷新状态：
         # 定时器只用于合并短时间内的重复事件，不再周期性扫描整个媒体库。
@@ -1367,7 +1432,7 @@ class NFOEditorQt6(NFOEditorQt):
         self.reload_timer.setSingleShot(True)
         self.reload_timer.timeout.connect(self._delayed_reload)
 
-        # 外部组件事件轮询: 组件可向 .nfo_editor_events.jsonl 追加事件, 主程序轻量消费
+        # 外部事件由 nfo_utils 统一写入程序同级 log；主程序轻量消费
         self.event_timer = QTimer()
         self.event_timer.setInterval(1000)
         self.event_timer.timeout.connect(self._poll_external_events)
@@ -1560,7 +1625,7 @@ class NFOEditorQt6(NFOEditorQt):
         if changing_folder:
             self._clear_current_editor_state()
         self.folder_path = folder_path
-        settings = QSettings("NFOEditor", "Directories")
+        settings = portable_qsettings("Directories")
         settings.setValue("last_nfo_dir", self.folder_path)
         self._clear_file_watches()
         self._set_event_file_for_folder(self.folder_path)
@@ -1573,14 +1638,14 @@ class NFOEditorQt6(NFOEditorQt):
             self.load_files_in_folder(auto_select=False)
 
     def open_folder(self):
-        settings = QSettings("NFOEditor", "Directories")
+        settings = portable_qsettings("Directories")
         last_dir = settings.value("last_nfo_dir", "")
         folder = QFileDialog.getExistingDirectory(self, "选择NFO文件夹", last_dir)
         if folder:
             self.set_nfo_folder(folder)
 
     def select_target_folder(self):
-        settings = QSettings("NFOEditor", "Directories")
+        settings = portable_qsettings("Directories")
         last_target = settings.value("last_target_dir", "")
         target = QFileDialog.getExistingDirectory(self, "选择目标文件夹", last_target)
         if target:
@@ -1685,6 +1750,7 @@ class NFOEditorQt6(NFOEditorQt):
         self.nfo_cache.clear()
         self._nfo_path_index.clear()
         self._tree_item_index.clear()
+        self.poster_by_directory.clear()
         self._loaded_snapshot = None
 
         self._show_progress = show_progress
@@ -1736,7 +1802,9 @@ class NFOEditorQt6(NFOEditorQt):
             return
         items = []
         paths = []
-        for nfo_path, first, second, nfo_name, cache_data in batch:
+        for nfo_path, first, second, nfo_name, cache_data, poster_path in batch:
+            directory = os.path.normcase(os.path.abspath(os.path.dirname(nfo_path)))
+            self.poster_by_directory[directory] = poster_path
             item = QTreeWidgetItem([first, second, nfo_name])
             items.append(item)
             paths.append(nfo_path)
@@ -1895,9 +1963,7 @@ class NFOEditorQt6(NFOEditorQt):
 
 
     def _set_event_file_for_folder(self, folder_path):
-        self._event_file_path = os.path.join(
-            folder_path, ".nfo_editor_events.jsonl"
-        )
+        self._event_file_path = editor_event_file(folder_path)
         self._event_partial_line = ""
         try:
             self._event_file_offset = os.path.getsize(
