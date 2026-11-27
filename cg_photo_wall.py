@@ -44,7 +44,6 @@ from nfo_utils import (
     program_config_dir,
     SharedNFOCache,
     shared_nfo_valid,
-    is_path_within,
     preferred_image_from_names,
     preferred_nfo_from_names,
     read_series_text,
