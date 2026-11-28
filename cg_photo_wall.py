@@ -43,6 +43,7 @@ from nfo_utils import (
     portable_qsettings,
     program_config_dir,
     SharedNFOCache,
+    DirectorySnapshotCache,
     shared_nfo_valid,
     preferred_image_from_names,
     preferred_nfo_from_names,
@@ -72,7 +73,9 @@ class PhotoWallMetadataWorker(QThread):
     def __init__(self, folder_path):
         super().__init__()
         self.folder_path = os.path.normpath(folder_path)
-        self.stop_event = threading.Event()
+        self.stop_event = threading.Event()  # Event.set() = 请求停止
+        self.directory_cache_hits = 0
+        self.directory_cache_scanned = 0
 
     def stop(self):
         self.stop_event.set()
@@ -114,22 +117,26 @@ class PhotoWallMetadataWorker(QThread):
         try:
             pairs = []
             directory_count = 0
-            for folder, directories, names in os.walk(
-                self.folder_path, topdown=True, followlinks=False
-            ):
-                if self.stop_event.is_set():
-                    return
-                directories.sort(key=str.casefold)
-                preferred_stem = os.path.basename(folder)
-                poster = preferred_image_from_names(
-                    folder, names, "poster", preferred_stem
-                )
-                nfo = preferred_nfo_from_names(folder, names, preferred_stem)
-                if poster and nfo:
-                    pairs.append((poster, nfo, folder))
-                directory_count += 1
-                if directory_count % 200 == 0:
-                    self.progress.emit("扫描目录", directory_count, 0)
+            directory_errors = []
+            with DirectorySnapshotCache() as listing_cache:
+                for folder, file_entries in listing_cache.walk(
+                    self.folder_path, self.stop_event, directory_errors
+                ):
+                    if self.stop_event.is_set():
+                        return
+                    names = [item.name for item in file_entries]
+                    preferred_stem = os.path.basename(folder)
+                    poster = preferred_image_from_names(
+                        folder, names, "poster", preferred_stem
+                    )
+                    nfo = preferred_nfo_from_names(folder, names, preferred_stem)
+                    if poster and nfo:
+                        pairs.append((poster, nfo, folder))
+                    directory_count += 1
+                    if directory_count % 200 == 0:
+                        self.progress.emit("扫描目录", directory_count, 0)
+                self.directory_cache_hits = listing_cache.cache_hits
+                self.directory_cache_scanned = listing_cache.scanned_folders
 
             if self.stop_event.is_set():
                 return
@@ -1094,10 +1101,24 @@ class PhotoWallDialog(QDialog):
         self.cancel_button.setEnabled(True)
 
         editor = self.parent_window
-        if (editor is not None and
-                getattr(editor, "nfo_files", None) and
-                getattr(editor, "nfo_cache", None) is not None):
-            # 编辑器已加载完整数据时，即使没有海报也不回退全盘扫描。
+        # 只在确实属于编辑器已完成扫描的目录范围内复用内存。
+        # 从 JAV 切到 JAV_LTX、E 盘或刮削目录时必须启动独立扫描，
+        # 否则旧代码会将超出编辑器范围的数据错误过滤成空照片墙。
+        editor_root = getattr(editor, "folder_path", "") if editor is not None else ""
+        memory_usable = False
+        if (editor_root and getattr(editor, "nfo_files", None)
+                and getattr(editor, "nfo_cache", None) is not None
+                and getattr(editor, "load_thread", None) is None
+                and not getattr(editor, "library_dirty", False)):
+            try:
+                chosen_key = os.path.normcase(os.path.abspath(folder_path))
+                editor_key = os.path.normcase(os.path.abspath(editor_root))
+                memory_usable = os.path.commonpath(
+                    (chosen_key, editor_key)
+                ) == editor_key
+            except ValueError:
+                memory_usable = False
+        if memory_usable:
             cached = self._build_posters_from_editor_cache(folder_path)
             self._display_posters(cached, "编辑器内存缓存")
             return
@@ -1135,8 +1156,13 @@ class PhotoWallDialog(QDialog):
             (path, folder, self._normalize_editor_cache_data(data))
             for path, folder, data in posters
         ]
+        worker = self._metadata_thread
+        manifest_hits = getattr(worker, "directory_cache_hits", 0)
+        manifest_rescanned = getattr(worker, "directory_cache_scanned", 0)
         self._display_posters(
-            normalized, f"SQLite 命中 {hits} 个 / 新解析 {parsed} 个"
+            normalized,
+            f"SQLite 命中 {hits} 个 / 新解析 {parsed} 个；"
+            f"目录快照复用 {manifest_hits} / 重新枚举 {manifest_rescanned}",
         )
 
     def _on_metadata_error(self, message):

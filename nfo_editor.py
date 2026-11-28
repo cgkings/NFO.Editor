@@ -84,6 +84,7 @@ from nfo_utils import (
     portable_qsettings,
     program_config_dir,
     SharedNFOCache,
+    DirectorySnapshotCache,
     shared_nfo_valid,
     atomic_write_text,
     find_numbered_trailer,
@@ -355,6 +356,9 @@ class LoadFilesThread(QThread):
         self.process_seconds = 0.0
         self.directory_count = 0
         self.posters_by_folder = {}  # 本轮目录枚举顺便取得的海报路径
+        self.directory_cache_hits = 0
+        self.directory_cache_scanned = 0
+        self.directory_scan_errors = []
 
     @property
     def is_stopped(self):
@@ -390,71 +394,57 @@ class LoadFilesThread(QThread):
         return (nfo_path, first_level, second_level, nfo_name, data, poster_path)
 
     def _discover_nfo_entries(self):
-        """目录只枚举一遍，尽可能使用 Windows DirEntry 缓存的文件元数据。
+        """自动复用 APPDATA 中按实际文件夹键保存的目录快照。
 
-        仅访问文件名为 .nfo 的元数据，不打开/读取 MP4、MKV 或 STRM。
-        保持 os.walk 的深度优先、同级名称排序以及不跟随目录软链接的行为。
-        返回 (path, stat_result_or_None) 元组，stat 失败留待后续旧索引兜底。
+        仅当文件夹成员发生变化或快照到期才对该文件夹 scandir；
+        任何 NFO 的内容仍然在后续批处理阶段用 stat 指纹核实。
+        独立选择父目录、子目录时共用同一份目录成员快照。
         """
-        pending = [self.folder_path]
         result = []
         directory_count = 0
-
-        while pending:
-            if self._stop_event.is_set():
-                return None
-
-            folder = pending.pop()
-            subdirs = []
-            nfo_entries = []
-            file_names = []  # 复用本次枚举结果，照片墙无需逐目录再查一次
-            try:
-                with os.scandir(folder) as entries:
-                    for entry in entries:
-                        if self._stop_event.is_set():
-                            return None
-                        try:
-                            if entry.is_dir(follow_symlinks=False):
-                                if not entry.is_symlink():
-                                    subdirs.append((entry.name, entry.path))
-                                continue
-
-                            file_names.append(entry.name)
-                            if not entry.name.lower().endswith(".nfo"):
-                                continue
-
-                            # os.walk 默认不会将指向目录的软链接当作 NFO 文件。
-                            if entry.is_symlink() and entry.is_dir():
-                                continue
-
-                            try:
-                                file_stat = entry.stat(follow_symlinks=True)
-                            except OSError:
-                                file_stat = None
-                            nfo_entries.append((entry.name, entry.path, file_stat))
-                        except OSError:
-                            # 单项访问失败不影响其它目录或文件。
+        errors = []
+        with DirectorySnapshotCache() as listing_cache:
+            for folder, entries in listing_cache.walk(
+                self.folder_path, self._stop_event, errors
+            ):
+                if self._stop_event.is_set():
+                    return None
+                file_names = [entry.name for entry in entries]
+                nfo_entries = []
+                for entry in entries:
+                    if self._stop_event.is_set():
+                        return None
+                    if not entry.name.casefold().endswith(".nfo"):
+                        continue
+                    try:
+                        if entry.is_symlink() and entry.is_dir():
                             continue
-            except OSError:
-                # 与 os.walk 默认 onerror=None 一致，跳过无权限/已消失目录。
-                continue
-
-            if nfo_entries:
-                folder_key = os.path.normcase(os.path.abspath(folder))
-                self.posters_by_folder[folder_key] = (
-                    preferred_image_from_names(
-                        folder, file_names, "poster", os.path.basename(folder)
-                    ) or ""
+                        # 原有 NFO 指纹仍从真实文件获得，绝不信任目录快照的
+                        # 文件大小或修改时间来判断 XML 正文是否需要重解析。
+                        try:
+                            st = entry.stat(follow_symlinks=True)
+                        except OSError:
+                            st = None
+                        nfo_entries.append((entry.name, entry.path, st))
+                    except OSError:
+                        continue
+                if nfo_entries:
+                    folder_key = os.path.normcase(os.path.abspath(folder))
+                    self.posters_by_folder[folder_key] = (
+                        preferred_image_from_names(
+                            folder, file_names, "poster", os.path.basename(folder)
+                        ) or ""
+                    )
+                nfo_entries.sort(key=lambda item: item[0].casefold())
+                result.extend(
+                    (path, st) for _name, path, st in nfo_entries
                 )
-            nfo_entries.sort(key=lambda item: item[0].lower())
-            result.extend((path, file_stat) for _name, path, file_stat in nfo_entries)
-            subdirs.sort(key=lambda item: item[0].lower())
-            pending.extend(path for _name, path in reversed(subdirs))
-
-            directory_count += 1
-            if directory_count % 200 == 0:
-                self.discovery_progress.emit(directory_count, len(result))
-
+                directory_count += 1
+                if directory_count % 200 == 0:
+                    self.discovery_progress.emit(directory_count, len(result))
+            self.directory_cache_hits = listing_cache.cache_hits
+            self.directory_cache_scanned = listing_cache.scanned_folders
+        self.directory_scan_errors = errors
         self.directory_count = directory_count
         return result
 
@@ -530,10 +520,9 @@ class LoadFilesThread(QThread):
                             if shared_row[:2] == fingerprint and shared_nfo_valid(shared_row[2]):
                                 data = dict(shared_row[2])
                                 data["path"] = nfo_path
-                                # 共享缓存可让从未由编辑器扫描过的 NFO 免 XML 解析。
-                                changed_rows.append((
-                                    nfo_path, *fingerprint, data
-                                ))
+                                # 共享缓存直接提供完整元数据，无需在每个新根目录下
+                                # 再重复写一套相同的编辑器索引，避免频繁切换
+                                # 父目录/子目录造成 SQLite 根目录级记录膨胀。
 
                         if data is None:
                             data = self._parse_nfo(nfo_path)
@@ -584,8 +573,15 @@ class LoadFilesThread(QThread):
                 return
 
             # 仅完整扫描结束，才能以本次观察到的文件列表清除旧索引。
-            self.disk_index.delete_missing_after_scan(conn, self.folder_path)
-            conn.commit()
+            if not self.directory_scan_errors:
+                self.disk_index.delete_missing_after_scan(conn, self.folder_path)
+                conn.commit()
+            else:
+                # 离线盘/无权限目录不可被误判为已删除影片。
+                print(
+                    f"目录核对有 {len(self.directory_scan_errors)} 条异常，"
+                    "本次保留原有编辑器索引。"
+                )
             self.process_seconds = time.perf_counter() - processing_start
             self.finished_signal.emit(total, parsed_count)
 
@@ -1873,8 +1869,10 @@ class NFOEditorQt6(NFOEditorQt):
             f"加载完成: 成功 {loaded_count}/{count} 个NFO ({total_folders} 个影片目录)，"
             f"本次解析 {parsed_count} 个，缓存命中 {cache_hits} 个"
             f"{stale_text}{failure_text}，总耗时 {elapsed:.2f} 秒"
-            f"（目录枚举 {discover_sec:.2f}s / 索引处理 {process_sec:.2f}s，"
-            f"访问目录 {directory_count} 个） - {self.folder_path}"
+            f"（目录清单 {discover_sec:.2f}s / 索引处理 {process_sec:.2f}s，"
+            f"访问 {directory_count} 个目录，快照复用 "
+            f"{getattr(worker, 'directory_cache_hits', 0)} 个 / 重新核对 "
+            f"{getattr(worker, 'directory_cache_scanned', 0)} 个） - {self.folder_path}"
         )
 
         # 这里只处理业务结果；按钮恢复和事件追踪必须等真正的 QThread.finished。

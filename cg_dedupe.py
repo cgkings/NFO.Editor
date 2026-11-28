@@ -33,6 +33,10 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Callable
 
+# 与编辑器、照片墙共用一份 APPDATA 目录快照；本文件的删除安全预检
+# 继续使用原有实时 scandir 路径，不信任快照来决定删除内容。
+from nfo_utils import DirectorySnapshotCache
+
 DATA_DIR_NAME = "CGDedupe_Data"
 
 # 每次 115 / CloudDrive2 真实视频删除完成后，至少间隔三秒才处理下一条。
@@ -992,8 +996,34 @@ class LocalTextCache:
             self.connection.close()
 
 
-def iter_scan_folders(roots, stop_event, errors):
-    """单次 scandir 枚举；不跟随链接/junction，不访问 STRM 目标。"""
+def iter_scan_folders(roots, stop_event, errors, directory_cache=None):
+    """默认安全路径实时枚举；普通查重可显式复用目录成员快照。
+
+    删除/移动安全预检不传 directory_cache，仍走原版实时 scandir，
+    从而避免在可能存在短暂过期清单时遗漏新媒体文件。
+    """
+    if directory_cache is not None:
+        for root in unique_scan_roots(roots):
+            for folder, items in directory_cache.walk(root, stop_event, errors):
+                if stop_event.is_set():
+                    return
+                nfos, media = [], []
+                for item in items:
+                    if stop_event.is_set():
+                        return
+                    if item.is_symlink():
+                        continue
+                    ext = ntpath.splitext(item.name)[1].casefold()
+                    if ext != ".nfo" and ext not in MEDIA_EXTS:
+                        continue
+                    if not item.is_file(follow_symlinks=False):
+                        continue
+                    if ext == ".nfo":
+                        nfos.append(item)
+                    else:
+                        media.append(item)
+                yield folder, nfos, media
+        return
     for root in unique_scan_roots(roots):
         stack = [root]
         while stack and not stop_event.is_set():
@@ -1176,6 +1206,7 @@ def scan_library(
     entries, errors = [], []
     cache = None
     shared_cache = None  # 只在扫描管理线程操作 SQLite，避免跨线程连接。
+    directory_cache = DirectorySnapshotCache()  # 自动启用单库目录快照；失败则实时扫描
     snapshot = {}
     if cache_path is not None:
         try:
@@ -1249,7 +1280,9 @@ def scan_library(
                     if workers > 1 else nullcontext())
         with executor as pool:
             try:
-                for job in iter_scan_folders(roots, stop_event, errors):
+                for job in iter_scan_folders(
+                    roots, stop_event, errors, directory_cache=directory_cache
+                ):
                     if stop_event.is_set():
                         break
                     visited += 1
@@ -1283,6 +1316,10 @@ def scan_library(
     finally:
         if cache_report is not None:
             cache_report.update(stats)
+            cache_report["directory_cache_hits"] = directory_cache.cache_hits
+            cache_report["directory_cache_rescanned"] = directory_cache.scanned_folders
+            cache_report["directory_cache_failures"] = directory_cache.failed_folders
+        directory_cache.close()
         if cache is not None:
             try:
                 cache.close()
@@ -4505,6 +4542,8 @@ class NfoDuplicateFinder(QtWidgets.QWidget):
             f"；NFO 缓存命中 {cache_hits}（其中共享缓存 {stats.get('shared_nfo_hits', 0)}）"
             f" / 本次解析 {cache_parsed}"
             f"；STRM 缓存命中 {strm_hits} / 本次读取 {strm_read}"
+            f"；目录快照复用 {stats.get('directory_cache_hits', 0)}"
+            f" / 实时核对 {stats.get('directory_cache_rescanned', 0)}"
             f"；已恢复视频参数 {restored_video_rows} 条（14天内）"
         )
         if visible_errors:

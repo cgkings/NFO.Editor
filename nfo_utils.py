@@ -8,6 +8,7 @@ import ntpath
 import sqlite3
 import os
 import re
+import stat
 import sys
 import time
 import tempfile
@@ -36,6 +37,383 @@ def program_log_dir() -> Path:
     """审计、事件等日志统一放在程序同级 log 目录。"""
     return application_dir() / "log"
 
+
+
+
+# Shared, directory-scoped manifest cache for all three scan applications.
+# Unlike NFO metadata, directory membership changes on directory timestamps;
+# NFO/STRM contents continue to be checked with real file fingerprints.
+DIRECTORY_MANIFEST_SCHEMA = 1
+DIRECTORY_MANIFEST_RECHECK_SECONDS = 15 * 60
+DIRECTORY_MANIFEST_RETENTION_SECONDS = 180 * 24 * 3600
+DIRECTORY_MANIFEST_MAX_FOLDERS = 300000
+
+
+def directory_manifest_db_path() -> Path:
+    """A single APPDATA database for all .py and bundled .exe applications.
+
+    Uses the real Windows roaming profile; never _MEIPASS, CWD or program folder.
+    """
+    home = os.environ.get("APPDATA")
+    if home:
+        base = Path(home)
+    elif os.name == "nt":
+        base = Path.home() / "AppData" / "Roaming"
+    else:
+        base = Path.home() / ".local" / "share"
+    return base / "NFO Tools" / "directory_manifests.sqlite3"
+
+
+class SnapshotFile:
+    """A small, immutable DirEntry-like object used only inside worker threads."""
+
+    __slots__ = ("name", "path", "_symlink")
+
+    def __init__(self, folder: str, name: str, is_symlink: bool):
+        self.name = name
+        self.path = os.path.join(folder, name)
+        self._symlink = bool(is_symlink)
+
+    def is_symlink(self) -> bool:
+        return self._symlink
+
+    def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+        if self._symlink and not follow_symlinks:
+            return False
+        try:
+            return os.path.isdir(self.path)
+        except OSError:
+            return False
+
+    def is_file(self, *, follow_symlinks: bool = True) -> bool:
+        try:
+            mode = os.stat(
+                self.path, follow_symlinks=follow_symlinks
+            ).st_mode
+            return stat.S_ISREG(mode)
+        except OSError:
+            return False
+
+    def stat(self, *, follow_symlinks: bool = True):
+        # Must always re-stat the actual NFO/STRM when checking content caches.
+        return os.stat(self.path, follow_symlinks=follow_symlinks)
+
+
+class DirectorySnapshotCache:
+    """One shared, bounded SQLite manifest table, keyed by physical folder path.
+
+    On every scan, stat each directory. Reuse its children/filenames only if the
+    directory fingerprint matches and it was enumerated recently. Re-enumerate
+    changed/aged directories. Never reuse NFO file metadata without its own stat.
+
+    The SQLite database is best-effort; if it becomes unavailable, use normal
+    scandir and preserve scan correctness. No user settings or opt-in UI.
+    """
+
+    WRITE_BATCH = 250
+
+    def __init__(self, db_path=None):
+        self.db_path = Path(db_path) if db_path is not None else directory_manifest_db_path()
+        self.connection = None
+        self._rows = {}
+        self._pending = []
+        self.cache_hits = 0
+        self.scanned_folders = 0
+        self.failed_folders = 0
+        self.changed_folders = 0
+        self._now = int(time.time())
+        self._last_touch = set()  # 每隔 30 天才更新一次活跃目录 used_at
+        self._loaded_roots = set()
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(str(self.db_path), timeout=3.0)
+            self.connection = connection
+            connection.execute("PRAGMA busy_timeout=3000")
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("PRAGMA cache_size=-8192")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS directory_manifests ("
+                "path_key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, "
+                "subdirs_json TEXT NOT NULL, files_json TEXT NOT NULL, "
+                "checked_at INTEGER NOT NULL, used_at INTEGER NOT NULL, "
+                "schema_version INTEGER NOT NULL)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_directory_manifests_used "
+                "ON directory_manifests(used_at)"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS manifest_meta "
+                "(name TEXT PRIMARY KEY, value INTEGER NOT NULL)"
+            )
+            connection.commit()
+            # Do not eagerly deserialize all four libraries when the user opens
+            # only a single movie subfolder. Fetch one subtree on demand.
+        except (OSError, sqlite3.Error) as error:
+            print(f"[目录快照] 缓存不可用，回退正常目录扫描：{error}")
+            if self.connection is not None:
+                self.connection.close()
+            self.connection = None
+            self._rows.clear()
+
+    @staticmethod
+    def _valid_cached_name(value):
+        return (
+            isinstance(value, str) and value not in (".", "..", "")
+            and "/" not in value and "\\\\" not in value
+        )
+
+    def _load_subtree(self, root: str):
+        """One indexed range query for the chosen subtree, never the full DB."""
+        if self.connection is None:
+            return
+        key = self._key(root)
+        if key in self._loaded_roots:
+            return
+        self._loaded_roots.add(key)
+        prefix = key.rstrip("\\") + "\\"
+        upper_bound = prefix + chr(0x10FFFF)
+        try:
+            cursor = self.connection.execute(
+                "SELECT path_key,fingerprint,subdirs_json,files_json,checked_at,used_at "
+                "FROM directory_manifests WHERE schema_version=? AND "
+                "(path_key=? OR (path_key>=? AND path_key<?))",
+                (DIRECTORY_MANIFEST_SCHEMA,key,prefix,upper_bound),
+            )
+            for row_key, signature, subdirs, files, checked, used in cursor:
+                try:
+                    folders = json.loads(subdirs)
+                    names = json.loads(files)
+                    stamp = json.loads(signature)
+                    if (
+                        isinstance(folders, list)
+                        and all(self._valid_cached_name(n) for n in folders)
+                        and isinstance(names, list)
+                        and all(
+                            isinstance(item, list) and len(item) == 2
+                            and self._valid_cached_name(item[0])
+                            and item[1] in (0,1) for item in names
+                        )
+                        and isinstance(stamp, list) and len(stamp)==2
+                        and all(isinstance(x,int) for x in stamp)
+                    ):
+                        self._rows[row_key] = (
+                            tuple(stamp),folders,names,int(checked),int(used)
+                        )
+                except (TypeError, ValueError):
+                    continue
+        except sqlite3.Error as error:
+            # Keep scanning normally, even when SQLite is locked/corrupted.
+            print(f"[目录快照] 子目录索引读取失败，回退实时扫描：{error}")
+            self.connection.close()
+            self.connection = None
+            self._rows.clear()
+
+    @staticmethod
+    def _key(folder: str) -> str:
+        return ntpath.normcase(ntpath.normpath(os.path.abspath(folder)))
+
+    @staticmethod
+    def _fingerprint(st):
+        # Directory stamp checks membership, not content of existing NFO files.
+        return (int(st.st_mtime_ns), int(st.st_ctime_ns))
+
+    @staticmethod
+    def _enumerate(folder: str, stop_event):
+        subdirs, files = [], []
+        errors_seen = False
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if stop_event.is_set():
+                    return None
+                try:
+                    if entry.is_symlink():
+                        # Do not follow symlink/junction directories into cycles.
+                        if not entry.is_dir(follow_symlinks=False):
+                            files.append([entry.name, 1])
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if (os.name == "nt"
+                                and getattr(entry.stat(follow_symlinks=False),
+                                            "st_file_attributes", 0) & 0x400):
+                            continue
+                        subdirs.append(entry.name)
+                    else:
+                        files.append([entry.name, 0])
+                except OSError:
+                    # Never persist a manifest that silently omitted an entry.
+                    errors_seen = True
+                    continue
+        subdirs.sort(key=str.casefold)
+        files.sort(key=lambda item: item[0].casefold())
+        return subdirs, files, errors_seen
+
+    def _flush(self):
+        if not self._pending or self.connection is None:
+            self._pending.clear()
+            return
+        rows = self._pending
+        self._pending = []
+        try:
+            self.connection.executemany(
+                "INSERT INTO directory_manifests "
+                "(path_key,fingerprint,subdirs_json,files_json,checked_at,used_at,schema_version) "
+                "VALUES (?,?,?,?,?,?,?) "
+                "ON CONFLICT(path_key) DO UPDATE SET "
+                "fingerprint=excluded.fingerprint,subdirs_json=excluded.subdirs_json,"
+                "files_json=excluded.files_json,checked_at=excluded.checked_at,"
+                "used_at=excluded.used_at,schema_version=excluded.schema_version",
+                rows,
+            )
+            self.connection.commit()
+        except sqlite3.Error as error:
+            self.connection.rollback()
+            print(f"[目录快照] 缓存更新失败，保持正常扫描：{error}")
+            self.connection.close()
+            self.connection = None
+
+    def _store(self, folder, signature, subdirs, files):
+        key = self._key(folder)
+        self._rows[key] = (signature, subdirs, files, self._now, self._now)
+        if self.connection is None:
+            return
+        self._pending.append((
+            key,json.dumps(list(signature),separators=(",",":")),
+            json.dumps(subdirs,ensure_ascii=False,separators=(",",":")),
+            json.dumps(files,ensure_ascii=False,separators=(",",":")),
+            self._now,self._now,DIRECTORY_MANIFEST_SCHEMA,
+        ))
+        if len(self._pending) >= self.WRITE_BATCH:
+            self._flush()
+
+    def walk(self, root: str, stop_event, errors=None):
+        """Yield (folder, list[SnapshotFile]); traverse only under selected root.
+
+        An independently selected subfolder reuses the same key from its parent
+        library scan. Missing/inaccessible folders never cause cache deletion.
+        """
+        stack = [os.path.normpath(os.path.abspath(os.fspath(root)))]
+        self._load_subtree(stack[0])
+        seen = set()
+        while stack and not stop_event.is_set():
+            folder = stack.pop()
+            key = self._key(folder)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                stat_before = os.stat(folder, follow_symlinks=False)
+                if not stat.S_ISDIR(stat_before.st_mode):
+                    raise NotADirectoryError(folder)
+                if (os.name == "nt" and key not in (
+                        self._key(os.path.normpath(root)),
+                    ) and getattr(stat_before,"st_file_attributes",0) & 0x400):
+                    # Do not traverse cached directories that became junctions.
+                    continue
+                fingerprint = self._fingerprint(stat_before)
+            except OSError as error:
+                self.failed_folders += 1
+                if errors is not None and len(errors) < 25:
+                    errors.append(f"{folder}：{error}")
+                continue
+
+            previous = self._rows.get(key)
+            if (
+                previous is not None and previous[0] == fingerprint
+                and self._now - previous[3] < DIRECTORY_MANIFEST_RECHECK_SECONDS
+            ):
+                subdirs, files = previous[1], previous[2]
+                self.cache_hits += 1
+                if (self.connection is not None and
+                        self._now - previous[4] >= 30 * 24 * 3600):
+                    self._last_touch.add(key)
+            else:
+                try:
+                    listing = self._enumerate(folder, stop_event)
+                    if listing is None:
+                        return
+                    subdirs, files, entry_errors = listing
+                    if entry_errors:
+                        self.failed_folders += 1
+                        if errors is not None and len(errors) < 25:
+                            errors.append(f"{folder}：部分文件无法读取，下次将重新核对")
+                    # Directory may change during enumeration; never persist
+                    # an unstable listing as if it were valid.
+                    stat_after = os.stat(folder, follow_symlinks=False)
+                    if (not entry_errors and
+                            self._fingerprint(stat_after) == fingerprint):
+                        self._store(folder, fingerprint, subdirs, files)
+                    else:
+                        self.failed_folders += 1
+                        if errors is not None and len(errors) < 25:
+                            errors.append(f"{folder}：枚举期间目录发生变化，下次将重新核对")
+                    self.scanned_folders += 1
+                    if previous is not None:
+                        self.changed_folders += 1
+                except OSError as error:
+                    self.failed_folders += 1
+                    if errors is not None and len(errors) < 25:
+                        errors.append(f"{folder}：{error}")
+                    continue
+
+            for name in reversed(subdirs):
+                stack.append(os.path.join(folder, name))
+            yield folder, [
+                SnapshotFile(folder, pair[0], bool(pair[1])) for pair in files
+            ]
+
+    def close(self):
+        self._flush()
+        if self.connection is not None:
+            try:
+                if self._last_touch:
+                    self.connection.executemany(
+                        "UPDATE directory_manifests SET used_at=? WHERE path_key=?",
+                        ((self._now, key) for key in self._last_touch),
+                    )
+                    self.connection.commit()
+                self._last_touch.clear()
+                # Clean stale manifests rarely; one shared DB rather than a DB
+                # per library. Avoid expensive maintenance on every scan.
+                row = self.connection.execute(
+                    "SELECT value FROM manifest_meta WHERE name='last_cleanup'"
+                ).fetchone()
+                if (row is None or int(row[0]) < self._now - 7*24*3600
+                        or self.scanned_folders >= 1000):
+                    cutoff = self._now - DIRECTORY_MANIFEST_RETENTION_SECONDS
+                    self.connection.execute(
+                        "DELETE FROM directory_manifests WHERE used_at < ?",
+                        (cutoff,),
+                    )
+                    count = self.connection.execute(
+                        "SELECT COUNT(*) FROM directory_manifests"
+                    ).fetchone()[0]
+                    if count > DIRECTORY_MANIFEST_MAX_FOLDERS:
+                        self.connection.execute(
+                            "DELETE FROM directory_manifests WHERE path_key IN ("
+                            "SELECT path_key FROM directory_manifests "
+                            "ORDER BY used_at ASC LIMIT ?)",
+                            (count - DIRECTORY_MANIFEST_MAX_FOLDERS,),
+                        )
+                    self.connection.execute(
+                        "INSERT INTO manifest_meta(name,value) VALUES('last_cleanup',?) "
+                        "ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                        (self._now,),
+                    )
+                    self.connection.commit()
+            except sqlite3.Error as error:
+                print(f"[目录快照] 清理失败（不影响扫描）：{error}")
+            finally:
+                self.connection.close()
+                self.connection = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
 
 
 SHARED_NFO_SCHEMA = 1
