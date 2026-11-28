@@ -16,7 +16,7 @@ _DEFAULT_VERSIONS = {
     "crop": "9.8.1",
     "rename": "9.8.1",
     "photo_wall": "9.8.1",
-    "dedupe": "11.3.11",
+    "dedupe": "11.3.12",
 }
 
 # GitHub CI 在源码分析之前生成此模块；本地直接运行 .py 时可以不存在。
